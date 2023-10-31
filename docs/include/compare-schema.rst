@@ -7,4 +7,6 @@
      --target             Postgres URI to the target database
      --dir                Work directory to use
      --all-databases      Compare all databases from the source instance
+     --snapshot           Use snapshot obtained with pg_export_snapshot
+                          on the source database
    

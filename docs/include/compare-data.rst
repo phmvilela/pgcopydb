@@ -8,4 +8,6 @@
      --dir                Work directory to use
      --all-databases      Compare all databases from the source instance
      --json               Format the output using JSON
+     --snapshot           Use snapshot obtained with pg_export_snapshot
+                          on the source database
    

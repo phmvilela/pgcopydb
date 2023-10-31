@@ -421,6 +421,29 @@ compare_table(CopyDataSpec *copySpecs, SourceTable *source)
 		return false;
 	}
 
+	if (!IS_EMPTY_STRING_BUFFER(copySpecs->sourceSnapshot.snapshot))
+	{
+		log_debug("compare_table: %s using snapshot: %s",
+				  source->relname,
+				  copySpecs->sourceSnapshot.snapshot);
+
+		if (!pgsql_set_transaction(&src, ISOLATION_REPEATABLE_READ, false, true))
+		{
+			/* errors have already been logged */
+			(void) pgsql_finish(&src);
+			return false;
+		}
+
+		if (!pgsql_set_snapshot(&src, copySpecs->sourceSnapshot.snapshot))
+		{
+			/* errors have already been logged */
+			(void) pgsql_finish(&src);
+			return false;
+		}
+
+		copySpecs->sourceSnapshot.state = SNAPSHOT_STATE_SET;
+	}
+
 	if (!pgsql_init(&dst, dsn->target_pguri, PGSQL_CONN_TARGET))
 	{
 		/* errors have already been logged */
@@ -969,6 +992,11 @@ compare_fetch_schemas(CopyDataSpec *copySpecs,
 	/* copy the structure instances over */
 	*sourceSpecs = *copySpecs;
 	*targetSpecs = *copySpecs;
+
+	/* unset sourceSnapshot snapshot for target */
+	targetSpecs->consistent = false;
+	(void) memset(&(targetSpecs->sourceSnapshot.snapshot), 0,
+				  sizeof(targetSpecs->sourceSnapshot.snapshot));
 
 	/*
 	 * Tweak the sourceSpecs so that we bypass retrieving catalog information
