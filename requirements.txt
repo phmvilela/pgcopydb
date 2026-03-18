@@ -1,0 +1,19 @@
+# Database
+psycopg2-binary==2.9.9
+
+# Azure SDKs
+azure-identity==1.14.0
+azure-mgmt-rdbms==10.2.0
+
+# Configuration
+python-dotenv==1.0.0
+
+# CLI
+click==8.1.7
+
+# Logging & Serialization
+python-json-logger==2.0.7
+
+# Testing (optional)
+pytest==7.4.3
+pytest-cov==4.1.0
