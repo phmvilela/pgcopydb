@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pg_cyan"
+version = "0.1.0"
+description = "PostgreSQL side-by-side migration orchestrator for Azure."
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+packages = ["pg_cyan", "pg_cyan.cloud", "pg_cyan.cloud.azure", "pg_cyan.postgres"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --cov=pg_cyan --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["pg_cyan"]
