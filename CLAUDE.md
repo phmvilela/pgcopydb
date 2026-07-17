@@ -11,8 +11,9 @@ post-migration**. Deliverables are a mix of Python (checks/orchestration) and
 Terraform (Azure provisioning). See `README.md` for the user-facing view.
 
 Current state: the **pre-migration preflight** checks, the **source parameter
-inventory** (`source-parameters`), and the Terraform **worker VM** exist.
-Migration and post-migration are not built yet.
+inventory** (`source-parameters`), the **source metrics collector**
+(`source-pg-metrics`), and the Terraform **worker VM** exist. Migration and
+post-migration are not built yet.
 
 ## Where work comes from
 
@@ -63,10 +64,10 @@ literals — never f-string user/config values into SQL.
 
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
-`preflight` and `source-parameters` are implemented. Options default to
-`PG_SOURCE_*` env vars so the same invocation works locally and in the
-container. Exit codes: `0` ready/success, `1` not ready/failure, `2`
-interrupted — keep these stable.
+`preflight`, `source-parameters`, and `source-pg-metrics` are implemented.
+Options default to `PG_SOURCE_*` env vars so the same invocation works locally
+and in the container. Exit codes: `0` ready/success, `1` not ready/failure,
+`2` interrupted — keep these stable.
 
 `source-parameters` (`pg_cyan/parameters.py`, `PgCyanParameters`) is the second
 orchestrator and the template for **artifact-producing** stages: instead of a
@@ -78,6 +79,16 @@ on success, or `pg-source-parameters-errors.json` carrying an error message on
 any failure (connection, query, empty result, or write). Both land in
 `--output-dir` / `$PG_OUTPUT_DIR`. Keep this success-vs-error two-file shape for
 future artifact stages.
+
+`source-pg-metrics` (`pg_cyan/metrics.py`, `PgCyanMetrics`) is the third
+orchestrator, another artifact-producing stage built on the same
+success-vs-error two-file shape. It collects PostgreSQL version, object
+counts (tables, partitions, views, indexes, sequences, functions, procedures,
+triggers, extensions), database size, and per-table sizes. On success it
+writes a non-empty `source-pg-metrics.json`; on any failure (connection,
+query, empty result, or write) it writes `source-pg-metrics-errors.json`
+with the error message (issue #3). Object counts rely on
+`pg_proc.prokind`, which requires PostgreSQL 11+.
 
 ## Configuration & secrets
 

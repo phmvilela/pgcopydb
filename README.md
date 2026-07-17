@@ -6,8 +6,9 @@
 PostgreSQL environment in Azure with minimal downtime. It is organized around
 three stages:
 
-1. **Pre-migration** — readiness checks and inventory of the source (versions,
-   parameters, extensions, primary keys, HA/geo-backup/networking/storage, etc.).
+1. **Pre-migration** — readiness checks, inventory, and metrics for the source
+   (versions, parameters, extensions, primary keys, object counts, database
+   and table sizes, HA/geo-backup/networking/storage, etc.).
 2. **Migration** — the cutover itself *(planned)*.
 3. **Post-migration** — validation and cleanup *(planned)*.
 
@@ -28,6 +29,7 @@ pg_cyan/
   cli.py               click CLI — `python -m pg_cyan.cli`
   preflight.py         PgCyanPreflight: pre-migration readiness checks
   parameters.py        PgCyanParameters: export source instance parameters
+  metrics.py           PgCyanMetrics: collect source database metrics
   cloud/azure/         Azure SDK integrations (skeleton)
   postgres/            PostgreSQL connection/introspection utils (skeleton)
 terraform/             Azure worker-VM provisioning (VNet, NSG, VM, cloud-init)
@@ -90,6 +92,28 @@ planner and preflight gates read (`wal_level`, `max_wal_senders`,
 |---------|---------------------------------------|------|
 | Success | `pg-source-parameters.json` (non-empty) | 0    |
 | Failure | `pg-source-parameters-errors.json`      | 1    |
+| Interrupted | *(none)*                          | 2    |
+
+Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
+directory).
+
+### Collect source database metrics
+
+```bash
+# Collect version, object counts, and size metrics from the source
+python -m pg_cyan.cli source-pg-metrics
+```
+
+`source-pg-metrics` connects to the source and collects metrics useful for
+planning the migration pipeline: PostgreSQL version, object counts (tables,
+partitioned tables, partitions, views, materialized views, indexes,
+sequences, functions, procedures, triggers, extensions), database size, and
+per-table sizes. Object counts assume PostgreSQL 11+ (`pg_proc.prokind`).
+
+| Outcome | File written                          | Exit |
+|---------|---------------------------------------|------|
+| Success | `source-pg-metrics.json` (non-empty)    | 0    |
+| Failure | `source-pg-metrics-errors.json`         | 1    |
 | Interrupted | *(none)*                          | 2    |
 
 Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
