@@ -114,9 +114,6 @@ idempotent — `terraform apply` should be safe to re-run. Restrict
 
 ## Known gaps / cleanups worth doing
 
-- `requirements.txt` pins `azure-mgmt-rdbms==10.2.0`, which does **not exist**
-  on PyPI (only `10.2.0bN` betas; latest stable is `10.1.1`). Pin a real
-  version before relying on Azure management calls.
 - `pg_cyan/cloud/azure/` and `pg_cyan/postgres/` are empty skeletons — the
   Azure-side pre-migration checks (HA, geo-backup, networking, storage, SKU)
   and shared PG introspection helpers will land here.
