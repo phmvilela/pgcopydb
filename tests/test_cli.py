@@ -27,9 +27,27 @@ class _StubChecker:
         pass
 
 
+class _StubExporter:
+    """Records constructor kwargs and returns a canned export summary."""
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubExporter.last_kwargs = kwargs
+        self._ok = kwargs["database"] == "ok_db"
+
+    def export(self):
+        status = "success" if self._ok else "failure"
+        return {"status": status, "output_file": None, "error_file": None}
+
+    def close(self):
+        pass
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
+    monkeypatch.setattr(cli_module, "PgCyanParameters", _StubExporter)
     return CliRunner()
 
 
@@ -56,3 +74,20 @@ def test_options_fall_back_to_env(runner, monkeypatch):
     runner.invoke(cli_module.cli, ["preflight"])
     assert _StubChecker.last_kwargs["host"] == "db.internal"
     assert _StubChecker.last_kwargs["port"] == 6432
+
+
+def test_source_parameters_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, ["source-parameters", "--database", "ok_db"])
+    assert result.exit_code == 0
+    assert _StubExporter.last_kwargs["database"] == "ok_db"
+
+
+def test_source_parameters_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, ["source-parameters", "--database", "other"])
+    assert result.exit_code == 1
+
+
+def test_source_parameters_output_dir_falls_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PG_OUTPUT_DIR", "/tmp/pgcyan-out")
+    runner.invoke(cli_module.cli, ["source-parameters", "--database", "ok_db"])
+    assert _StubExporter.last_kwargs["output_dir"] == "/tmp/pgcyan-out"

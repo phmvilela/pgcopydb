@@ -10,6 +10,10 @@ htmlcov/
 .env
 *.env
 
+# Generated migration inventories / reports
+pg-source-parameters.json
+pg-source-parameters-errors.json
+
 # Terraform
 terraform/.terraform/
 *.tfstate

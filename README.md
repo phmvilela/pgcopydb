@@ -27,6 +27,7 @@ pg_cyan/
   __init__.py          Package metadata (__version__)
   cli.py               click CLI — `python -m pg_cyan.cli`
   preflight.py         PgCyanPreflight: pre-migration readiness checks
+  parameters.py        PgCyanParameters: export source instance parameters
   cloud/azure/         Azure SDK integrations (skeleton)
   postgres/            PostgreSQL connection/introspection utils (skeleton)
 terraform/             Azure worker-VM provisioning (VNet, NSG, VM, cloud-init)
@@ -73,6 +74,27 @@ python -m pg_cyan.cli preflight
 | 1    | Not ready / a check failed  |
 | 2    | Interrupted                 |
 
+### Export the source instance parameters
+
+```bash
+# Dump every instance-level parameter of the source to JSON
+python -m pg_cyan.cli source-parameters
+```
+
+`source-parameters` connects to the source and writes an inventory of **all
+instance-level configuration parameters** (`pg_settings`) — the values the
+planner and preflight gates read (`wal_level`, `max_wal_senders`,
+`max_replication_slots`, `track_commit_timestamp`, `max_slot_wal_keep_size`, …).
+
+| Outcome | File written                          | Exit |
+|---------|---------------------------------------|------|
+| Success | `pg-source-parameters.json` (non-empty) | 0    |
+| Failure | `pg-source-parameters-errors.json`      | 1    |
+| Interrupted | *(none)*                          | 2    |
+
+Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
+directory).
+
 ### Configuration (environment variables)
 
 | Variable                     | Default     | Purpose                          |
@@ -83,6 +105,7 @@ python -m pg_cyan.cli preflight
 | `PG_SOURCE_PASSWORD`         | *(empty)*   | Source password                  |
 | `PG_SOURCE_DATABASE`         | `postgres`  | Source database                  |
 | `PREFLIGHT_TIMEOUT_SECONDS`  | `30`        | Connection timeout               |
+| `PG_OUTPUT_DIR`              | `.`         | Output dir for generated JSON    |
 | `LOG_LEVEL`                  | `INFO`      | Log verbosity                    |
 
 ## Docker

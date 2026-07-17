@@ -10,8 +10,9 @@ minimal downtime, across three stages: **pre-migration → migration →
 post-migration**. Deliverables are a mix of Python (checks/orchestration) and
 Terraform (Azure provisioning). See `README.md` for the user-facing view.
 
-Current state: only the **pre-migration preflight** checks and the Terraform
-**worker VM** exist. Migration and post-migration are not built yet.
+Current state: the **pre-migration preflight** checks, the **source parameter
+inventory** (`source-parameters`), and the Terraform **worker VM** exist.
+Migration and post-migration are not built yet.
 
 ## Where work comes from
 
@@ -62,9 +63,21 @@ literals — never f-string user/config values into SQL.
 
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
-`preflight` is implemented. Options default to `PG_SOURCE_*` env vars so the
-same invocation works locally and in the container. Exit codes: `0` ready,
-`1` not ready, `2` interrupted — keep these stable.
+`preflight` and `source-parameters` are implemented. Options default to
+`PG_SOURCE_*` env vars so the same invocation works locally and in the
+container. Exit codes: `0` ready/success, `1` not ready/failure, `2`
+interrupted — keep these stable.
+
+`source-parameters` (`pg_cyan/parameters.py`, `PgCyanParameters`) is the second
+orchestrator and the template for **artifact-producing** stages: instead of a
+pass/fail summary it writes a JSON *inventory* to disk. It follows the same
+orchestrator conventions (connection/state on the instance, `_log_event`,
+graceful degradation — `export()` never raises). The file contract is the
+important part and comes from its issue: a non-empty `pg-source-parameters.json`
+on success, or `pg-source-parameters-errors.json` carrying an error message on
+any failure (connection, query, empty result, or write). Both land in
+`--output-dir` / `$PG_OUTPUT_DIR`. Keep this success-vs-error two-file shape for
+future artifact stages.
 
 ## Configuration & secrets
 
