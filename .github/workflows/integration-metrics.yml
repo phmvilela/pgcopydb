@@ -1,0 +1,48 @@
+name: "Integration: source-pg-metrics"
+
+# Manual only (issue #19) -- hits a real PostgreSQL server, so it never runs
+# on push/pull_request. Only the credentials (user/password) are secrets;
+# host/port/database aren't sensitive and come from plain repo variables,
+# both configured on GitHub -- not from the workflow file.
+on:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: Collect metrics from source database
+    runs-on: ubuntu-latest
+    env:
+      PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
+      PG_SOURCE_PORT: ${{ vars.PG_SOURCE_PORT }}
+      PG_SOURCE_USER: ${{ secrets.PG_SOURCE_USER }}
+      PG_SOURCE_PASSWORD: ${{ secrets.PG_SOURCE_PASSWORD }}
+      PG_SOURCE_DATABASE: ${{ vars.PG_SOURCE_DATABASE }}
+      PG_OUTPUT_DIR: integration-output
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run source-pg-metrics integration test
+        run: python -m pytest tests/integration -m integration -v
+
+      - name: Upload source-pg-metrics.json for human review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-pg-metrics-${{ github.run_id }}
+          path: integration-output/*.json
+          if-no-files-found: warn
+          retention-days: 30
