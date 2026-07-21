@@ -1,15 +1,15 @@
-name: "Integration: source-pg-metrics"
+name: "Integration: pre-migration artifacts"
 
-# Manual only (issue #19) -- hits a real PostgreSQL server, so it never runs
-# on push/pull_request. Only the credentials (user/password) are secrets;
-# host/port/database aren't sensitive and come from plain repo variables,
-# both configured on GitHub -- not from the workflow file.
+# Manual only (issues #19, #4) -- hits a real PostgreSQL server, so it never
+# runs on push/pull_request. Only the credentials (user/password) are
+# secrets; host/port/database aren't sensitive and come from plain repo
+# variables, both configured on GitHub -- not from the workflow file.
 on:
   workflow_dispatch:
 
 jobs:
   integration:
-    name: Collect metrics from source database
+    name: Collect pre-migration artifacts from source database
     runs-on: ubuntu-latest
     env:
       PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
@@ -35,14 +35,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run source-pg-metrics integration test
+      - name: Run pre-migration integration tests
         run: python -m pytest tests/integration -m integration -v
 
-      - name: Upload source-pg-metrics.json for human review
+      - name: Upload pre-migration artifact JSON for human review
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: source-pg-metrics-${{ github.run_id }}
+          name: pre-migration-artifacts-${{ github.run_id }}
           path: integration-output/*.json
           if-no-files-found: warn
           retention-days: 30

@@ -110,20 +110,24 @@ with the error message (issue #3). Object counts rely on
   the default run.
 - Add/extend a test for every new check or CLI change before considering it
   done.
-- `tests/integration/test_metrics_integration.py` (issue #19) is the template
-  for a manual integration test: it runs the real orchestrator against a live
-  server (connection settings from `PG_SOURCE_*` env vars, same as
-  `collect_metrics_from_env`) and asserts only the *shape* of the output --
+- `tests/integration/test_pre_migration_integration.py` (issue #19, extended
+  for issue #4) is the **one file** for manual integration tests of the
+  pre-migration artifact stages -- add new stages as another test function
+  here rather than a new integration test file. Each test runs the real
+  orchestrator against a live server (connection settings from `PG_SOURCE_*`
+  env vars, same as `collect_metrics_from_env` /
+  `export_parameters_from_env`) and asserts only the *shape* of the output --
   every documented field is present -- never specific values. It's driven
   manually via the `workflow_dispatch`-only
-  `.github/workflows/integration-metrics.yml`, which reads connection details
-  configured on GitHub -- credentials (`PG_SOURCE_USER`/`PG_SOURCE_PASSWORD`)
-  as repo Secrets, everything else (`PG_SOURCE_HOST`/`PG_SOURCE_PORT`/
-  `PG_SOURCE_DATABASE`) as plain repo Variables -- and uploads the produced
-  JSON as a build artifact for a human to eyeball. Follow this pattern
-  (env-var config, secrets only for credentials, field-presence-only
-  assertions, `workflow_dispatch` + artifact upload) for future integration
-  tests.
+  `.github/workflows/integration-pre-migration.yml`, which reads connection
+  details configured on GitHub -- credentials (`PG_SOURCE_USER`/
+  `PG_SOURCE_PASSWORD`) as repo Secrets, everything else (`PG_SOURCE_HOST`/
+  `PG_SOURCE_PORT`/`PG_SOURCE_DATABASE`) as plain repo Variables -- and
+  uploads the produced JSON files as a build artifact for a human to
+  eyeball. Follow this pattern (single integration test file per stage
+  addition, env-var config, secrets only for credentials,
+  field-presence-only assertions, `workflow_dispatch` + artifact upload) for
+  future stages.
 
 ## Style
 

@@ -53,6 +53,25 @@ def test_build_output_is_non_empty_and_well_formed():
     assert json.loads(json.dumps(payload, default=str))["parameter_count"] == 2
 
 
+def test_export_writes_error_file_on_query_failure(tmp_path, monkeypatch):
+    exporter = make_exporter(output_dir=str(tmp_path))
+    monkeypatch.setattr(exporter, "connect", lambda: True)
+
+    def fake_fetch():
+        exporter.errors.append("Parameter query failed: permission denied for table pg_settings")
+        return None
+
+    monkeypatch.setattr(exporter, "fetch_parameters", fake_fetch)
+
+    summary = exporter.export()
+
+    assert summary["status"] == "failure"
+    error_file = tmp_path / PgCyanParameters.ERROR_FILENAME
+    assert error_file.exists()
+    payload = json.loads(error_file.read_text())
+    assert "permission denied" in payload["errors"][0]
+
+
 def test_export_writes_error_file_when_connection_fails(tmp_path):
     exporter = make_exporter(output_dir=str(tmp_path))
     # Nothing listening -> connect() fails fast (timeout=1).

@@ -165,13 +165,13 @@ wiring). Tests requiring a live PostgreSQL server belong in a separate
 integration suite (`tests/integration/`, marked `integration`, excluded from
 the default run).
 
-### Integration test: source-pg-metrics
+### Integration tests: pre-migration artifacts
 
-`tests/integration/test_metrics_integration.py` runs `source-pg-metrics`
-against a real PostgreSQL server and checks the *shape* of the resulting
-`source-pg-metrics.json` — that every documented field is present — without
-validating its values. Run it locally against a source you point at via the
-usual `PG_SOURCE_*` env vars:
+`tests/integration/test_pre_migration_integration.py` runs `source-pg-metrics`
+(issue #19) and `source-parameters` (issue #4) against a real PostgreSQL
+server and checks the *shape* of each resulting JSON file — that every
+documented field is present — without validating its values. Run it locally
+against a source you point at via the usual `PG_SOURCE_*` env vars:
 
 ```bash
 PG_SOURCE_HOST=... PG_SOURCE_USER=... PG_SOURCE_PASSWORD=... PG_SOURCE_DATABASE=... \
@@ -179,7 +179,7 @@ PG_SOURCE_HOST=... PG_SOURCE_USER=... PG_SOURCE_PASSWORD=... PG_SOURCE_DATABASE=
 ```
 
 It also runs manually from GitHub Actions via the **"Integration:
-source-pg-metrics"** workflow (`workflow_dispatch` only — it's never
+pre-migration artifacts"** workflow (`workflow_dispatch` only — it's never
 triggered by push/PR). Connection details come from GitHub, split by
 sensitivity: credentials are repo **Secrets**, everything else is a plain
 repo **Variable**:
@@ -192,8 +192,8 @@ repo **Variable**:
 | `PG_SOURCE_USER`      | Secret    | Source user             |
 | `PG_SOURCE_PASSWORD`  | Secret    | Source password         |
 
-The resulting `source-pg-metrics.json` is uploaded as a workflow artifact for
-human review.
+The resulting `source-pg-metrics.json` and `pg-source-parameters.json` are
+uploaded as a workflow artifact for human review.
 
 ## Development & work tracking
 
