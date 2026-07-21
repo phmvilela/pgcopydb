@@ -1,0 +1,42 @@
+# Example Terraform variables for the pg_cyan AKS deployment.
+# Copy to terraform.tfvars and adjust for your environment.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+
+resource_group_name = "pg-cyan-aks-rg"
+azure_region        = "eastus"
+cluster_name        = "pg-cyan-aks"
+
+# Kubernetes version — check availability in your region:
+#   az aks get-versions --location eastus -o table
+kubernetes_version = "1.30"
+sku_tier           = "Standard"
+
+# Namespace MUST match deploy/k8s/00-namespace.yaml
+k8s_namespace = "pgcyan-migration"
+
+# Node pool (autoscaled). Bound max_count to cap concurrent shard fan-out cost.
+node_vm_size         = "Standard_D4s_v5"
+node_min_count       = 2
+node_max_count       = 6
+max_pods_per_node    = 60
+node_os_disk_size_gb = 128
+
+# Networking (Azure CNI Overlay). service_cidr must NOT overlap the VNet.
+vnet_address_space           = ["10.10.0.0/16"]
+node_subnet_address_prefixes = ["10.10.0.0/20"]
+pod_cidr                     = "10.244.0.0/16"
+service_cidr                 = "10.0.0.0/16"
+dns_service_ip               = "10.0.0.10"
+
+# ACR name must be globally unique and alphanumeric only (no hyphens).
+acr_name = "pgcyanacr"
+acr_sku  = "Standard"
+
+# Monitoring
+log_retention_in_days = 30
+
+environment_tags = {
+  team        = "database-migration"
+  environment = "staging"
+}

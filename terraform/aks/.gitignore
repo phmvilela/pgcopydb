@@ -1,0 +1,6 @@
+# Terraform working dirs / state (state + tfvars already covered by repo root .gitignore)
+.terraform/
+.terraform.lock.hcl
+
+# Rendered helper script (contains cluster-specific client-ids; re-generated on apply)
+generated/

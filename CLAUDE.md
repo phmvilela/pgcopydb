@@ -138,10 +138,23 @@ with the error message (issue #3). Object counts rely on
 
 ## Terraform
 
-Lives in `terraform/` (resource group, VNet, subnet, NSG, public IP, VM,
-cloud-init). It provisions the migration **worker VM**. It is meant to be
-idempotent — `terraform apply` should be safe to re-run. Restrict
-`allowed_ssh_cidr` and keep state/secrets out of the repo.
+Two independent root modules, each with its own state:
+
+- `terraform/` — the migration **worker VM** (resource group, VNet, subnet,
+  NSG, public IP, VM, cloud-init). Restrict `allowed_ssh_cidr`.
+- `terraform/aks/` — the **AKS cluster** that runs the `deploy/k8s` sharded
+  pgcopydb migration (issue #34). Enables **OIDC issuer + Workload Identity**,
+  creates the two user-assigned managed identities + federated credentials for
+  the `pgcyan-orchestrator`/`pgcyan-worker` ServiceAccounts, an ACR (AcrPull to
+  the kubelet identity), Log Analytics/Container Insights, and Azure CNI
+  Overlay networking. Post-apply, its outputs feed the
+  `azure.workload.identity/client-id` SA annotations in `deploy/k8s/01-rbac.yaml`
+  (see `terraform/aks/README.md`). Managed-identity → Postgres login must be
+  granted DB-side out of band.
+
+Both modules are meant to be idempotent — `terraform apply` should be safe to
+re-run. Keep state/secrets out of the repo (`*.tfstate`, `*.tfvars` are
+gitignored; commit only `*.tfvars.example`).
 
 ## Known gaps / cleanups worth doing
 
