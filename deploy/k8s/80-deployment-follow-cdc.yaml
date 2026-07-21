@@ -1,0 +1,80 @@
+# 80-deployment-follow-cdc.yaml
+# ---------------------------------------------------------------------------
+# PHASE 4 (optional): CHANGE DATA CAPTURE / catch-up before cutover.
+#
+# THE HARD CONSTRAINT that makes this NOT a shard: logical decoding consumes a
+# SINGLE replication slot with a SINGLE consumer. You cannot fan CDC out across
+# shared-nothing pods the way phases 2/3 fan out -- the slot is one ordered
+# stream. So this is exactly ONE long-lived pod (a Deployment, replicas: 1),
+# running `pgcopydb follow`, streaming source changes since the snapshot LSN and
+# applying them to the target until lag ~ 0, at which point the operator flips
+# the application endpoint (cutover).
+#
+# This is why the sharded model is fundamentally an INITIAL-COPY accelerator:
+# phases 0-3 parallelise the bulk load; the ongoing-replication tail is
+# inherently serial. If the source can take a hard cutover window (frozen
+# source, --not-consistent path), you may skip this phase entirely.
+#
+# ASSUMPTION: wal_level=logical and a migration role with REPLICATION are
+# already set on the source (pre-migration issues #6/#14). The publication+slot
+# are created by pgcopydb itself (see notes/issue-22-migration-stage-assessment.md).
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgcyan-follow-cdc
+  namespace: pgcyan-migration
+spec:
+  replicas: 1              # MUST be 1 -- one slot, one consumer
+  strategy:
+    type: Recreate         # never two consumers on the slot at once
+  selector:
+    matchLabels:
+      pgcyan.dev/phase: "cdc"
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/phase: "cdc"
+    spec:
+      serviceAccountName: pgcyan-worker
+      containers:
+        - name: pgcopydb-follow
+          image: "REPLACE_ME/pgcyan:latest"   # TODO: pin image with pgcopydb
+          # `follow` resumes from the slot; --resume lets a restarted pod pick up
+          # where the previous one left off (slot LSN is server-side, durable).
+          command: ["pgcopydb", "follow"]
+          args:
+            - "--dir=/work/cdc"
+            - "--resume"
+            # TODO: --plugin/--wal2json vs pgoutput per source capability; the
+            # planner records the choice. LOB caveats live in
+            # notes/"PostgreSQL Logical Replication Limitations ... LOBs".md
+          envFrom:
+            - secretRef:
+                name: pgcyan-db-uris
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+          resources:
+            # Apply is target-bound; the pod transforms+ships WAL. Modest.
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "2",    memory: "2Gi" }
+          # TODO: expose `pgcopydb stream sentinel get --json` lag as a readiness
+          # gate / metric so the orchestrator knows when lag ~ 0 and cutover is
+          # safe. Zero lag is necessary but not sufficient -- see post-cutover
+          # verification in pgcopydb-and-pgdump-tooling-assessment.md §3.
+      volumes:
+        - name: workdir
+          persistentVolumeClaim:
+            claimName: pgcyan-workdir
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pgcyan-follow-cdc
+  namespace: pgcyan-migration
+spec:
+  maxUnavailable: 0        # keep the single CDC consumer alive through drains
+  selector:
+    matchLabels:
+      pgcyan.dev/phase: "cdc"

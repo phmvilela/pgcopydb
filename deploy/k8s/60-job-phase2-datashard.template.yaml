@@ -1,0 +1,115 @@
+# 60-job-phase2-datashard.template.yaml
+# ---------------------------------------------------------------------------
+# PHASE 2: DATA SHARDS -- the horizontally-scaled COPY workers. This is a
+# TEMPLATE. The orchestrator stamps out ONE Job per entry in
+# plan.json > data_shards, substituting the ${...} placeholders. They all run
+# concurrently, all point at the same source+target, and by construction (their
+# filter files are disjoint) they never touch the same table.
+#
+# WHERE THE WORK LIVES: COPY streams source -> pod -> target. The pod is mostly
+# an I/O pipe; its bottleneck is NETWORK bandwidth, not CPU. That is exactly why
+# fanning out into many pods helps here (more aggregate egress/ingress) -- and
+# is the OPPOSITE of phase 3, whose work runs on the target server (see 70/71).
+#
+# NO-OVERLAP GUARANTEE: `--filters /plan/${FILTER_FILE}` restricts this shard to
+# an explicit [include-only-table] list authored by the planner. Two shards with
+# disjoint lists cannot collide. This is the physical enforcement of "the
+# planner makes sure nothing overlaps".
+#
+# CONSISTENCY: `--snapshot ${SNAPSHOT_ID}` ties this shard to the holder's
+# snapshot (phase 1) so all shards copy the same instant.
+#
+# INTRA-TABLE SPLIT: `--split-tables-larger-than` lets a single shard further
+# parallelise a giant table across `--table-jobs` processes via integer-range or
+# CTID split. For a table too big for even one shard, the planner instead emits
+# multiple shards each pinned to a different key range (TODO: needs a per-range
+# filter mechanism; today pgcopydb splits WITHIN a job, so range-across-jobs is
+# a planner responsibility -- see note).
+#
+# RESUME: `--dir=/work/${SHARD_NAME}` (own subPath) + `--resume`. A killed shard
+# pod restarts and continues at per-table / per-part granularity, never redoing
+# a completed table. backoffLimit lets k8s do that restart automatically.
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # TODO(orchestrator): substitute ${SHARD_NAME}, e.g. pgcyan-datashard-shard-0
+  name: pgcyan-datashard-${SHARD_NAME}
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/phase: "data"
+    pgcyan.dev/shard: "${SHARD_NAME}"
+spec:
+  backoffLimit: 6                 # shards are resumable; let k8s retry generously
+  completions: 1
+  parallelism: 1                  # ONE pod per shard; scale-out is MORE SHARDS, not more pods here
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/phase: "data"
+        pgcyan.dev/shard: "${SHARD_NAME}"
+    spec:
+      serviceAccountName: pgcyan-worker
+      restartPolicy: Never
+      # An initContainer lifts the snapshot id from the shared file into a place
+      # the main container can read, so we do not hard-code it.
+      initContainers:
+        - name: read-snapshot
+          image: "REPLACE_ME/pgcyan:latest"
+          command: ["sh", "-c", "cp /work/coordinator/snapshot /work/${SHARD_NAME}/snapshot.id"]
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+      containers:
+        - name: pgcopydb-copy
+          image: "REPLACE_ME/pgcyan:latest"   # TODO: pin image with pgcopydb
+          # `clone --skip-extensions --no-acl ...` limited to this shard's tables.
+          # Using `copy-db`/`clone` restricted to the include-only filter set.
+          command: ["sh", "-c"]
+          args:
+            - >
+              pgcopydb clone
+              --dir=/work/${SHARD_NAME}
+              --filters=/plan/${FILTER_FILE}
+              --snapshot="$(cat /work/${SHARD_NAME}/snapshot.id)"
+              --table-jobs=${TABLE_JOBS}
+              --index-jobs=0
+              --split-tables-larger-than=${SPLIT_TABLES_LARGER_THAN}
+              --skip-vacuum
+              --no-owner
+              --resume
+              --restart=false
+          # NOTE: --index-jobs=0 and --skip-vacuum: phase 2 loads HEAP ONLY.
+          # Index builds, constraints and vacuum are deferred to phase 3 so the
+          # COPY is not slowed by index maintenance. This is the whole point of
+          # the pre-data / post-data split.
+          envFrom:
+            - secretRef:
+                name: pgcyan-db-uris
+          # TODO(orchestrator): substitute these from plan.json > data_shards[i].
+          env:
+            - name: FILTER_FILE
+              value: "${FILTER_FILE}"            # e.g. shard-0.filters
+            - name: TABLE_JOBS
+              value: "${TABLE_JOBS}"             # e.g. 4  (intra-shard COPY processes)
+            - name: SPLIT_TABLES_LARGER_THAN
+              value: "${SPLIT_TABLES_LARGER_THAN}"  # e.g. 50GB
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+            - name: plan
+              mountPath: /plan
+              readOnly: true
+          resources:
+            # Network-bound; sized per-shard by the planner from assigned bytes.
+            # TODO(orchestrator): substitute from plan.json > data_shards[i].resources
+            requests: { cpu: "${CPU_REQUEST}", memory: "${MEM_REQUEST}" }
+            limits:   { cpu: "${CPU_LIMIT}",   memory: "${MEM_LIMIT}" }
+      volumes:
+        - name: workdir
+          persistentVolumeClaim:
+            claimName: pgcyan-workdir
+        - name: plan
+          configMap:
+            name: pgcyan-plan

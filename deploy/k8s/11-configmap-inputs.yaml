@@ -1,0 +1,36 @@
+# 11-configmap-inputs.yaml
+# ---------------------------------------------------------------------------
+# The planner's INPUTS. These are the artifacts the pre-migration stage already
+# produces (source-pg-metrics.json from metrics.py, pg-source-parameters.json
+# from parameters.py) plus operator-supplied constraints (cost ceiling, cutover
+# window, expert overrides).
+#
+# ASSUMPTION: the pre-migration stage has already run and its two JSON artifacts
+# are available. In a real pipeline the orchestrator would populate this
+# ConfigMap from those files rather than us hand-writing them here.
+#
+# TODO: metrics.py currently reports pg_total_relation_size (heap+index
+# conflated). The planner needs heap-vs-index SEPARATELY to size the COPY phase
+# (heap) independently from the index-build phase (target-side). Extend
+# metrics.py before trusting the byte splits the planner derives from this.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgcyan-planner-inputs
+  namespace: pgcyan-migration
+data:
+  # TODO: replace inline stubs with the real artifacts, e.g. mounted from the
+  # pre-migration Job's output volume or `kubectl create configmap --from-file`.
+  source-pg-metrics.json: |
+    { "TODO": "output of `python -m pg_cyan.cli source-pg-metrics`" }
+  pg-source-parameters.json: |
+    { "TODO": "output of `python -m pg_cyan.cli source-parameters`" }
+  constraints.json: |
+    {
+      "TODO": "operator-supplied, not yet produced by any tool",
+      "max_cloud_cost_usd": null,
+      "cutover_window_minutes": null,
+      "target_max_connections": null,
+      "expert_overrides": {}
+    }

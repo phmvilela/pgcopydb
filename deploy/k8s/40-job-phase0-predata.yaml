@@ -1,0 +1,63 @@
+# 40-job-phase0-predata.yaml
+# ---------------------------------------------------------------------------
+# PHASE 0: pre-data (schema WITHOUT secondary indexes / constraints).
+#
+# A single coordinator Job. It creates the target schema -- tables, types,
+# owners, sequences, primary-key-backing objects deferred -- but deliberately
+# NOT secondary indexes or foreign keys (those are phase 3, built after the data
+# lands, which is dramatically faster than maintaining them during COPY).
+#
+# This runs BEFORE any data shard so every shard finds its target tables already
+# present. It is a hard barrier: no shard may start until this succeeds.
+#
+# ASSUMPTION: `pgcopydb restore pre-data` (equivalently the pre-data section of
+# `pgcopydb clone`) is the mechanism. It uses the same snapshot as the shards;
+# since the snapshot holder (phase 1) owns the snapshot, this job either shares
+# --dir with it or takes the snapshot id the same way the shards do. Modelled
+# here as: snapshot holder starts first, writes the id, THEN this job runs.
+# (Ordering is enforced by the orchestrator, not by YAML.)
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pgcyan-phase0-predata
+  namespace: pgcyan-migration
+spec:
+  backoffLimit: 3           # pre-data is cheap to retry; it is idempotent-ish
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/phase: "pre-data"
+    spec:
+      serviceAccountName: pgcyan-worker
+      restartPolicy: Never
+      containers:
+        - name: pgcopydb-predata
+          image: "REPLACE_ME/pgcyan:latest"   # TODO: pin image with pgcopydb
+          command: ["pgcopydb", "restore", "pre-data"]
+          args:
+            - "--dir=/work/phase0"
+            - "--resume"
+            - "--no-owner"          # ASSUMPTION: target roles pre-created by Terraform; drop if not
+            - "--snapshot=$(SNAPSHOT_ID)"
+          env:
+            - name: SNAPSHOT_ID
+              # TODO: an initContainer should read /work/coordinator/snapshot
+              # (written by the snapshot holder) into this env var. Placeholder
+              # wiring shown; see 50-deployment-snapshot-holder.yaml.
+              value: "REPLACE_VIA_INITCONTAINER"
+          envFrom:
+            - secretRef:
+                name: pgcyan-db-uris   # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+          resources:
+            # Pre-data is schema DDL only -- tiny. Thin pod.
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+      volumes:
+        - name: workdir
+          persistentVolumeClaim:
+            claimName: pgcyan-workdir

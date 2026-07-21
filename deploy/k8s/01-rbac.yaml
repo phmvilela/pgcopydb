@@ -1,0 +1,76 @@
+# 01-rbac.yaml
+# ---------------------------------------------------------------------------
+# Two identities:
+#
+#   1. pgcyan-orchestrator -- the control plane. It (and only it) is allowed to
+#      create/patch/delete the per-phase Jobs and to read their status so it can
+#      enforce the DAG barriers (wait for phase N to fully succeed before
+#      applying phase N+1). This is the imperative glue that plain YAML cannot
+#      express on its own.
+#
+#   2. pgcyan-worker -- the data-plane identity used by every pgcopydb Job/pod
+#      (pre-data, snapshot holder, data shards, index/FK, CDC). Workers need NO
+#      Kubernetes API access at all -- they only talk to Postgres. They get a
+#      near-empty ServiceAccount purely so we can bind Azure Workload Identity
+#      (federated) credentials to it instead of shipping static DB passwords.
+#
+# ASSUMPTION: cluster is AKS with OIDC + Workload Identity enabled, so DB auth
+# can be Entra-token based. If that is not available, fall back to the Secret in
+# 10-secrets.example.yaml. Per pgcyan CLAUDE.md we prefer managed identity /
+# DefaultAzureCredential over static credentials.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgcyan-orchestrator
+  namespace: pgcyan-migration
+  # TODO: annotate with the Workload Identity client id once the planner app's
+  # federated credential exists:
+  #   azure.workload.identity/client-id: "<orchestrator-mi-client-id>"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgcyan-worker
+  namespace: pgcyan-migration
+  labels:
+    azure.workload.identity/use: "true"
+  # TODO: annotate with the Workload Identity client id of the managed identity
+  # that has been granted login on BOTH source and target Postgres:
+  #   azure.workload.identity/client-id: "<worker-mi-client-id>"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcyan-orchestrator
+  namespace: pgcyan-migration
+rules:
+  # Create and supervise the phase Jobs and the snapshot-holder Deployment.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # Read pod status/logs to detect shard failures and surface progress.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # Publish the generated plan and read the collected inputs.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcyan-orchestrator
+  namespace: pgcyan-migration
+subjects:
+  - kind: ServiceAccount
+    name: pgcyan-orchestrator
+    namespace: pgcyan-migration
+roleRef:
+  kind: Role
+  name: pgcyan-orchestrator
+  apiGroup: rbac.authorization.k8s.io

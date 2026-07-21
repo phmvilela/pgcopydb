@@ -1,0 +1,73 @@
+# 71-job-phase3-fk.yaml
+# ---------------------------------------------------------------------------
+# PHASE 3b: FOREIGN KEY constraints -- the SINGLE-PASS job.
+#
+# WHY it is one job and NOT sharded like the indexes:
+#   A foreign key spans TWO tables that may live in DIFFERENT data shards. There
+#   is no clean way to partition FK creation across shared-nothing pods without
+#   them coordinating locks (ADD FOREIGN KEY takes SHARE ROW EXCLUSIVE on both
+#   referenced and referencing table). So FKs are applied in ONE coordinated
+#   pass, after ALL data (phase 2) AND all indexes (phase 3a) are in place.
+#   Within this one job pgcopydb can still parallelise non-conflicting FKs via
+#   --restore-jobs; "single pass" means one job, not one connection.
+#
+# WHY MORE KUBERNETES POWER HERE IS A CATEGORY ERROR (the question that started
+# this design): FK validation -- the scan proving existing rows satisfy the
+# constraint -- runs ON THE TARGET SERVER, like index builds. Fattening THIS pod
+# does not speed it up. The lever is again target-side: --restore-jobs (bounded
+# by target vCPU / max_connections) and the target's CPU/IOPS. So this pod, too,
+# is thin; if you want phase 3 to go faster, scale the TARGET, not the pod.
+#
+# This is the last hard barrier before the source and target are schema- and
+# data-equivalent (modulo any CDC still catching up in phase 4).
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pgcyan-phase3-fk
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/phase: "post-data-fk"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/phase: "post-data-fk"
+    spec:
+      serviceAccountName: pgcyan-worker
+      restartPolicy: Never
+      containers:
+        - name: pgcopydb-fk
+          image: "REPLACE_ME/pgcyan:latest"   # TODO: pin image with pgcopydb
+          # ASSUMPTION: `pgcopydb restore constraints` (post-data, no filter ->
+          # whole DB) applies FKs and any remaining table constraints in one
+          # coordinated pass. If a single global filter is not desired, run
+          # against the full plan (no --filters) so cross-shard FKs resolve.
+          command: ["sh", "-c"]
+          args:
+            - >
+              pgcopydb restore constraints
+              --dir=/work/phase3-fk
+              --restore-jobs=${RESTORE_JOBS}
+              --resume
+          envFrom:
+            - secretRef:
+                name: pgcyan-db-uris
+          env:
+            - name: RESTORE_JOBS
+              # Concurrent FK/constraint builds on the target. Bound by target
+              # vCPU / max_connections. TODO(planner): set from constraints.json.
+              value: "8"
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+          resources:
+            # THIN ON PURPOSE -- validation happens on the target server.
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: workdir
+          persistentVolumeClaim:
+            claimName: pgcyan-workdir

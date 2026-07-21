@@ -1,0 +1,20 @@
+# 00-namespace.yaml
+# ---------------------------------------------------------------------------
+# All migration workloads live in a single namespace so that RBAC, quotas and
+# NetworkPolicies can be scoped to the migration and torn down as a unit when
+# the cutover is complete.
+#
+# ASSUMPTION: one namespace per migration run. If you run several migrations
+# concurrently (e.g. one per source database) give each its own namespace and
+# parameterise the name below -- the plan/planner already keys everything on a
+# run id, so the natural mapping is namespace == run id.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgcyan-migration
+  labels:
+    app.kubernetes.io/part-of: pgcyan
+    # TODO: the orchestrator should stamp a unique run id here so that
+    # `kubectl delete ns pgcyan-migration-<runid>` cleanly reclaims everything.
+    pgcyan.dev/run-id: "REPLACE_ME_RUN_ID"

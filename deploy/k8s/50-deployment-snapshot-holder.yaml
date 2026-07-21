@@ -1,0 +1,93 @@
+# 50-deployment-snapshot-holder.yaml
+# ---------------------------------------------------------------------------
+# PHASE 1: the SNAPSHOT HOLDER -- the single most safety-critical object here.
+#
+# THE PROBLEM it solves: a Postgres exported snapshot is only valid while the
+# transaction that exported it stays open. The moment that connection closes,
+# `SET TRANSACTION SNAPSHOT` in the shards fails and each shard would otherwise
+# fall back to its OWN, DIFFERENT point in time -> silent cross-shard
+# inconsistency / corruption. Because our shards are shared-nothing separate
+# pods, none of them can own the snapshot on behalf of the others.
+#
+# THE FIX: one long-lived pod runs `pgcopydb snapshot`, which opens the
+# exporting transaction, holds it, and writes the snapshot id under the shared
+# work dir. Every phase-0/2 pod reads that id and passes `--snapshot`, so they
+# all copy the SAME instant. This pod must stay Running for the entire duration
+# of the initial COPY (phases 0-2). Hence a Deployment (restarts if killed), not
+# a Job.
+#
+# CAVEAT: if this pod dies, the snapshot is GONE and cannot be recreated at the
+# same LSN -- the in-flight initial copy must restart (--restart) from a new
+# snapshot. Treat this pod as a singleton pet: PodDisruptionBudget + priority.
+#
+# ALTERNATIVE (frozen source): if the source is quiesced/read-only for the
+# migration window, skip this pod entirely and give the shards
+# `--not-consistent` (each takes its own snapshot; safe because nothing writes).
+# The planner records which mode applies in plan.json -> snapshot.mode.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgcyan-snapshot-holder
+  namespace: pgcyan-migration
+spec:
+  replicas: 1              # MUST be exactly 1 -- a second holder = a second snapshot
+  strategy:
+    type: Recreate         # never run two holders at once
+  selector:
+    matchLabels:
+      pgcyan.dev/phase: "snapshot-holder"
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/phase: "snapshot-holder"
+    spec:
+      serviceAccountName: pgcyan-worker
+      # TODO: add a high PriorityClass so this pod is the LAST to be evicted
+      # under node pressure. Its death invalidates the whole initial copy.
+      # priorityClassName: pgcyan-critical
+      containers:
+        - name: snapshot
+          image: "REPLACE_ME/pgcyan:latest"   # TODO: pin image with pgcopydb
+          # `pgcopydb snapshot` exports and HOLDS the snapshot, writing its id to
+          # /work/coordinator/snapshot, and blocks (keeps the txn open) until
+          # terminated. Shards read that file.
+          command: ["pgcopydb", "snapshot"]
+          args:
+            - "--dir=/work/coordinator"
+          envFrom:
+            - secretRef:
+                name: pgcyan-db-uris
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+          resources:
+            # Holds one idle transaction. Essentially free.
+            requests: { cpu: "50m",  memory: "128Mi" }
+            limits:   { cpu: "250m", memory: "256Mi" }
+          # Liveness: if the snapshot file disappears or the process dies, let
+          # k8s restart it -- though note a restart means a NEW snapshot, so the
+          # orchestrator must treat a holder restart as "initial copy must
+          # --restart". TODO: wire an alert on restartCount > 0.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/work/coordinator/snapshot"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: workdir
+          persistentVolumeClaim:
+            claimName: pgcyan-workdir
+---
+# Guard against voluntary disruption (node drain / autoscaler) evicting the
+# singleton holder mid-copy.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pgcyan-snapshot-holder
+  namespace: pgcyan-migration
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      pgcyan.dev/phase: "snapshot-holder"

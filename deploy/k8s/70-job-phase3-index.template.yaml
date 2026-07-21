@@ -1,0 +1,81 @@
+# 70-job-phase3-index.template.yaml
+# ---------------------------------------------------------------------------
+# PHASE 3a: SECONDARY INDEX builds. TEMPLATE -- one Job per plan.json >
+# index_shards entry. Runs only AFTER the phase-2 barrier (every data shard
+# succeeded), because an index over half-loaded data is worthless.
+#
+# CRITICAL RESOURCE INSIGHT (this drove the whole phase-3 design):
+#   The heavy compute of CREATE INDEX runs ON THE TARGET POSTGRES SERVER, not in
+#   this pod. This pod issues `CREATE INDEX` and then just holds a connection
+#   open and WAITS. Giving this pod more CPU/RAM does almost nothing. Therefore:
+#     * pods here are deliberately THIN (see resources below);
+#     * the real throughput levers are TARGET-SIDE: number of concurrent index
+#       connections (--index-jobs across these jobs), the target's
+#       maintenance_work_mem, max_parallel_maintenance_workers, CPU cores and
+#       IOPS. The planner should raise those for the index window (and consider
+#       temporarily scaling the target SKU UP, then back down).
+#   Sharding index builds across several Jobs helps ONLY up to the target's core
+#   count -- each CREATE INDEX pins ~1 target core; beyond ~target_vCPU total
+#   concurrent builds, extra jobs just queue on the server.
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # TODO(orchestrator): substitute ${INDEX_SHARD_NAME}, e.g. pgcyan-index-idx-0
+  name: pgcyan-index-${INDEX_SHARD_NAME}
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/phase: "post-data-index"
+    pgcyan.dev/shard: "${INDEX_SHARD_NAME}"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/phase: "post-data-index"
+    spec:
+      serviceAccountName: pgcyan-worker
+      restartPolicy: Never
+      containers:
+        - name: pgcopydb-index
+          image: "REPLACE_ME/pgcyan:latest"   # TODO: pin image with pgcopydb
+          # Build secondary indexes (and the unique indexes backing PK/UK) for
+          # this shard's tables. FKs are handled separately in 71 because they
+          # cross shard boundaries.
+          command: ["sh", "-c"]
+          args:
+            - >
+              pgcopydb restore indexes
+              --dir=/work/${INDEX_SHARD_NAME}
+              --filters=/plan/${FILTER_FILE}
+              --index-jobs=${INDEX_JOBS}
+              --resume
+          envFrom:
+            - secretRef:
+                name: pgcyan-db-uris
+          env:
+            - name: FILTER_FILE
+              value: "${FILTER_FILE}"
+            - name: INDEX_JOBS
+              # Concurrent CREATE INDEX connections THIS job opens to the target.
+              # Sum of INDEX_JOBS across all index jobs should stay <= target
+              # vCPU (and within target max_connections). TODO(planner): enforce.
+              value: "${INDEX_JOBS}"
+          volumeMounts:
+            - name: workdir
+              mountPath: /work
+            - name: plan
+              mountPath: /plan
+              readOnly: true
+          resources:
+            # THIN ON PURPOSE. The pod waits on the server; it does not compute.
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: workdir
+          persistentVolumeClaim:
+            claimName: pgcyan-workdir
+        - name: plan
+          configMap:
+            name: pgcyan-plan

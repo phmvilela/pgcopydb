@@ -1,0 +1,59 @@
+# 30-job-planner.yaml
+# ---------------------------------------------------------------------------
+# PHASE -1 (control plane): the PLANNER.
+#
+# Reads the inputs ConfigMap (metrics + parameters + constraints), runs the
+# deterministic bin-packing / DAG planner, and WRITES the pgcyan-plan ConfigMap
+# (plan.json + shard-<n>.filters). It does not touch Postgres data; it only
+# reads the already-collected metadata and produces a plan.
+#
+# TODO -- THE PLANNER APP DOES NOT EXIST YET. This Job assumes a
+# `python -m pg_cyan.cli plan` subcommand that:
+#   * loads /inputs/*.json,
+#   * derives per-table heap vs index bytes (needs the metrics.py fix noted in
+#     11-configmap-inputs.yaml),
+#   * LPT bin-packs tables into N shards under the connection/cost budget,
+#     range-splitting any single table too big for one shard,
+#   * builds the FK dependency graph so phase-3 FK ordering is known,
+#   * writes plan.json + shard-*.filters, then
+#   * `kubectl apply`s (or, preferably, calls the k8s API for) the plan
+#     ConfigMap. Requires the pgcyan-orchestrator RBAC (configmaps: create/patch).
+# Until it exists, 12-configmap-plan.yaml is applied by hand as a stand-in.
+#
+# ASSUMPTION: the pg_cyan container image bundles both the planner CLI and
+# pgcopydb. See Dockerfile / devcontainer toolchain.
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pgcyan-planner
+  namespace: pgcyan-migration
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400   # keep for a day for post-mortem, then GC
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/phase: "planner"
+    spec:
+      serviceAccountName: pgcyan-orchestrator   # needs configmap write RBAC
+      restartPolicy: Never
+      containers:
+        - name: planner
+          # TODO: publish and pin this image (planner CLI + pgcopydb).
+          image: "REPLACE_ME/pgcyan:latest"
+          command: ["python", "-m", "pg_cyan.cli", "plan"]   # TODO: subcommand TBD
+          args:
+            - "--inputs-dir=/inputs"
+            - "--output-configmap=pgcyan-plan"
+          volumeMounts:
+            - name: inputs
+              mountPath: /inputs
+              readOnly: true
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+      volumes:
+        - name: inputs
+          configMap:
+            name: pgcyan-planner-inputs
