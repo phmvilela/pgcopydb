@@ -32,6 +32,31 @@ terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
+### Deploy from Azure Cloud Shell (no local install)
+
+These `.tf` files are **not** consumable by the Azure Portal UI — Terraform is
+not ARM/Bicep, so there is no "upload template" path for them. The
+browser-based equivalent is **Azure Cloud Shell** (the `>_` icon in the portal),
+which ships Terraform and is already authenticated as your Azure user (no
+`az login`):
+
+```bash
+# In Cloud Shell — get the module (clone the repo or upload the terraform/aks/ folder)
+git clone https://github.com/berenguel/pgcyan.git
+cd pgcyan/terraform/aks
+
+cp terraform.tfvars.example terraform.tfvars   # edit: acr_name must be globally unique
+terraform init
+terraform apply
+```
+
+This runs the module exactly as written (Workload Identity, the managed
+identities + federated credentials, ACR, etc.) with normal Terraform state, so
+`terraform apply` re-runs and `terraform destroy` behave as expected. Building
+the same resources by hand in the portal is possible but error-prone (the
+federated-credential `subject` and the `azurefile-csi` RWX class must match the
+manifests exactly) and leaves no state — prefer Cloud Shell.
+
 ## After apply — wire up and deploy the manifests
 
 1. **Get kubeconfig:**
