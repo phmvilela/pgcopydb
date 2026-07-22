@@ -95,14 +95,24 @@ is a drop-in — the node objects don't change.
 
 ## Biggest open TODOs (tracked inline in the YAML)
 
-- **Planner app doesn't exist** (`30`): needs a `pg_cyan.cli plan` subcommand.
+- ~~**Planner app doesn't exist**~~ (`30`) — done (issue #38): `pg_cyan.cli plan`
+  (`pg_cyan/planner.py`) LPT bin-packs tables into disjoint heap-balanced shards,
+  emits `plan.json` + `shard-<n>.filters`, and aborts (writing no plan) when the
+  source has large objects. FK graph and cross-shard range-split are deferred
+  follow-ups (see below).
 - ~~**`metrics.py` conflates heap+index size**~~ — fixed (issue #37):
   `source-pg-metrics.json` now reports `heap_bytes`/`index_bytes` per table and
   in `table_totals`, so phase 2 (COPY, heap) and phase 3 (index build) can be
   sized independently.
 - **Range-split of a single table across shards** — pgcopydb splits *within* a job
   (`--split-tables-larger-than`); splitting one giant table *across* shards is a
-  planner responsibility not yet designed.
+  planner responsibility not yet designed. The `plan` command (issue #38) keeps
+  oversized tables whole on their own shard and records `split_tables_larger_than`
+  for the within-job split; cross-shard splitting stays deferred.
+- **Planner FK graph is a placeholder** — `plan.json` carries
+  `fk_graph.status: "deferred"` (empty edges); no artifact collects FK edges yet.
+  Phase-3b applies all constraints in one non-sharded pass regardless, so this is
+  informational once implemented.
 - **Image + secrets** — `REPLACE_ME/pgcyan:latest` must be built (pgcopydb + planner
   CLI); prefer Azure Workload Identity over the example Secret (`10`).
 

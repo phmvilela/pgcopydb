@@ -9,6 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from pg_cyan import cli as cli_module
+from pg_cyan.planner import PgCyanPlanner as RealPlanner
 
 
 class _StubChecker:
@@ -78,12 +79,31 @@ class _StubLobsCollector:
         pass
 
 
+class _StubPlanner(RealPlanner):
+    """Records constructor kwargs and returns a canned plan summary.
+
+    Subclasses the real planner so the CLI's option-default lambdas (which read
+    ``PgCyanPlanner.DEFAULT_*``) still resolve after monkeypatching.
+    """
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubPlanner.last_kwargs = kwargs
+        self._ok = kwargs["output_dir"] == "ok_dir"
+
+    def plan(self):
+        status = "success" if self._ok else "failure"
+        return {"status": status, "output_file": None, "error_file": None}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
     monkeypatch.setattr(cli_module, "PgCyanParameters", _StubExporter)
     monkeypatch.setattr(cli_module, "PgCyanMetrics", _StubMetricsCollector)
     monkeypatch.setattr(cli_module, "PgCyanLobs", _StubLobsCollector)
+    monkeypatch.setattr(cli_module, "PgCyanPlanner", _StubPlanner)
     return CliRunner()
 
 
@@ -161,3 +181,22 @@ def test_source_largeobjects_output_dir_falls_back_to_env(runner, monkeypatch):
     monkeypatch.setenv("PG_OUTPUT_DIR", "/tmp/pgcyan-out")
     runner.invoke(cli_module.cli, ["source-largeobjects", "--database", "ok_db"])
     assert _StubLobsCollector.last_kwargs["output_dir"] == "/tmp/pgcyan-out"
+
+
+def test_plan_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, ["plan", "--output-dir", "ok_dir"])
+    assert result.exit_code == 0
+    assert _StubPlanner.last_kwargs["output_dir"] == "ok_dir"
+
+
+def test_plan_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, ["plan", "--output-dir", "other"])
+    assert result.exit_code == 1
+
+
+def test_plan_options_fall_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PG_INPUTS_DIR", "/inputs")
+    monkeypatch.setenv("PGCYAN_SHARDS", "7")
+    runner.invoke(cli_module.cli, ["plan", "--output-dir", "ok_dir"])
+    assert _StubPlanner.last_kwargs["inputs_dir"] == "/inputs"
+    assert _StubPlanner.last_kwargs["shards"] == 7

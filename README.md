@@ -31,6 +31,7 @@ pg_cyan/
   parameters.py        PgCyanParameters: export source instance parameters
   metrics.py           PgCyanMetrics: collect source database metrics
   lobs.py              PgCyanLobs: count source large objects
+  planner.py           PgCyanPlanner: bin-pack shards + emit the migration plan
   cloud/azure/         Azure SDK integrations (skeleton)
   postgres/            PostgreSQL connection/introspection utils (skeleton)
 terraform/             Azure worker-VM provisioning (VNet, NSG, VM, cloud-init)
@@ -142,6 +143,38 @@ success (an empty database is not a failure).
 Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
 directory).
 
+### Plan the sharded migration
+
+```bash
+# Bin-pack the source into disjoint copy shards and emit the migration plan
+python -m pg_cyan.cli plan --inputs-dir ./artifacts --output-dir ./plan
+```
+
+`plan` is a **pure offline transform** — it opens no database connection. It
+reads the artifacts already produced by the pre-migration stages from
+`--inputs-dir` (`source-pg-metrics.json` and `source-pg-largeobjects.json`
+required; `pg-source-parameters.json` / `constraints.json` optional), LPT
+bin-packs the tables into disjoint copy shards balanced by **heap bytes**, and
+writes `plan.json` plus one `shard-<n>.filters` per shard (pgcopydb `--filters`
+format with a disjoint `[include-only-table]` list). This is the phase `-1`
+node in `deploy/k8s/`.
+
+Before packing anything it runs a **large-object abort gate**: if the source
+has any large objects (`lob_count > 0`), it exits non-zero, writes no plan, and
+records why — pgcopydb's logical-replication CDC does not replicate large
+objects. Shard count is fixed at 4 for now (clamped to the table count);
+FK-graph collection and cross-shard range-splitting of an oversized table are
+deferred follow-ups.
+
+| Outcome | File(s) written                                | Exit |
+|---------|------------------------------------------------|------|
+| Success | `plan.json` + `shard-<n>.filters` (non-empty)  | 0    |
+| Failure / LOB abort | `plan-errors.json` (no plan)       | 1    |
+| Interrupted | *(none)*                                   | 2    |
+
+Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
+directory).
+
 ### Configuration (environment variables)
 
 | Variable                     | Default     | Purpose                          |
@@ -153,6 +186,13 @@ directory).
 | `PG_SOURCE_DATABASE`         | `postgres`  | Source database                  |
 | `PREFLIGHT_TIMEOUT_SECONDS`  | `30`        | Connection timeout               |
 | `PG_OUTPUT_DIR`              | `.`         | Output dir for generated JSON    |
+| `PG_INPUTS_DIR`              | `.`         | `plan`: dir holding source artifacts |
+| `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
+| `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
+| `PGCYAN_SNAPSHOT_MODE`       | `coordinator-held` | `plan`: snapshot strategy |
+| `PGCYAN_PUBLICATION`         | `pgcyan_pub` | `plan`: publication name        |
+| `PGCYAN_SLOT`                | `pgcyan_slot` | `plan`: replication slot name  |
+| `PGCYAN_RUN_ID`              | *(clock)*   | `plan`: opaque run identifier    |
 | `LOG_LEVEL`                  | `INFO`      | Log verbosity                    |
 
 ## Docker

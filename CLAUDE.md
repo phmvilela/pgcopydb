@@ -64,9 +64,9 @@ literals — never f-string user/config values into SQL.
 
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
-`preflight`, `source-parameters`, `source-pg-metrics`, and
-`source-largeobjects` are implemented. Options default to `PG_SOURCE_*` env
-vars so the same invocation works locally
+`preflight`, `source-parameters`, `source-pg-metrics`,
+`source-largeobjects`, and `plan` are implemented. Options default to
+`PG_SOURCE_*` env vars so the same invocation works locally
 and in the container. Exit codes: `0` ready/success, `1` not ready/failure,
 `2` interrupted — keep these stable.
 
@@ -107,6 +107,26 @@ with the error message (issue #20). **A count of zero is a valid happy path**
 — an empty database is not a failure — so `collect()` guards on the count
 being `is not None` rather than truthiness (contrast `source-parameters`,
 where an empty result *is* a failure).
+
+`plan` (`pg_cyan/planner.py`, `PgCyanPlanner`) is the **migration planner**
+(issue #38) and the first stage that is a *pure offline transform* rather than
+a DB collector: it reads the already-collected artifacts from `--inputs-dir`
+(`source-pg-metrics.json` + `source-pg-largeobjects.json` required;
+`pg-source-parameters.json` / `constraints.json` optional) and never opens a DB
+connection. It LPT bin-packs tables into disjoint copy shards balanced by
+**heap bytes** and writes `plan.json` plus one `shard-<n>.filters` per shard
+(pgcopydb `--filters` format with a disjoint `[include-only-table]` list —
+disjointness is re-validated before any file is written). It still follows the
+orchestrator conventions (`_log_event`, graceful degradation — `plan()` never
+raises) and the success-vs-error two-file shape: `plan.json` on success,
+`plan-errors.json` on any failure. A **LOB abort gate** runs first — if
+`source-pg-largeobjects.json` reports `lob_count > 0`, `plan()` writes no plan
+and returns failure (exit 1), because pgcopydb pgoutput CDC does not replicate
+large objects. Fixed at N=4 shards for now; the FK graph is emitted as
+`"deferred"` and cross-shard range-splitting of an oversized table is out of
+scope (both deferred to follow-ups, per the resolved sub-questions in #38).
+This is the phase `-1` node in `deploy/k8s/30-job-planner.yaml`; its output
+populates `12-configmap-plan.yaml`.
 
 ## Configuration & secrets
 

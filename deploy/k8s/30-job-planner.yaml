@@ -7,21 +7,24 @@
 # (plan.json + shard-<n>.filters). It does not touch Postgres data; it only
 # reads the already-collected metadata and produces a plan.
 #
-# TODO -- THE PLANNER APP DOES NOT EXIST YET. This Job assumes a
-# `python -m pg_cyan.cli plan` subcommand that:
-#   * loads /inputs/*.json,
-#   * derives per-table heap vs index bytes (needs the metrics.py fix noted in
-#     11-configmap-inputs.yaml),
-#   * LPT bin-packs tables into N shards under the connection/cost budget,
-#     range-splitting any single table too big for one shard,
-#   * builds the FK dependency graph so phase-3 FK ordering is known,
-#   * writes plan.json + shard-*.filters, then
-#   * `kubectl apply`s (or, preferably, calls the k8s API for) the plan
-#     ConfigMap. Requires the pgcyan-orchestrator RBAC (configmaps: create/patch).
-# Until it exists, 12-configmap-plan.yaml is applied by hand as a stand-in.
+# The planner is `python -m pg_cyan.cli plan` (pg_cyan/planner.py, issue #38):
+#   * loads /inputs/*.json (source-pg-metrics + source-pg-largeobjects, plus the
+#     optional parameters/constraints),
+#   * runs the LOB abort gate -- if the source has any large objects it exits
+#     non-zero and writes NO plan (pgoutput CDC does not replicate LOBs),
+#   * LPT bin-packs tables into N disjoint shards by heap bytes (fixed N=4 for
+#     now; oversized tables stay whole and split within their job via
+#     split_tables_larger_than -- cross-shard range-split is a follow-up),
+#   * records snapshot mode / publication / slot; emits a deferred FK graph
+#     (real FK collection is a follow-up), and
+#   * writes plan.json + shard-<n>.filters to --output-dir.
+# This Job writes those files to a scratch emptyDir and then publishes them into
+# the pgcyan-plan ConfigMap with kubectl (needs the pgcyan-orchestrator RBAC:
+# configmaps create/patch). 12-configmap-plan.yaml is the illustrative stand-in
+# it overwrites.
 #
-# ASSUMPTION: the pg_cyan container image bundles both the planner CLI and
-# pgcopydb. See Dockerfile / devcontainer toolchain.
+# ASSUMPTION: the pg_cyan container image bundles the planner CLI, pgcopydb, and
+# kubectl. See Dockerfile / devcontainer toolchain.
 # ---------------------------------------------------------------------------
 apiVersion: batch/v1
 kind: Job
@@ -40,16 +43,28 @@ spec:
       restartPolicy: Never
       containers:
         - name: planner
-          # TODO: publish and pin this image (planner CLI + pgcopydb).
+          # TODO: publish and pin this image (planner CLI + pgcopydb + kubectl).
           image: "REPLACE_ME/pgcyan:latest"
-          command: ["python", "-m", "pg_cyan.cli", "plan"]   # TODO: subcommand TBD
+          # Run the planner into a scratch dir, then publish plan.json +
+          # shard-<n>.filters into the pgcyan-plan ConfigMap. If the LOB abort
+          # gate fires, `plan` exits non-zero here and the Job fails without
+          # touching the ConfigMap.
+          command: ["sh", "-c"]
           args:
-            - "--inputs-dir=/inputs"
-            - "--output-configmap=pgcyan-plan"
+            - >
+              python -m pg_cyan.cli plan
+              --inputs-dir=/inputs
+              --output-dir=/work/plan
+              &&
+              kubectl create configmap pgcyan-plan
+              --from-file=/work/plan
+              --dry-run=client -o yaml | kubectl apply -f -
           volumeMounts:
             - name: inputs
               mountPath: /inputs
               readOnly: true
+            - name: work
+              mountPath: /work
           resources:
             requests: { cpu: "500m", memory: "512Mi" }
             limits:   { cpu: "1",    memory: "1Gi" }
@@ -57,3 +72,5 @@ spec:
         - name: inputs
           configMap:
             name: pgcyan-planner-inputs
+        - name: work
+          emptyDir: {}

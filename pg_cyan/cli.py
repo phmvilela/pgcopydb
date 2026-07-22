@@ -21,6 +21,7 @@ from pg_cyan import __version__
 from pg_cyan.lobs import PgCyanLobs
 from pg_cyan.metrics import PgCyanMetrics
 from pg_cyan.parameters import PgCyanParameters
+from pg_cyan.planner import PgCyanPlanner
 from pg_cyan.preflight import PgCyanPreflight
 
 
@@ -172,6 +173,61 @@ def source_largeobjects(host: str, port: int, user: str, password: str,
         sys.exit(0 if summary["status"] == "success" else 1)
     except KeyboardInterrupt:
         collector.close()
+        sys.exit(2)
+
+
+@cli.command(name="plan")
+@click.option("--inputs-dir", default=lambda: os.getenv("PG_INPUTS_DIR", "."),
+              show_default="$PG_INPUTS_DIR",
+              help="Directory holding the collected source artifacts.")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR",
+              help="Directory for plan.json / shard-<n>.filters (or plan-errors.json).")
+@click.option("--shards", type=int,
+              default=lambda: int(os.getenv("PGCYAN_SHARDS", str(PgCyanPlanner.DEFAULT_SHARDS))),
+              show_default="$PGCYAN_SHARDS",
+              help="Number of copy shards (clamped to the table count).")
+@click.option("--split-tables-larger-than",
+              default=lambda: os.getenv("PGCYAN_SPLIT_TABLES_LARGER_THAN",
+                                        PgCyanPlanner.DEFAULT_SPLIT_THRESHOLD),
+              show_default="$PGCYAN_SPLIT_TABLES_LARGER_THAN",
+              help="pgcopydb within-job split threshold recorded per shard.")
+@click.option("--snapshot-mode",
+              default=lambda: os.getenv("PGCYAN_SNAPSHOT_MODE", PgCyanPlanner.DEFAULT_SNAPSHOT_MODE),
+              show_default="$PGCYAN_SNAPSHOT_MODE",
+              help="Snapshot strategy recorded in the plan.")
+@click.option("--publication-name",
+              default=lambda: os.getenv("PGCYAN_PUBLICATION", PgCyanPlanner.DEFAULT_PUBLICATION),
+              show_default="$PGCYAN_PUBLICATION",
+              help="Logical-replication publication name for downstream phases.")
+@click.option("--slot-name",
+              default=lambda: os.getenv("PGCYAN_SLOT", PgCyanPlanner.DEFAULT_SLOT),
+              show_default="$PGCYAN_SLOT",
+              help="Replication slot name for downstream phases.")
+@click.option("--run-id", default=lambda: os.getenv("PGCYAN_RUN_ID"),
+              show_default="$PGCYAN_RUN_ID",
+              help="Opaque run identifier; generated from the clock if omitted.")
+def plan(inputs_dir: str, output_dir: str, shards: int, split_tables_larger_than: str,
+         snapshot_mode: str, publication_name: str, slot_name: str,
+         run_id: str) -> None:
+    """Bin-pack the source into disjoint copy shards and emit the migration plan.
+
+    Reads the collected source artifacts from ``--inputs-dir`` and writes
+    ``plan.json`` plus one ``shard-<n>.filters`` per shard on success, or
+    ``plan-errors.json`` on failure. Aborts non-zero, writing no plan, when the
+    source has large objects (pgcopydb CDC does not replicate them).
+    """
+    planner = PgCyanPlanner(
+        inputs_dir=inputs_dir, output_dir=output_dir, shards=shards,
+        split_tables_larger_than=split_tables_larger_than,
+        snapshot_mode=snapshot_mode, publication_name=publication_name,
+        slot_name=slot_name, run_id=run_id,
+    )
+    try:
+        summary = planner.plan()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
         sys.exit(2)
 
 
