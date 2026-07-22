@@ -84,11 +84,16 @@ future artifact stages.
 orchestrator, another artifact-producing stage built on the same
 success-vs-error two-file shape. It collects PostgreSQL version, object
 counts (tables, partitions, views, indexes, sequences, functions, procedures,
-triggers, extensions), database size, and per-table sizes. On success it
-writes a non-empty `source-pg-metrics.json`; on any failure (connection,
-query, empty result, or write) it writes `source-pg-metrics-errors.json`
-with the error message (issue #3). Object counts rely on
-`pg_proc.prokind`, which requires PostgreSQL 11+.
+triggers, extensions), database size, and per-table sizes. Table sizes are
+reported as **separate heap and index figures** (`heap_bytes`/`index_bytes`,
+via `pg_table_size()`/`pg_indexes_size()`), per table and as database-wide
+`table_totals`, so the sharded-migration planner can size the network-bound
+COPY (heap) apart from the index build (issue #37); the two sum to the old
+conflated `pg_total_relation_size`. On success it writes a non-empty
+`source-pg-metrics.json`; on any failure (connection, query, empty result,
+or write) it writes `source-pg-metrics-errors.json` with the error message
+(issue #3). Object counts rely on `pg_proc.prokind`, which requires
+PostgreSQL 11+.
 
 ## Configuration & secrets
 

@@ -39,7 +39,12 @@ _OBJECT_COUNT_FIELDS = (
     "materialized_views", "indexes", "sequences", "functions",
     "procedures", "triggers", "extensions",
 )
-_TABLE_FIELDS = ("schema", "name", "relkind", "size_bytes", "size_pretty", "row_estimate")
+_TABLE_FIELDS = (
+    "schema", "name", "relkind",
+    "heap_bytes", "heap_pretty", "index_bytes", "index_pretty",
+    "row_estimate",
+)
+_TABLE_TOTALS_FIELDS = ("heap_bytes", "index_bytes", "total_bytes")
 
 
 def _connection_kwargs(output_dir_env="PG_OUTPUT_DIR"):
@@ -80,7 +85,7 @@ def test_collect_writes_source_pg_metrics_with_all_fields(collector):
     assert payload  # non-empty (issue #3 acceptance criterion 1)
 
     for field in ("timestamp", "component", "status", "source", "version",
-                  "database_size", "object_counts", "tables"):
+                  "database_size", "object_counts", "tables", "table_totals"):
         assert field in payload, f"missing top-level field: {field}"
 
     for field in _SOURCE_FIELDS:
@@ -99,6 +104,13 @@ def test_collect_writes_source_pg_metrics_with_all_fields(collector):
     for table in payload["tables"]:
         for field in _TABLE_FIELDS:
             assert field in table, f"missing table field: {field}"
+
+    for field in _TABLE_TOTALS_FIELDS:
+        assert field in payload["table_totals"], f"missing table_totals field: {field}"
+    # heap + index is reported as a distinct split that sums to the total
+    # (issue #37).
+    totals = payload["table_totals"]
+    assert totals["heap_bytes"] + totals["index_bytes"] == totals["total_bytes"]
 
 
 def test_export_writes_source_parameters_with_all_fields(exporter):

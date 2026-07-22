@@ -4,7 +4,9 @@ Source database metrics collection for PostgreSQL migration.
 Connects to the source database and captures metrics useful for planning the
 migration pipeline: server version, object counts (tables, partitions,
 views, indexes, sequences, functions, procedures, triggers, extensions),
-database size, and per-table sizes.
+database size, and per-table sizes -- reported as separate heap and index
+figures, per table and as database-wide totals (issue #37), so the migration
+planner can size the network-bound COPY (heap) apart from the index build.
 
 Follows the ``PgCyanParameters`` / ``PgCyanPreflight`` orchestrator pattern
 (see ``parameters.py``, ``preflight.py``, and ``CLAUDE.md``): one class per
@@ -67,18 +69,25 @@ _OBJECT_COUNTS_QUERY = """
         (SELECT count(*) FROM pg_extension) AS extensions;
 """
 
+# Heap and index bytes are reported separately (issue #37): the planner
+# bin-packs copy shards by heap bytes (phase 2, network-bound COPY) but sizes
+# the index-build work (phase 3) by index bytes, so a single conflated size
+# makes both splits wrong. ``pg_table_size`` (heap + TOAST + FSM/VM) plus
+# ``pg_indexes_size`` sum to the old ``pg_total_relation_size`` figure.
 _TABLE_SIZES_QUERY = """
     SELECT
         n.nspname AS schema,
         c.relname AS name,
         c.relkind AS relkind,
-        pg_total_relation_size(c.oid) AS size_bytes,
-        pg_size_pretty(pg_total_relation_size(c.oid)) AS size_pretty,
+        pg_table_size(c.oid) AS heap_bytes,
+        pg_size_pretty(pg_table_size(c.oid)) AS heap_pretty,
+        pg_indexes_size(c.oid) AS index_bytes,
+        pg_size_pretty(pg_indexes_size(c.oid)) AS index_pretty,
         c.reltuples AS row_estimate
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN %(schemas)s
-    ORDER BY pg_total_relation_size(c.oid) DESC;
+    ORDER BY pg_table_size(c.oid) DESC, pg_indexes_size(c.oid) DESC;
 """
 
 
@@ -251,6 +260,7 @@ class PgCyanMetrics:
                 },
                 "object_counts": object_counts,
                 "tables": tables,
+                "table_totals": self._table_totals(tables),
             }
             self._log_event(
                 "fetch_metrics",
@@ -271,6 +281,25 @@ class PgCyanMetrics:
             )
             self.errors.append(f"Metrics query failed: {str(e)}")
             return None
+
+    @staticmethod
+    def _table_totals(tables: List[Dict]) -> Dict[str, int]:
+        """
+        Sum the per-table heap/index figures into database-wide totals.
+
+        Reported alongside the per-table breakdown (issue #37) so the planner
+        can size the network-bound COPY (phase 2, heap bytes) separately from
+        the index build (phase 3, index bytes). ``heap_bytes + index_bytes``
+        equals ``total_bytes``, which matches the old conflated
+        ``pg_total_relation_size`` sum.
+        """
+        heap_bytes = sum(t.get("heap_bytes") or 0 for t in tables)
+        index_bytes = sum(t.get("index_bytes") or 0 for t in tables)
+        return {
+            "heap_bytes": heap_bytes,
+            "index_bytes": index_bytes,
+            "total_bytes": heap_bytes + index_bytes,
+        }
 
     def _build_output(self, metrics: Dict) -> Dict:
         """Assemble the happy-path payload written to ``source-pg-metrics.json``."""

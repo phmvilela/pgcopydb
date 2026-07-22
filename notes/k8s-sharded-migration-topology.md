@@ -96,8 +96,10 @@ is a drop-in — the node objects don't change.
 ## Biggest open TODOs (tracked inline in the YAML)
 
 - **Planner app doesn't exist** (`30`): needs a `pg_cyan.cli plan` subcommand.
-- **`metrics.py` conflates heap+index size** — the planner needs them separate to
-  size phase 2 vs phase 3. Fix before trusting the byte splits.
+- ~~**`metrics.py` conflates heap+index size**~~ — fixed (issue #37):
+  `source-pg-metrics.json` now reports `heap_bytes`/`index_bytes` per table and
+  in `table_totals`, so phase 2 (COPY, heap) and phase 3 (index build) can be
+  sized independently.
 - **Range-split of a single table across shards** — pgcopydb splits *within* a job
   (`--split-tables-larger-than`); splitting one giant table *across* shards is a
   planner responsibility not yet designed.

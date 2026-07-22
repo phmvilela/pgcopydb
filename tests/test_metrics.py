@@ -42,8 +42,13 @@ SAMPLE_METRICS = {
     },
     "tables": [
         {"schema": "public", "name": "widgets", "relkind": "r",
-         "size_bytes": 1000, "size_pretty": "1000 bytes", "row_estimate": 10.0},
+         "heap_bytes": 600, "heap_pretty": "600 bytes",
+         "index_bytes": 400, "index_pretty": "400 bytes", "row_estimate": 10.0},
+        {"schema": "public", "name": "gadgets", "relkind": "r",
+         "heap_bytes": 120, "heap_pretty": "120 bytes",
+         "index_bytes": 80, "index_pretty": "80 bytes", "row_estimate": 5.0},
     ],
+    "table_totals": {"heap_bytes": 720, "index_bytes": 480, "total_bytes": 1200},
 }
 
 
@@ -76,6 +81,40 @@ def test_build_output_is_non_empty_and_well_formed():
     assert payload["tables"] == SAMPLE_METRICS["tables"]
     # Round-trips as JSON and is clearly non-empty.
     assert json.loads(json.dumps(payload, default=str))["object_counts"]["tables"] == 3
+
+
+def test_table_totals_sum_heap_and_index_separately():
+    # Heap and index are summed as distinct figures; total is their sum
+    # (issue #37: heap_bytes + index_bytes == the old conflated total).
+    totals = PgCyanMetrics._table_totals(SAMPLE_METRICS["tables"])
+    assert totals["heap_bytes"] == 600 + 120
+    assert totals["index_bytes"] == 400 + 80
+    assert totals["total_bytes"] == totals["heap_bytes"] + totals["index_bytes"]
+
+
+def test_table_totals_handle_empty_and_missing_values():
+    assert PgCyanMetrics._table_totals([]) == {
+        "heap_bytes": 0, "index_bytes": 0, "total_bytes": 0,
+    }
+    # A row missing/None figures must not raise; it contributes zero.
+    totals = PgCyanMetrics._table_totals(
+        [{"heap_bytes": None, "index_bytes": 50}, {"heap_bytes": 10}]
+    )
+    assert totals == {"heap_bytes": 10, "index_bytes": 50, "total_bytes": 60}
+
+
+def test_build_output_carries_heap_index_split_and_totals():
+    collector = make_collector()
+    payload = collector._build_output(SAMPLE_METRICS)
+    # Per-table split is preserved and the conflated size_bytes is gone.
+    widgets = payload["tables"][0]
+    assert widgets["heap_bytes"] == 600
+    assert widgets["index_bytes"] == 400
+    assert "size_bytes" not in widgets
+    # Totals ride along and sum to the old total-relation-size figure.
+    assert payload["table_totals"]["heap_bytes"] == 720
+    assert payload["table_totals"]["index_bytes"] == 480
+    assert payload["table_totals"]["total_bytes"] == 1200
 
 
 def test_collect_writes_error_file_when_connection_fails(tmp_path):
@@ -124,7 +163,7 @@ def test_collect_writes_output_file_on_success(tmp_path, monkeypatch):
     summary = collector.collect()
 
     assert summary["status"] == "success"
-    assert summary["table_count"] == 1
+    assert summary["table_count"] == 2
 
     output_file = tmp_path / PgCyanMetrics.OUTPUT_FILENAME
     assert output_file.exists()
