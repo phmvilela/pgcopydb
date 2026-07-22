@@ -7,7 +7,7 @@ variable "resource_group_name" {
 variable "azure_region" {
   description = "Azure region where resources will be deployed"
   type        = string
-  default     = "eastus"
+  default     = "westus2"
 }
 
 variable "cluster_name" {
@@ -24,7 +24,7 @@ variable "cluster_name" {
 variable "kubernetes_version" {
   description = "Kubernetes version for the control plane and default node pool"
   type        = string
-  default     = "1.30"
+  default     = "1.33"
 }
 
 variable "sku_tier" {

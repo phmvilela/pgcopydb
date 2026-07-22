@@ -2,7 +2,7 @@
 # Copy to terraform.tfvars and adjust for your environment
 
 resource_group_name = "pg-cyan-migration-rg"
-azure_region        = "eastus"
+azure_region        = "westus2"
 vm_name             = "pg-cyan-worker-01"
 vm_size             = "Standard_B2s"  # 2 vCPU, 4 GB RAM (scale later as needed)
 admin_username      = "azureuser"

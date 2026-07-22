@@ -4,12 +4,13 @@
 #   cp terraform.tfvars.example terraform.tfvars
 
 resource_group_name = "pg-cyan-aks-rg"
-azure_region        = "eastus"
+azure_region        = "westus2"
 cluster_name        = "pg-cyan-aks"
 
-# Kubernetes version — check availability in your region:
-#   az aks get-versions --location eastus -o table
-kubernetes_version = "1.30"
+# Kubernetes version — check availability in your region (versions get
+# retired from standard support and fall back to the paid LTS tier):
+#   az aks get-versions --location westus2 -o table
+kubernetes_version = "1.33"
 sku_tier           = "Standard"
 
 # Namespace MUST match deploy/k8s/00-namespace.yaml
