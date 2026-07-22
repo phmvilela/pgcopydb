@@ -2,8 +2,9 @@
 
 Provisions the **Azure Kubernetes Service** cluster that runs the sharded
 pgcopydb migration defined in [`deploy/k8s`](../../deploy/k8s/). This module is
-**separate from** the worker-VM module in [`../`](../) — it has its own state and
-is applied independently.
+**separate from** the worker-VM module in [`../`](../) — it has its own state
+(a separate blob in the shared remote backend; see [Remote state](#remote-state))
+and is applied independently.
 
 ## What it creates
 
@@ -27,7 +28,12 @@ is applied independently.
 ```bash
 cd terraform/aks
 cp terraform.tfvars.example terraform.tfvars   # edit: acr_name must be globally unique
-terraform init
+
+# One-time: create the shared remote-state backend (see "Remote state" below).
+# Writes a gitignored backend.hcl into this module.
+../bootstrap-backend.sh
+
+terraform init -backend-config=backend.hcl
 terraform plan -out=tfplan
 terraform apply tfplan
 ```
@@ -46,13 +52,16 @@ git clone https://github.com/berenguel/pgcyan.git
 cd pgcyan/terraform/aks
 
 cp terraform.tfvars.example terraform.tfvars   # edit: acr_name must be globally unique
-terraform init
+../bootstrap-backend.sh                        # recommended: durable remote state
+terraform init -backend-config=backend.hcl     # or just `terraform init` for throwaway local state
 terraform apply
 ```
 
 This runs the module exactly as written (Workload Identity, the managed
-identities + federated credentials, ACR, etc.) with normal Terraform state, so
-`terraform apply` re-runs and `terraform destroy` behave as expected. Building
+identities + federated credentials, ACR, etc.), so `terraform apply` re-runs and
+`terraform destroy` behave as expected. Use the remote backend
+(`bootstrap-backend.sh` + `-backend-config=backend.hcl`) if you want the state to
+persist beyond the Cloud Shell session. Building
 the same resources by hand in the portal is possible but error-prone (the
 federated-credential `subject` and the `azurefile-csi` RWX class must match the
 manifests exactly) and leaves no state — prefer Cloud Shell.
@@ -94,6 +103,16 @@ manifests exactly) and leaves no state — prefer Cloud Shell.
    roles on **both** source and target Postgres so the worker can authenticate
    with the token it exchanges. Until then, fall back to the Secret in
    `10-secrets.example.yaml`.
+
+## Remote state
+
+This module's state is a blob (`key = "aks.tfstate"`) in the shared Azure Blob
+backend created by [`../bootstrap-backend.sh`](../bootstrap-backend.sh) — the
+same container the worker-VM module uses (`key = "worker-vm.tfstate"`). Run the
+script once (`az login` first), then `terraform init -backend-config=backend.hcl`.
+The generated `backend.hcl` is gitignored; only the per-module `key` is
+committed. See [`../README.md`](../README.md#remote-state) for the full rationale
+and the key-less (AAD) option.
 
 ## Notes
 

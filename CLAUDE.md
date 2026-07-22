@@ -138,7 +138,8 @@ with the error message (issue #3). Object counts rely on
 
 ## Terraform
 
-Two independent root modules, each with its own state:
+Two independent root modules, each with its own **remote** state (separate blobs
+in one shared Azure Blob backend; see below):
 
 - `terraform/` — the migration **worker VM** (resource group, VNet, subnet,
   NSG, public IP, VM, cloud-init). Restrict `allowed_ssh_cidr`.
@@ -153,8 +154,14 @@ Two independent root modules, each with its own state:
   granted DB-side out of band.
 
 Both modules are meant to be idempotent — `terraform apply` should be safe to
-re-run. Keep state/secrets out of the repo (`*.tfstate`, `*.tfvars` are
-gitignored; commit only `*.tfvars.example`).
+re-run. State lives in a shared Azure Blob backend, one blob per module
+(`worker-vm.tfstate` / `aks.tfstate`), bootstrapped once by
+`terraform/bootstrap-backend.sh` (idempotent; storage account name derived from
+the subscription id). Run it, then `terraform init -backend-config=backend.hcl`
+in each module. This is what keeps an ephemeral dev container from orphaning
+Azure resources by losing local state. Keep state/secrets out of the repo
+(`*.tfstate`, `*.tfvars`, `backend.hcl` are gitignored; commit only the
+`*.example` files).
 
 ## Known gaps / cleanups worth doing
 

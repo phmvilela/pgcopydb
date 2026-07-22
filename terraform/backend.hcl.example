@@ -1,0 +1,14 @@
+# Example remote-state backend configuration (shared by both root modules).
+#
+# The REAL values are written to backend.hcl (gitignored, one per module) by
+# ./bootstrap-backend.sh -- run that once and it generates backend.hcl for both
+# terraform/ and terraform/aks/. Only copy this by hand if you are NOT using the
+# bootstrap script.
+#
+#   terraform init -backend-config=backend.hcl
+#
+# The per-module state `key` (worker-vm.tfstate / aks.tfstate) is committed in
+# each module's `backend "azurerm"` block, so it is intentionally absent here.
+resource_group_name  = "pg-cyan-tfstate-rg"
+storage_account_name = "pgcyantfxxxxxxxxxxxx"
+container_name       = "tfstate"
