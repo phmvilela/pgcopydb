@@ -1,6 +1,6 @@
 """
 Manual integration tests for the pre-migration artifact stages: source-pg-metrics
-(issue #19) and source-parameters (issue #4).
+(issue #19), source-parameters (issue #4), and source-pg-largeobjects (issue #20).
 
 Run against a real PostgreSQL server -- connection settings come from the
 same ``PG_SOURCE_*`` / ``PG_OUTPUT_DIR`` environment variables the CLI reads
@@ -26,6 +26,7 @@ import os
 
 import pytest
 
+from pg_cyan.lobs import PgCyanLobs
 from pg_cyan.metrics import PgCyanMetrics
 from pg_cyan.parameters import PgCyanParameters
 
@@ -69,6 +70,13 @@ def collector():
 @pytest.fixture
 def exporter():
     instance = PgCyanParameters(**_connection_kwargs())
+    yield instance
+    instance.close()
+
+
+@pytest.fixture
+def lobs():
+    instance = PgCyanLobs(**_connection_kwargs())
     yield instance
     instance.close()
 
@@ -136,3 +144,26 @@ def test_export_writes_source_parameters_with_all_fields(exporter):
     for parameter in payload["parameters"]:
         for field in PgCyanParameters._PARAM_COLUMNS:
             assert field in parameter, f"missing parameter field: {field}"
+
+
+def test_collect_writes_source_lobs_with_all_fields(lobs):
+    summary = lobs.collect()
+
+    assert summary["status"] == "success", lobs.errors
+    assert summary["output_file"]
+
+    with open(summary["output_file"], encoding="utf-8") as fh:
+        payload = json.load(fh)
+
+    assert payload  # non-empty (issue #20 acceptance criterion)
+
+    for field in ("timestamp", "component", "status", "source",
+                  "lob_count"):
+        assert field in payload, f"missing top-level field: {field}"
+
+    for field in _SOURCE_FIELDS:
+        assert field in payload["source"], f"missing source field: {field}"
+
+    # A count is always present and non-negative (zero is valid).
+    assert isinstance(payload["lob_count"], int)
+    assert payload["lob_count"] >= 0

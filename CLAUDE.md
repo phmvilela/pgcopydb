@@ -64,8 +64,9 @@ literals — never f-string user/config values into SQL.
 
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
-`preflight`, `source-parameters`, and `source-pg-metrics` are implemented.
-Options default to `PG_SOURCE_*` env vars so the same invocation works locally
+`preflight`, `source-parameters`, `source-pg-metrics`, and
+`source-largeobjects` are implemented. Options default to `PG_SOURCE_*` env
+vars so the same invocation works locally
 and in the container. Exit codes: `0` ready/success, `1` not ready/failure,
 `2` interrupted — keep these stable.
 
@@ -94,6 +95,18 @@ conflated `pg_total_relation_size`. On success it writes a non-empty
 or write) it writes `source-pg-metrics-errors.json` with the error message
 (issue #3). Object counts rely on `pg_proc.prokind`, which requires
 PostgreSQL 11+.
+
+`source-largeobjects` (`pg_cyan/lobs.py`, `PgCyanLobs`) is the
+fourth orchestrator, another artifact-producing stage on the same
+success-vs-error two-file shape. It counts the rows in
+`pg_largeobject_metadata` (the source database's PostgreSQL large objects,
+copied by a separate `pg_dump` path than the per-table `COPY`) and writes the
+count to a non-empty `source-pg-largeobjects.json`; on any failure
+(connection, query, or write) it writes `source-pg-largeobjects-errors.json`
+with the error message (issue #20). **A count of zero is a valid happy path**
+— an empty database is not a failure — so `collect()` guards on the count
+being `is not None` rather than truthiness (contrast `source-parameters`,
+where an empty result *is* a failure).
 
 ## Configuration & secrets
 

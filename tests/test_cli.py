@@ -61,11 +61,29 @@ class _StubMetricsCollector:
         pass
 
 
+class _StubLobsCollector:
+    """Records constructor kwargs and returns a canned collect summary."""
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubLobsCollector.last_kwargs = kwargs
+        self._ok = kwargs["database"] == "ok_db"
+
+    def collect(self):
+        status = "success" if self._ok else "failure"
+        return {"status": status, "output_file": None, "error_file": None}
+
+    def close(self):
+        pass
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
     monkeypatch.setattr(cli_module, "PgCyanParameters", _StubExporter)
     monkeypatch.setattr(cli_module, "PgCyanMetrics", _StubMetricsCollector)
+    monkeypatch.setattr(cli_module, "PgCyanLobs", _StubLobsCollector)
     return CliRunner()
 
 
@@ -126,3 +144,20 @@ def test_source_pg_metrics_output_dir_falls_back_to_env(runner, monkeypatch):
     monkeypatch.setenv("PG_OUTPUT_DIR", "/tmp/pgcyan-out")
     runner.invoke(cli_module.cli, ["source-pg-metrics", "--database", "ok_db"])
     assert _StubMetricsCollector.last_kwargs["output_dir"] == "/tmp/pgcyan-out"
+
+
+def test_source_largeobjects_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, ["source-largeobjects", "--database", "ok_db"])
+    assert result.exit_code == 0
+    assert _StubLobsCollector.last_kwargs["database"] == "ok_db"
+
+
+def test_source_largeobjects_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, ["source-largeobjects", "--database", "other"])
+    assert result.exit_code == 1
+
+
+def test_source_largeobjects_output_dir_falls_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PG_OUTPUT_DIR", "/tmp/pgcyan-out")
+    runner.invoke(cli_module.cli, ["source-largeobjects", "--database", "ok_db"])
+    assert _StubLobsCollector.last_kwargs["output_dir"] == "/tmp/pgcyan-out"

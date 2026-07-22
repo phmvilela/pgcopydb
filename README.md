@@ -30,6 +30,7 @@ pg_cyan/
   preflight.py         PgCyanPreflight: pre-migration readiness checks
   parameters.py        PgCyanParameters: export source instance parameters
   metrics.py           PgCyanMetrics: collect source database metrics
+  lobs.py              PgCyanLobs: count source large objects
   cloud/azure/         Azure SDK integrations (skeleton)
   postgres/            PostgreSQL connection/introspection utils (skeleton)
 terraform/             Azure worker-VM provisioning (VNet, NSG, VM, cloud-init)
@@ -119,6 +120,28 @@ per-table sizes. Object counts assume PostgreSQL 11+ (`pg_proc.prokind`).
 Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
 directory).
 
+### Count source large objects
+
+```bash
+# Count the source database's large objects (pg_largeobject_metadata)
+python -m pg_cyan.cli source-largeobjects
+```
+
+`source-largeobjects` connects to the source and counts the rows in
+`pg_largeobject_metadata` — the database's PostgreSQL large objects, which the
+migration copies via a separate `pg_dump` path than the per-table `COPY`. The
+count is written to `lob_count`. A count of **zero** is a valid
+success (an empty database is not a failure).
+
+| Outcome | File written                              | Exit |
+|---------|-------------------------------------------|------|
+| Success | `source-pg-largeobjects.json` (non-empty) | 0    |
+| Failure | `source-pg-largeobjects-errors.json`      | 1    |
+| Interrupted | *(none)*                              | 2    |
+
+Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
+directory).
+
 ### Configuration (environment variables)
 
 | Variable                     | Default     | Purpose                          |
@@ -168,8 +191,9 @@ the default run).
 ### Integration tests: pre-migration artifacts
 
 `tests/integration/test_pre_migration_integration.py` runs `source-pg-metrics`
-(issue #19) and `source-parameters` (issue #4) against a real PostgreSQL
-server and checks the *shape* of each resulting JSON file — that every
+(issue #19), `source-parameters` (issue #4), and `source-largeobjects`
+(issue #20) against a real PostgreSQL server and checks the *shape* of each
+resulting JSON file — that every
 documented field is present — without validating its values. Run it locally
 against a source you point at via the usual `PG_SOURCE_*` env vars:
 

@@ -18,6 +18,7 @@ import sys
 import click
 
 from pg_cyan import __version__
+from pg_cyan.lobs import PgCyanLobs
 from pg_cyan.metrics import PgCyanMetrics
 from pg_cyan.parameters import PgCyanParameters
 from pg_cyan.preflight import PgCyanPreflight
@@ -123,6 +124,44 @@ def source_pg_metrics(host: str, port: int, user: str, password: str,
     ``source-pg-metrics-errors.json`` with an error message on failure.
     """
     collector = PgCyanMetrics(
+        host=host, port=port, user=user, password=password,
+        database=database, timeout=timeout, output_dir=output_dir,
+    )
+    try:
+        summary = collector.collect()
+        collector.close()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        collector.close()
+        sys.exit(2)
+
+
+@cli.command(name="source-largeobjects")
+@click.option("--host", default=lambda: os.getenv("PG_SOURCE_HOST", "localhost"),
+              show_default="$PG_SOURCE_HOST", help="Source PostgreSQL host.")
+@click.option("--port", type=int, default=lambda: int(os.getenv("PG_SOURCE_PORT", "5432")),
+              show_default="$PG_SOURCE_PORT", help="Source PostgreSQL port.")
+@click.option("--user", default=lambda: os.getenv("PG_SOURCE_USER", "postgres"),
+              show_default="$PG_SOURCE_USER", help="Source database user.")
+@click.option("--password", default=lambda: os.getenv("PG_SOURCE_PASSWORD", ""),
+              help="Source database password (prefer $PG_SOURCE_PASSWORD).")
+@click.option("--database", default=lambda: os.getenv("PG_SOURCE_DATABASE", "postgres"),
+              show_default="$PG_SOURCE_DATABASE", help="Source database name.")
+@click.option("--timeout", type=int,
+              default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
+              show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Connection timeout (seconds).")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR",
+              help="Directory for source-pg-largeobjects[-errors].json.")
+def source_largeobjects(host: str, port: int, user: str, password: str,
+                        database: str, timeout: int, output_dir: str) -> None:
+    """Count the source database's large objects and write the count to JSON.
+
+    Writes ``source-pg-largeobjects.json`` on success, or
+    ``source-pg-largeobjects-errors.json`` with an error message on failure.
+    """
+    collector = PgCyanLobs(
         host=host, port=port, user=user, password=password,
         database=database, timeout=timeout, output_dir=output_dir,
     )
