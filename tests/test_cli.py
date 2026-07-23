@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from pg_cyan import cli as cli_module
 from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
+from pg_cyan.snapshot import PgCyanSnapshot as RealSnapshot
 
 
 class _StubChecker:
@@ -119,6 +120,32 @@ class _StubOrchestrator(RealOrchestrator):
         return {"status": status, "namespace": self.namespace, "phases": [], "errors": []}
 
 
+class _StubSnapshot(RealSnapshot):
+    """Records constructor kwargs and canned establish/hold results.
+
+    Subclasses the real holder (like ``_StubPlanner``) so the CLI's option
+    defaults, which read ``PgCyanSnapshot.DEFAULT_*``, still resolve after
+    monkeypatching. Never launches pgcopydb or opens a connection.
+    """
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubSnapshot.last_kwargs = kwargs
+        self._ok = kwargs["slot_name"] == "ok_slot"
+
+    def establish(self):
+        status = "success" if self._ok else "failure"
+        return {"status": status, "slot_file": None, "publication_file": None,
+                "snapshot_name": "0000000A-1" if self._ok else None, "errors": []}
+
+    def hold(self):
+        return 0
+
+    def close(self):
+        pass
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
@@ -127,6 +154,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanLobs", _StubLobsCollector)
     monkeypatch.setattr(cli_module, "PgCyanPlanner", _StubPlanner)
     monkeypatch.setattr(cli_module, "PgCyanOrchestrator", _StubOrchestrator)
+    monkeypatch.setattr(cli_module, "PgCyanSnapshot", _StubSnapshot)
     return CliRunner()
 
 
@@ -223,6 +251,29 @@ def test_plan_options_fall_back_to_env(runner, monkeypatch):
     runner.invoke(cli_module.cli, ["plan", "--output-dir", "ok_dir"])
     assert _StubPlanner.last_kwargs["inputs_dir"] == "/inputs"
     assert _StubPlanner.last_kwargs["shards"] == 7
+
+
+def test_snapshot_hold_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, ["snapshot-hold", "--slot-name", "ok_slot"])
+    assert result.exit_code == 0
+    assert _StubSnapshot.last_kwargs["slot_name"] == "ok_slot"
+
+
+def test_snapshot_hold_exit_one_when_not_established(runner):
+    result = runner.invoke(cli_module.cli, ["snapshot-hold", "--slot-name", "other"])
+    assert result.exit_code == 1
+
+
+def test_snapshot_hold_options_fall_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PGCYAN_PUBLICATION", "env_pub")
+    monkeypatch.setenv("PGCYAN_SLOT", "ok_slot")
+    monkeypatch.setenv("PGCYAN_SNAPSHOT_MODE", "frozen-source")
+    monkeypatch.setenv("PGCOPYDB_SOURCE_PGURI", "postgres://h/db")
+    runner.invoke(cli_module.cli, ["snapshot-hold"])
+    assert _StubSnapshot.last_kwargs["publication_name"] == "env_pub"
+    assert _StubSnapshot.last_kwargs["slot_name"] == "ok_slot"
+    assert _StubSnapshot.last_kwargs["snapshot_mode"] == "frozen-source"
+    assert _StubSnapshot.last_kwargs["source_pguri"] == "postgres://h/db"
 
 
 def test_orchestrate_exit_zero_on_success(runner):

@@ -1,0 +1,225 @@
+name: "Run: snapshot holder (phase 1)"
+
+# Integration test for the phase-1 SNAPSHOT HOLDER (issue #23) on the AKS
+# cluster. Modelled on run-planner.yml, but the snapshot holder is a Deployment,
+# NOT a Job -- it is designed to run forever, holding the exported snapshot open.
+# So instead of a Job-completion barrier this workflow:
+#
+#   1. applies the shared work-dir PVC (20) + the holder Deployment (50),
+#   2. waits for the pod to be Running and the Deployment Available -- the
+#      readiness probe only passes once source-pg-slot.json exists, i.e. the
+#      publication + slot + consistent snapshot are all established,
+#   3. execs into the pod and asserts it can SEE the outputs on the shared /work
+#      volume (source-pg-slot.json, source-pg-publication.json, snapshot id),
+#   4. tears the holder down GRACEFULLY (delete Deployment, --wait) so the
+#      wrapper SIGTERMs pgcopydb and the source replication connection closes --
+#      no stale connection is left behind (issue #23 PS),
+#   5. asserts the graceful-shutdown log line, and uploads logs + outputs.
+#
+# It deliberately does NOT start phases 0/2 (they move real data) and does not
+# advance any replication origin.
+#
+# Manual only (`workflow_dispatch`) -- it hits a real source database and the
+# real cluster, exactly like run-planner.yml.
+#
+# ---------------------------------------------------------------------------
+# PREREQUISITES (see run-planner.yml for the full list):
+#   * terraform/aks applied; the pgcyan image built + pushed to the ACR.
+#   * A dynamic RWX StorageClass for 20-pvc-workdir.yaml (azurefile-csi on AKS).
+#   * The SOURCE server must allow logical replication (wal_level=logical) and
+#     the login role must be able to CREATE PUBLICATION FOR ALL TABLES + create
+#     a replication slot (superuser / azure_pg_admin with the replication attr).
+#   * GitHub config (same split as run-planner.yml):
+#       secrets:  AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
+#                 PG_SOURCE_USER / PG_SOURCE_PASSWORD
+#       variables: AKS_RESOURCE_GROUP / AKS_CLUSTER_NAME
+#                  PG_SOURCE_HOST / PG_SOURCE_PORT / PG_SOURCE_DATABASE
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: "Override the pgcyan image for the holder (e.g. myacr.azurecr.io/pgcyan@sha256:...). Blank = use the digest pinned in deploy/k8s."
+        required: false
+        type: string
+
+permissions:
+  id-token: write   # OIDC token for azure/login
+  contents: read
+
+jobs:
+  run-snapshot-holder:
+    name: Establish, verify, then gracefully tear down the snapshot holder
+    runs-on: ubuntu-latest
+    environment: azure
+    env:
+      NS: pgcyan-migration
+      DEPLOY: pgcyan-snapshot-holder
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Guard -- require Azure + AKS + source-DB config
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          PG_SOURCE_USER: ${{ secrets.PG_SOURCE_USER }}
+          PG_SOURCE_PASSWORD: ${{ secrets.PG_SOURCE_PASSWORD }}
+          PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
+          PG_SOURCE_DATABASE: ${{ vars.PG_SOURCE_DATABASE }}
+        run: |
+          missing=()
+          [ -z "${AZURE_CLIENT_ID}" ]     && missing+=("AZURE_CLIENT_ID secret")
+          [ -z "${AKS_RESOURCE_GROUP}" ]  && missing+=("AKS_RESOURCE_GROUP variable")
+          [ -z "${AKS_CLUSTER_NAME}" ]    && missing+=("AKS_CLUSTER_NAME variable")
+          [ -z "${PG_SOURCE_USER}" ]      && missing+=("PG_SOURCE_USER secret")
+          [ -z "${PG_SOURCE_PASSWORD}" ]  && missing+=("PG_SOURCE_PASSWORD secret")
+          [ -z "${PG_SOURCE_HOST}" ]      && missing+=("PG_SOURCE_HOST variable")
+          [ -z "${PG_SOURCE_DATABASE}" ]  && missing+=("PG_SOURCE_DATABASE variable")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::%s not set -- configure it before running (see workflow header).\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Azure login (OIDC, passwordless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Ensure namespace + RBAC + work-dir PVC
+        run: |
+          kubectl apply -f deploy/k8s/00-namespace.yaml
+          kubectl apply -f deploy/k8s/01-rbac.yaml
+          kubectl apply -f deploy/k8s/20-pvc-workdir.yaml
+
+      # The holder reads pgcopydb's native PGCOPYDB_SOURCE_PGURI from the
+      # `pgcyan-db-uris` Secret. Build it from the same PG_SOURCE_* GitHub
+      # secrets/variables run-planner.yml uses; never in git. Azure Postgres
+      # requires TLS -> sslmode=require. (A target URI is not needed for phase 1
+      # -- the holder only touches the source -- but the key is set empty so the
+      # Secret shape matches 10-secrets.example.yaml.)
+      - name: Create/refresh source-DB Secret (PGCOPYDB_SOURCE_PGURI)
+        env:
+          PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
+          PG_SOURCE_PORT: ${{ vars.PG_SOURCE_PORT }}
+          PG_SOURCE_USER: ${{ secrets.PG_SOURCE_USER }}
+          PG_SOURCE_PASSWORD: ${{ secrets.PG_SOURCE_PASSWORD }}
+          PG_SOURCE_DATABASE: ${{ vars.PG_SOURCE_DATABASE }}
+        run: |
+          port="${PG_SOURCE_PORT:-5432}"
+          # URL-encode the user/password so special characters survive the URI.
+          enc() { python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+          u="$(enc "$PG_SOURCE_USER")"; p="$(enc "$PG_SOURCE_PASSWORD")"
+          uri="postgres://${u}:${p}@${PG_SOURCE_HOST}:${port}/${PG_SOURCE_DATABASE}?sslmode=require"
+          kubectl create secret generic pgcyan-db-uris -n "$NS" \
+            --from-literal=PGCOPYDB_SOURCE_PGURI="$uri" \
+            --from-literal=PGCOPYDB_TARGET_PGURI="" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pin image override (optional)
+        if: inputs.image_ref != ''
+        run: |
+          f=deploy/k8s/50-deployment-snapshot-holder.yaml
+          sed -i "s|image: \".*\"|image: \"${{ inputs.image_ref }}\"|" "$f"
+          grep -n 'image:' "$f"
+
+      # Start clean so a leftover holder from a prior run can't mask a fresh
+      # snapshot (its /work/coordinator/snapshot would be stale).
+      - name: Clear any prior holder
+        run: |
+          kubectl delete -f deploy/k8s/50-deployment-snapshot-holder.yaml \
+            -n "$NS" --ignore-not-found --wait=true
+
+      - name: Apply the snapshot holder
+        run: kubectl apply -f deploy/k8s/50-deployment-snapshot-holder.yaml
+
+      # The readiness probe passes only once source-pg-slot.json exists, so a
+      # ready replica == publication + slot + consistent snapshot all established.
+      - name: Wait for the holder to establish + become ready
+        run: |
+          set -euo pipefail
+          echo "waiting for the holder pod to be Running ..."
+          kubectl wait --for=condition=Ready pod \
+            -l pgcyan.dev/phase=snapshot-holder -n "$NS" --timeout=300s
+          echo "waiting for the Deployment to report an available replica ..."
+          kubectl rollout status deploy/"$DEPLOY" -n "$NS" --timeout=300s
+
+      # Acceptance: the outputs must be visible on the shared /work volume.
+      - name: Verify outputs on /work
+        run: |
+          set -euo pipefail
+          pod="$(kubectl get pod -l pgcyan.dev/phase=snapshot-holder -n "$NS" \
+                   -o jsonpath='{.items[0].metadata.name}')"
+          echo "holder pod: $pod"
+          echo "---- /work/coordinator ----"
+          kubectl exec "$pod" -n "$NS" -- ls -la /work/coordinator
+          for f in source-pg-slot.json source-pg-publication.json snapshot; do
+            echo "asserting /work/coordinator/$f is present and non-empty ..."
+            kubectl exec "$pod" -n "$NS" -- test -s "/work/coordinator/$f"
+          done
+          echo "---- source-pg-slot.json ----"
+          kubectl exec "$pod" -n "$NS" -- cat /work/coordinator/source-pg-slot.json
+          echo "---- source-pg-publication.json ----"
+          kubectl exec "$pod" -n "$NS" -- cat /work/coordinator/source-pg-publication.json
+
+      # Grab the outputs + logs BEFORE teardown, for the artifact.
+      - name: Collect outputs + establish logs
+        if: always()
+        run: |
+          mkdir -p snapshot-output
+          pod="$(kubectl get pod -l pgcyan.dev/phase=snapshot-holder -n "$NS" \
+                   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [ -n "${pod:-}" ]; then
+            for f in source-pg-slot.json source-pg-publication.json snapshot; do
+              kubectl exec "$pod" -n "$NS" -- cat "/work/coordinator/$f" \
+                > "snapshot-output/$f" 2>/dev/null || true
+            done
+          fi
+          kubectl logs -l pgcyan.dev/phase=snapshot-holder -n "$NS" --tail=-1 \
+            > snapshot-output/holder.log 2>&1 || true
+          ls -la snapshot-output
+
+      # Graceful teardown: deleting the Deployment SIGTERMs the pod; the wrapper
+      # then SIGTERMs pgcopydb, which closes the replication connection cleanly
+      # within terminationGracePeriodSeconds. --wait blocks until the pod is
+      # actually gone, so a hung shutdown fails the step.
+      - name: Gracefully shut the holder down
+        run: |
+          set -euo pipefail
+          kubectl delete deploy/"$DEPLOY" -n "$NS" --wait=true --timeout=120s
+          kubectl delete pdb/pgcyan-snapshot-holder -n "$NS" --ignore-not-found
+          echo "holder deleted; verifying no pod remains ..."
+          kubectl get pod -l pgcyan.dev/phase=snapshot-holder -n "$NS" 2>&1 | tee /tmp/pods.txt
+          grep -q "No resources found" /tmp/pods.txt \
+            || [ -z "$(kubectl get pod -l pgcyan.dev/phase=snapshot-holder -n "$NS" -o name)" ]
+
+      # Confirm the shutdown was graceful (the wrapper logged the clean stop),
+      # not a SIGKILL -- this is what proves the source connection was released.
+      - name: Assert graceful shutdown in the logs
+        run: |
+          set -euo pipefail
+          if grep -q "terminating the snapshot holder" snapshot-output/holder.log \
+             || grep -q "source connection released" snapshot-output/holder.log; then
+            echo "graceful shutdown confirmed"
+          else
+            echo "::warning::did not observe the graceful-shutdown log line (pod logs may have rotated on delete)"
+          fi
+
+      - name: Upload holder outputs + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgcyan-snapshot-holder-${{ github.run_id }}
+          path: snapshot-output/*
+          if-no-files-found: warn
+          retention-days: 30

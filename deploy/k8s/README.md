@@ -24,7 +24,7 @@ phase −2 input collector are assumed already applied).
 | `25-job-collect-inputs.yaml` | −2 | Job | collectors hit the source DB → write the inputs ConfigMap |
 | `30-job-planner.yaml` | −1 | Job | runs the planner (`pg_cyan.cli plan`) |
 | `40-job-phase0-predata.yaml` | 0 | Job | schema without secondary idx/FK |
-| `50-deployment-snapshot-holder.yaml` | 1 | Deployment(1)+PDB | holds the consistent snapshot |
+| `50-deployment-snapshot-holder.yaml` | 1 | Deployment(1)+PDB | `pg_cyan.cli snapshot-hold`: creates publication + pgoutput slot, exports & HOLDS the consistent snapshot |
 | `60-job-phase2-datashard.template.yaml` | 2 | Job × N | concurrent HEAP-only COPY shards |
 | `70-job-phase3-index.template.yaml` | 3a | Job × M | secondary index builds (shardable) |
 | `71-job-phase3-fk.yaml` | 3b | Job (single) | FK/constraint single coordinated pass |

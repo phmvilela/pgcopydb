@@ -32,6 +32,8 @@ pg_cyan/
   metrics.py           PgCyanMetrics: collect source database metrics
   lobs.py              PgCyanLobs: count source large objects
   planner.py           PgCyanPlanner: bin-pack shards + emit the migration plan
+  snapshot.py          PgCyanSnapshot: establish + hold the consistent snapshot
+  orchestrator.py      PgCyanOrchestrator: walk the deploy/k8s migration DAG
   cloud/azure/         Azure SDK integrations (skeleton)
   postgres/            PostgreSQL connection/introspection utils (skeleton)
 terraform/             Azure worker-VM provisioning (VNet, NSG, VM, cloud-init)
@@ -175,6 +177,38 @@ deferred follow-ups.
 Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
 directory).
 
+### Hold the consistent snapshot
+
+```bash
+# Establish and HOLD the publication + slot + consistent snapshot on the source
+python -m pg_cyan.cli snapshot-hold --work-dir /work/coordinator
+```
+
+`snapshot-hold` is the phase `1` **snapshot holder** — the safety-critical node
+in `deploy/k8s/50-deployment-snapshot-holder.yaml`. In one coordinated step it
+creates the publication `FOR ALL TABLES`, drives `pgcopydb snapshot --follow`
+to create the `pgoutput` replication slot and export its **consistent
+snapshot**, writes the snapshot id to the shared `/work` volume, and then
+**holds the exporting connection open** so every pre-data (#24) and sharded-copy
+(#25) pod pins the same instant. A PostgreSQL snapshot is only valid while its
+transaction stays open, so this runs as a Deployment (replicas=1 + PDB): if it
+dies the in-flight copy must `--restart` from a new snapshot. It does **not**
+create or advance a replication origin.
+
+On `SIGTERM`/`SIGINT` it terminates `pgcopydb`, which closes the replication
+connection cleanly — a graceful exit leaves no stale source connection behind.
+
+| Outcome | File(s) written                                            | Exit |
+|---------|------------------------------------------------------------|------|
+| Success | `source-pg-slot.json` + `source-pg-publication.json`, then holds until signalled | 0 |
+| Failure | `source-pg-slot-errors.json` / `source-pg-publication-errors.json` | 1 |
+| Interrupted | *(partial; child torn down)*                           | 2    |
+
+Outputs land in `--output-dir` (default `$PG_OUTPUT_DIR`, else `--work-dir`), so
+on the holder pod they sit next to the snapshot id on the shared `/work` volume.
+The connection string comes from pgcopydb's native `PGCOPYDB_SOURCE_PGURI` when
+set, otherwise the discrete `PG_SOURCE_*` variables.
+
 ### Configuration (environment variables)
 
 | Variable                     | Default     | Purpose                          |
@@ -190,9 +224,13 @@ directory).
 | `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
 | `PGCYAN_SNAPSHOT_MODE`       | `coordinator-held` | `plan`: snapshot strategy |
-| `PGCYAN_PUBLICATION`         | `pgcyan_pub` | `plan`: publication name        |
-| `PGCYAN_SLOT`                | `pgcyan_slot` | `plan`: replication slot name  |
+| `PGCYAN_PUBLICATION`         | `pgcyan_pub` | `plan` / `snapshot-hold`: publication name |
+| `PGCYAN_SLOT`                | `pgcyan_slot` | `plan` / `snapshot-hold`: replication slot name |
 | `PGCYAN_RUN_ID`              | *(clock)*   | `plan`: opaque run identifier    |
+| `PGCOPYDB_SOURCE_PGURI`      | *(unset)*   | `snapshot-hold`: source libpq URI (else `PG_SOURCE_*`) |
+| `PGCYAN_PLUGIN`              | `pgoutput`  | `snapshot-hold`: logical decoding output plugin |
+| `PGCYAN_WORK_DIR`            | `/work/coordinator` | `snapshot-hold`: pgcopydb `--dir`; snapshot id written here |
+| `PGCYAN_PLAN_FILE`           | *(unset)*   | `snapshot-hold`: optional `plan.json` to source names/mode |
 | `LOG_LEVEL`                  | `INFO`      | Log verbosity                    |
 
 ## Docker

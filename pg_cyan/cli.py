@@ -24,6 +24,7 @@ from pg_cyan.orchestrator import PgCyanOrchestrator
 from pg_cyan.parameters import PgCyanParameters
 from pg_cyan.planner import PgCyanPlanner
 from pg_cyan.preflight import PgCyanPreflight
+from pg_cyan.snapshot import PgCyanSnapshot
 
 
 @click.group()
@@ -271,6 +272,81 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
         click.echo(json.dumps(summary, indent=2, default=str))
         sys.exit(0 if summary["status"] == "success" else 1)
     except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="snapshot-hold")
+@click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
+              show_default="$PGCOPYDB_SOURCE_PGURI",
+              help="Source libpq URI (pgcopydb-native); falls back to --host/--port/... if unset.")
+@click.option("--host", default=lambda: os.getenv("PG_SOURCE_HOST", "localhost"),
+              show_default="$PG_SOURCE_HOST", help="Source PostgreSQL host.")
+@click.option("--port", type=int, default=lambda: int(os.getenv("PG_SOURCE_PORT", "5432")),
+              show_default="$PG_SOURCE_PORT", help="Source PostgreSQL port.")
+@click.option("--user", default=lambda: os.getenv("PG_SOURCE_USER", "postgres"),
+              show_default="$PG_SOURCE_USER", help="Source database user.")
+@click.option("--password", default=lambda: os.getenv("PG_SOURCE_PASSWORD", ""),
+              help="Source database password (prefer $PG_SOURCE_PASSWORD).")
+@click.option("--database", default=lambda: os.getenv("PG_SOURCE_DATABASE", "postgres"),
+              show_default="$PG_SOURCE_DATABASE", help="Source database name.")
+@click.option("--timeout", type=int,
+              default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
+              show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Connection timeout (seconds).")
+@click.option("--publication-name",
+              default=lambda: os.getenv("PGCYAN_PUBLICATION", PgCyanSnapshot.DEFAULT_PUBLICATION),
+              show_default="$PGCYAN_PUBLICATION", help="Publication to create FOR ALL TABLES.")
+@click.option("--slot-name",
+              default=lambda: os.getenv("PGCYAN_SLOT", PgCyanSnapshot.DEFAULT_SLOT),
+              show_default="$PGCYAN_SLOT", help="Logical replication slot to create.")
+@click.option("--snapshot-mode",
+              default=lambda: os.getenv("PGCYAN_SNAPSHOT_MODE", PgCyanSnapshot.DEFAULT_SNAPSHOT_MODE),
+              show_default="$PGCYAN_SNAPSHOT_MODE", help="Recorded snapshot mode (held vs frozen-source).")
+@click.option("--plugin",
+              default=lambda: os.getenv("PGCYAN_PLUGIN", PgCyanSnapshot.DEFAULT_PLUGIN),
+              show_default="$PGCYAN_PLUGIN", help="Logical decoding output plugin.")
+@click.option("--work-dir",
+              default=lambda: os.getenv("PGCYAN_WORK_DIR", PgCyanSnapshot.DEFAULT_WORK_DIR),
+              show_default="$PGCYAN_WORK_DIR", help="pgcopydb --dir; the snapshot id is written here.")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
+              show_default="$PG_OUTPUT_DIR (defaults to --work-dir)",
+              help="Directory for source-pg-slot.json / source-pg-publication.json.")
+@click.option("--plan-file", default=lambda: os.getenv("PGCYAN_PLAN_FILE"),
+              show_default="$PGCYAN_PLAN_FILE",
+              help="Optional plan.json to source publication/slot/mode from.")
+@click.option("--pgcopydb-bin",
+              default=lambda: os.getenv("PGCOPYDB_BIN", PgCyanSnapshot.DEFAULT_PGCOPYDB_BIN),
+              show_default="$PGCOPYDB_BIN", help="pgcopydb executable name/path.")
+def snapshot_hold(source_pguri: str, host: str, port: int, user: str, password: str,
+                  database: str, timeout: int, publication_name: str, slot_name: str,
+                  snapshot_mode: str, plugin: str, work_dir: str, output_dir: str,
+                  plan_file: str, pgcopydb_bin: str) -> None:
+    """Establish and HOLD the source's consistent publication + slot + snapshot.
+
+    Creates the publication FOR ALL TABLES, creates the pgoutput slot and exports
+    its consistent snapshot (writing the id to the shared /work volume), then
+    blocks -- keeping the exporting connection open -- until SIGTERM/SIGINT, at
+    which point it terminates pgcopydb so the source connection closes cleanly.
+    Writes ``source-pg-slot.json`` + ``source-pg-publication.json`` on success,
+    or matching ``*-errors.json`` on failure.
+    """
+    holder = PgCyanSnapshot(
+        source_pguri=source_pguri or None,
+        host=host, port=port, user=user, password=password,
+        database=database, timeout=timeout,
+        publication_name=publication_name, slot_name=slot_name,
+        snapshot_mode=snapshot_mode, plugin=plugin, work_dir=work_dir,
+        output_dir=output_dir or None, plan_file=plan_file or None,
+        pgcopydb_bin=pgcopydb_bin,
+    )
+    try:
+        summary = holder.establish()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        if summary["status"] != "success":
+            holder.close()
+            sys.exit(1)
+        sys.exit(0 if holder.hold() == 0 else 1)
+    except KeyboardInterrupt:
+        holder.close()
         sys.exit(2)
 
 

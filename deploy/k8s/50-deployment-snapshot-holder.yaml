@@ -9,12 +9,17 @@
 # inconsistency / corruption. Because our shards are shared-nothing separate
 # pods, none of them can own the snapshot on behalf of the others.
 #
-# THE FIX: one long-lived pod runs `pgcopydb snapshot`, which opens the
-# exporting transaction, holds it, and writes the snapshot id under the shared
-# work dir. Every phase-0/2 pod reads that id and passes `--snapshot`, so they
-# all copy the SAME instant. This pod must stay Running for the entire duration
-# of the initial COPY (phases 0-2). Hence a Deployment (restarts if killed), not
-# a Job.
+# THE FIX: one long-lived pod runs `pg_cyan.cli snapshot-hold` (issue #23), a
+# thin wrapper that establishes the whole consistent replication setup in one
+# coordinated step -- it creates the publication FOR ALL TABLES, then drives
+# `pgcopydb snapshot --follow` to create the pgoutput slot, export its
+# consistent snapshot, write the snapshot id under the shared work dir, and HOLD
+# the exporting connection open. Every phase-0/2 pod reads that id and passes
+# `--snapshot`, so they all copy the SAME instant. This pod must stay Running
+# for the entire duration of the initial COPY (phases 0-2). Hence a Deployment
+# (restarts if killed), not a Job. On graceful shutdown the wrapper terminates
+# pgcopydb, which closes the replication connection -- no stale source
+# connection is left behind.
 #
 # CAVEAT: if this pod dies, the snapshot is GONE and cannot be recreated at the
 # same LSN -- the in-flight initial copy must restart (--restart) from a new
@@ -43,21 +48,42 @@ spec:
         pgcyan.dev/phase: "snapshot-holder"
     spec:
       serviceAccountName: pgcyan-worker
+      # Give the wrapper time to SIGTERM pgcopydb and let it close the
+      # replication connection before k8s SIGKILLs the pod -- a clean exit is
+      # what prevents a stale source connection (issue #23).
+      terminationGracePeriodSeconds: 60
       # TODO: add a high PriorityClass so this pod is the LAST to be evicted
       # under node pressure. Its death invalidates the whole initial copy.
       # priorityClassName: pgcyan-critical
       containers:
         - name: snapshot
           image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
-          # `pgcopydb snapshot` exports and HOLDS the snapshot, writing its id to
-          # /work/coordinator/snapshot, and blocks (keeps the txn open) until
-          # terminated. Shards read that file.
-          command: ["pgcopydb", "snapshot"]
-          args:
-            - "--dir=/work/coordinator"
+          # `pg_cyan.cli snapshot-hold` creates the publication FOR ALL TABLES,
+          # drives `pgcopydb snapshot --follow` to create the pgoutput slot +
+          # export the consistent snapshot (writing its id to
+          # /work/coordinator/snapshot and source-pg-{slot,publication}.json
+          # alongside it), then blocks holding the exporting connection until it
+          # receives SIGTERM. Shards read the snapshot id file.
+          command: ["python", "-m", "pg_cyan.cli", "snapshot-hold"]
+          env:
+            # Establish under the shared /work volume so phases 0/2 -- and the
+            # integration test -- see the snapshot id and the JSON outputs there.
+            - name: PGCYAN_WORK_DIR
+              value: "/work/coordinator"
+            - name: PG_OUTPUT_DIR
+              value: "/work/coordinator"
+            # Publication/slot/mode default to the planner's defaults; the
+            # orchestrator overrides these (or mounts plan.json at
+            # $PGCYAN_PLAN_FILE) so the holder and the plan agree.
+            - name: PGCYAN_PUBLICATION
+              value: "pgcyan_pub"
+            - name: PGCYAN_SLOT
+              value: "pgcyan_slot"
+            - name: PGCYAN_SNAPSHOT_MODE
+              value: "coordinator-held"
           envFrom:
             - secretRef:
-                name: pgcyan-db-uris
+                name: pgcyan-db-uris    # PGCOPYDB_SOURCE_PGURI (pgcopydb-native)
           volumeMounts:
             - name: workdir
               mountPath: /work
@@ -65,13 +91,14 @@ spec:
             # Holds one idle transaction. Essentially free.
             requests: { cpu: "50m",  memory: "128Mi" }
             limits:   { cpu: "250m", memory: "256Mi" }
-          # Liveness: if the snapshot file disappears or the process dies, let
-          # k8s restart it -- though note a restart means a NEW snapshot, so the
-          # orchestrator must treat a holder restart as "initial copy must
-          # --restart". TODO: wire an alert on restartCount > 0.
+          # Ready only once the whole setup is established: source-pg-slot.json
+          # is written last (after the publication, slot, and exported snapshot),
+          # so its presence means the holder is fully up. A restart means a NEW
+          # snapshot, so the orchestrator must treat a holder restart as "initial
+          # copy must --restart". TODO: wire an alert on restartCount > 0.
           readinessProbe:
             exec:
-              command: ["test", "-f", "/work/coordinator/snapshot"]
+              command: ["test", "-f", "/work/coordinator/source-pg-slot.json"]
             initialDelaySeconds: 5
             periodSeconds: 5
       volumes:

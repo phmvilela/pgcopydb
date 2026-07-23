@@ -11,10 +11,10 @@ post-migration**. Deliverables are a mix of Python (checks/orchestration) and
 Terraform (Azure provisioning). See `README.md` for the user-facing view.
 
 Current state: the **pre-migration** stages (`preflight`, `source-parameters`,
-`source-pg-metrics`, `source-largeobjects`, `plan`), the **migration DAG
-orchestrator** (`orchestrate`, driving the `deploy/k8s/` sharded pgcopydb
-Jobs/Deployments), and the Terraform **worker VM** / **AKS cluster** modules
-exist. Post-migration is not built yet.
+`source-pg-metrics`, `source-largeobjects`, `plan`), the phase-1 **snapshot
+holder** (`snapshot-hold`), the **migration DAG orchestrator** (`orchestrate`,
+driving the `deploy/k8s/` sharded pgcopydb Jobs/Deployments), and the Terraform
+**worker VM** / **AKS cluster** modules exist. Post-migration is not built yet.
 
 ## Where work comes from
 
@@ -66,10 +66,10 @@ literals — never f-string user/config values into SQL.
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
 `preflight`, `source-parameters`, `source-pg-metrics`,
-`source-largeobjects`, `plan`, and `orchestrate` are implemented. Options
-default to `PG_SOURCE_*` env vars so the same invocation works locally
-and in the container. Exit codes: `0` ready/success, `1` not ready/failure,
-`2` interrupted — keep these stable.
+`source-largeobjects`, `plan`, `snapshot-hold`, and `orchestrate` are
+implemented. Options default to `PG_SOURCE_*` env vars so the same invocation
+works locally and in the container. Exit codes: `0` ready/success, `1` not
+ready/failure, `2` interrupted — keep these stable.
 
 `source-parameters` (`pg_cyan/parameters.py`, `PgCyanParameters`) is the second
 orchestrator and the template for **artifact-producing** stages: instead of a
@@ -128,6 +128,37 @@ large objects. Fixed at N=4 shards for now; the FK graph is emitted as
 scope (both deferred to follow-ups, per the resolved sub-questions in #38).
 This is the phase `-1` node in `deploy/k8s/30-job-planner.yaml`; its output
 populates `12-configmap-plan.yaml`.
+
+`snapshot-hold` (`pg_cyan/snapshot.py`, `PgCyanSnapshot`) is the phase `1`
+**snapshot holder** (issue #23) and the first stage that both talks to the
+source **and** stays running -- it is a long-lived Deployment, not a one-shot
+collector. In one coordinated step it creates the publication `FOR ALL TABLES`,
+then drives `pgcopydb snapshot --follow --plugin pgoutput --slot-name <slot>`
+(a thin wrapper -- **do not** hand-roll `CREATE_REPLICATION_SLOT` SQL) to create
+the slot, export its **consistent snapshot**, write the snapshot id to the
+shared `/work` volume, and **hold the exporting connection open** so phases 0/2
+pin the same instant. pgcopydb's `snapshot` path does not manage the
+publication, so the holder creates it itself (a single `CREATE PUBLICATION` via
+`psycopg2.sql`, not the discouraged slot SQL). It does **not** create/advance a
+replication origin. It still follows the orchestrator conventions (`_log_event`,
+graceful degradation -- `establish()` never raises) and the success-vs-error
+two-file shape, but with **two** artifacts: `source-pg-slot.json` (slot +
+snapshot name + captured `consistent_point`) and `source-pg-publication.json`
+(publication name), or matching `*-errors.json` on failure. Publication/slot/
+mode default to the planner's (`PGCYAN_PUBLICATION`/`PGCYAN_SLOT`/
+`PGCYAN_SNAPSHOT_MODE`) and can be overridden from `plan.json` via
+`--plan-file`. The lifecycle splits into `establish()` (create + hold + write
+outputs; returns a summary) and `hold()` (block until SIGTERM/SIGINT, then
+terminate pgcopydb so the replication connection closes -- a graceful pod exit
+leaves **no stale source connection**, per the ticket's PS). This is the node in
+`deploy/k8s/50-deployment-snapshot-holder.yaml`; its readiness probe gates on
+`source-pg-slot.json`, so a ready replica means the snapshot is fully
+established. Because it is a Deployment (not a Job), its integration test is a
+`workflow_dispatch` workflow (`.github/workflows/run-snapshot-holder.yml`,
+modelled on `run-planner.yml`) that applies the holder, waits for the pod to be
+Ready, asserts the outputs are visible on `/work`, then tears it down gracefully
+and checks the clean-shutdown log line -- rather than a `tests/integration`
+pytest.
 
 `orchestrate` (`pg_cyan/orchestrator.py`, `PgCyanOrchestrator`) is the
 **migration DAG orchestrator** (issue #40) -- the `deploy/k8s/` manifests are
