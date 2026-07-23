@@ -5,9 +5,13 @@ architecture. Full explanation of how the objects form the DAG:
 [../../notes/k8s-sharded-migration-topology.md](../../notes/k8s-sharded-migration-topology.md).
 
 These are the **node** objects. Ordering/barriers between phases are enforced by
-the **orchestrator** (imperatively, using the RBAC in `01-rbac.yaml`) or by a
-workflow engine — plain YAML cannot express "wait for all shards". Files are
-numbered in apply order.
+the **orchestrator** (`pg_cyan.cli orchestrate`, `pg_cyan/orchestrator.py`,
+issue #40 — custom Python using the Kubernetes client and the RBAC in
+`01-rbac.yaml`, chosen over Argo Workflows so no new CRDs/controller are
+needed; see the module docstring for the full rationale) — plain YAML cannot
+express "wait for all shards". Files are numbered in apply order; the
+orchestrator applies phases −1 through 4 (namespace/RBAC/PVC/Secrets and the
+phase −2 input collector are assumed already applied).
 
 | File | Phase | Kind | Role |
 |---|---|---|---|
@@ -47,3 +51,29 @@ or let CI do it (`.github/workflows/publish-image.yml`, on a `v*` tag or manual
 dispatch). If your `acr_name` differs from the default `pgcyanacr`, repoint the
 `image:` field in each manifest at your registry's login server (and prefer
 pinning by `@sha256:` digest — the build script and workflow both print it).
+
+## Pinning the digest across every manifest at once
+
+`kustomization.yaml` bundles the directly-appliable manifests (everything
+except the example Secret, the two generated ConfigMap stubs, and the two
+non-standalone `.template.yaml` files — see the comments in that file) with an
+`images:` override, so a fresh digest only needs to be set in **one** place:
+
+```sh
+kubectl kustomize deploy/k8s              # preview the rendered, pinned bundle
+kubectl apply -k deploy/k8s               # apply the whole bundle yourself
+```
+
+CI's `deploy` job in `publish-image.yml` (manual-only —
+`workflow_dispatch` with `deploy_to_cluster: true`) does this automatically
+after a successful publish: it rewrites the `digest:` in `kustomization.yaml`
+to the image it just pushed, uploads the fully rendered bundle as a build
+artifact, but **applies only `00-namespace.yaml` / `01-rbac.yaml` /
+`20-pvc-workdir.yaml`** — the cluster-scoped prerequisites the orchestrator
+already assumes exist. It deliberately does not apply the phase manifests or
+start the orchestrator itself; that starts a real migration run against real
+databases, and stays a separate, deliberate action a human takes (e.g. the
+`kubectl run ... -- python -m pg_cyan.cli orchestrate` one-liner printed in
+that job's summary). See the workflow file's header comment for the Azure
+role assignment and `AKS_RESOURCE_GROUP` / `AKS_CLUSTER_NAME` repo variables
+it needs.

@@ -134,6 +134,18 @@ variable "acr_sku" {
   }
 }
 
+# --- GitHub Actions OIDC (CI/CD) ---
+variable "github_repo" {
+  description = "GitHub \"org/repo\" that publish-image.yml's `publish`/`deploy` jobs run in — the federated credential trusts only this exact repo"
+  type        = string
+  default     = "berenguel/pgcyan"
+
+  validation {
+    condition     = can(regex("^[^/]+/[^/]+$", var.github_repo))
+    error_message = "github_repo must be in \"org/repo\" form, e.g. berenguel/pgcyan."
+  }
+}
+
 # --- monitoring ---
 variable "log_retention_in_days" {
   description = "Retention period for the Log Analytics workspace"

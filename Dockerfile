@@ -69,6 +69,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY pg_cyan/ ./pg_cyan/
+# The orchestrator (pg_cyan.cli orchestrate, issue #40) applies these manifests
+# from PgCyanOrchestrator.DEFAULT_MANIFESTS_DIR, which resolves to ./deploy/k8s
+# next to ./pg_cyan -- keep this path in sync with that default.
+COPY deploy/k8s/ ./deploy/k8s/
 
 # Create non-root user for security
 RUN useradd -m -u 1000 migration && chown -R migration:migration /app

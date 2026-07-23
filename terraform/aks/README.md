@@ -16,6 +16,7 @@ and is applied independently.
 | **Azure Container Registry** + **AcrPull** to the kubelet identity | Hosts the `REPLACE_ME/pgcyan` image so every Job/Deployment can pull it without imagePullSecrets. |
 | **Log Analytics** + **Container Insights** (`oms_agent`) | Cluster/pod observability for the migration run. |
 | **Azure CNI Overlay** VNet/subnet | Pod IPs come from an overlay CIDR, so heavy concurrent shard fan-out never exhausts the VNet. |
+| **GitHub Actions OIDC identity** (UAMI + federated credential) | Passwordless Azure login for `.github/workflows/publish-image.yml`'s `publish` (ACR push) and `deploy` (AKS sync) jobs — no static credentials in GitHub. |
 
 ## Prerequisites
 
@@ -103,6 +104,20 @@ manifests exactly) and leaves no state — prefer Cloud Shell.
    roles on **both** source and target Postgres so the worker can authenticate
    with the token it exchanges. Until then, fall back to the Secret in
    `10-secrets.example.yaml`.
+
+6. **Configure GitHub Actions OIDC.** Set the printed values as GitHub repo
+   secrets (Settings → Secrets and variables → Actions):
+   ```bash
+   terraform output github_actions_client_id
+   terraform output github_actions_tenant_id
+   terraform output github_actions_subscription_id
+   ```
+   → `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID`. Also set
+   the repo variables `AKS_RESOURCE_GROUP` / `AKS_CLUSTER_NAME` to
+   `terraform output resource_group_name` / `cluster_name` (and `ACR_NAME` if
+   it differs from the workflow's `pgcyanacr` default). The federated
+   credential trusts exactly `var.github_repo` (default `berenguel/pgcyan`) —
+   change that variable and re-apply if you fork the repo.
 
 ## Remote state
 

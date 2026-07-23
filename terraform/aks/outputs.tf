@@ -55,3 +55,19 @@ output "workload_identity_patch_script" {
   description = "Path to the generated script that annotates the ServiceAccounts with the MI client-ids"
   value       = local_file.workload_identity_patch.filename
 }
+
+# --- GitHub Actions OIDC (CI/CD): set these as GitHub repo secrets ---
+output "github_actions_client_id" {
+  description = "Set as the GitHub repo secret AZURE_CLIENT_ID"
+  value       = azurerm_user_assigned_identity.github_actions.client_id
+}
+
+output "github_actions_tenant_id" {
+  description = "Set as the GitHub repo secret AZURE_TENANT_ID"
+  value       = data.azurerm_client_config.current.tenant_id
+}
+
+output "github_actions_subscription_id" {
+  description = "Set as the GitHub repo secret AZURE_SUBSCRIPTION_ID"
+  value       = data.azurerm_client_config.current.subscription_id
+}

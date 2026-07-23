@@ -11,6 +11,10 @@ python-dotenv==1.0.0
 # CLI
 click==8.1.7
 
+# Kubernetes orchestrator (pg_cyan.cli orchestrate, issue #40)
+kubernetes==30.1.0
+PyYAML==6.0.1
+
 # Logging & Serialization
 python-json-logger==2.0.7
 

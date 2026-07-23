@@ -9,6 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from pg_cyan import cli as cli_module
+from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
 
 
@@ -97,6 +98,27 @@ class _StubPlanner(RealPlanner):
         return {"status": status, "output_file": None, "error_file": None}
 
 
+class _StubOrchestrator(RealOrchestrator):
+    """Records constructor kwargs and returns a canned run summary.
+
+    Subclasses the real orchestrator (like ``_StubPlanner``) so the CLI's
+    option-default lambdas, which read ``PgCyanOrchestrator.DEFAULT_*``, still
+    resolve after monkeypatching. Deliberately does NOT call ``super().__init__``
+    -- no real Kubernetes client should be built for a CLI-wiring test.
+    """
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubOrchestrator.last_kwargs = kwargs
+        self.namespace = kwargs["namespace"]
+        self._ok = self.namespace == "ok_ns"
+
+    def run(self):
+        status = "success" if self._ok else "failure"
+        return {"status": status, "namespace": self.namespace, "phases": [], "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
@@ -104,6 +126,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanMetrics", _StubMetricsCollector)
     monkeypatch.setattr(cli_module, "PgCyanLobs", _StubLobsCollector)
     monkeypatch.setattr(cli_module, "PgCyanPlanner", _StubPlanner)
+    monkeypatch.setattr(cli_module, "PgCyanOrchestrator", _StubOrchestrator)
     return CliRunner()
 
 
@@ -200,3 +223,27 @@ def test_plan_options_fall_back_to_env(runner, monkeypatch):
     runner.invoke(cli_module.cli, ["plan", "--output-dir", "ok_dir"])
     assert _StubPlanner.last_kwargs["inputs_dir"] == "/inputs"
     assert _StubPlanner.last_kwargs["shards"] == 7
+
+
+def test_orchestrate_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, ["orchestrate", "--namespace", "ok_ns"])
+    assert result.exit_code == 0
+    assert _StubOrchestrator.last_kwargs["namespace"] == "ok_ns"
+
+
+def test_orchestrate_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, ["orchestrate", "--namespace", "other_ns"])
+    assert result.exit_code == 1
+
+
+def test_orchestrate_options_fall_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PGCYAN_NAMESPACE", "ok_ns")
+    monkeypatch.setenv("PGCYAN_JOB_TIMEOUT", "42")
+    runner.invoke(cli_module.cli, ["orchestrate"])
+    assert _StubOrchestrator.last_kwargs["namespace"] == "ok_ns"
+    assert _StubOrchestrator.last_kwargs["job_timeout"] == 42
+
+
+def test_orchestrate_kubeconfig_flag(runner):
+    runner.invoke(cli_module.cli, ["orchestrate", "--namespace", "ok_ns", "--kubeconfig"])
+    assert _StubOrchestrator.last_kwargs["in_cluster"] is False

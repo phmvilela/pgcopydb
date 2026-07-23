@@ -20,6 +20,7 @@ import click
 from pg_cyan import __version__
 from pg_cyan.lobs import PgCyanLobs
 from pg_cyan.metrics import PgCyanMetrics
+from pg_cyan.orchestrator import PgCyanOrchestrator
 from pg_cyan.parameters import PgCyanParameters
 from pg_cyan.planner import PgCyanPlanner
 from pg_cyan.preflight import PgCyanPreflight
@@ -225,6 +226,48 @@ def plan(inputs_dir: str, output_dir: str, shards: int, split_tables_larger_than
     )
     try:
         summary = planner.plan()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="orchestrate")
+@click.option("--namespace",
+              default=lambda: os.getenv("PGCYAN_NAMESPACE", PgCyanOrchestrator.DEFAULT_NAMESPACE),
+              show_default="$PGCYAN_NAMESPACE", help="Namespace the migration workloads run in.")
+@click.option("--manifests-dir",
+              default=lambda: os.getenv("PGCYAN_MANIFESTS_DIR", PgCyanOrchestrator.DEFAULT_MANIFESTS_DIR),
+              show_default="$PGCYAN_MANIFESTS_DIR",
+              help="Directory containing the deploy/k8s phase manifests.")
+@click.option("--plan-configmap",
+              default=lambda: os.getenv("PGCYAN_PLAN_CONFIGMAP", PgCyanOrchestrator.DEFAULT_PLAN_CONFIGMAP),
+              show_default="$PGCYAN_PLAN_CONFIGMAP",
+              help="ConfigMap the planner Job publishes plan.json/shard filters to.")
+@click.option("--poll-interval", type=int,
+              default=lambda: int(os.getenv("PGCYAN_POLL_INTERVAL", str(PgCyanOrchestrator.DEFAULT_POLL_INTERVAL))),
+              show_default="$PGCYAN_POLL_INTERVAL", help="Seconds between Job/Deployment status polls.")
+@click.option("--job-timeout", type=int,
+              default=lambda: int(os.getenv("PGCYAN_JOB_TIMEOUT", str(PgCyanOrchestrator.DEFAULT_JOB_TIMEOUT))),
+              show_default="$PGCYAN_JOB_TIMEOUT",
+              help="Seconds to wait for a phase barrier before failing it.")
+@click.option("--in-cluster/--kubeconfig", default=True,
+              help="Load in-cluster ServiceAccount credentials (default) or a local kubeconfig for dev/testing.")
+def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
+                 poll_interval: int, job_timeout: int, in_cluster: bool) -> None:
+    """Walk the migration DAG: apply each phase in order and block on its barrier.
+
+    Applies planner(-1) -> pre-data(0) -> snapshot-holder(1) -> data shards(2)
+    -> index(3a) -> FK(3b) -> follow-CDC(4), stopping (without applying later
+    phases) at the first phase whose Jobs/Deployments do not all succeed/become
+    ready.
+    """
+    orchestrator = PgCyanOrchestrator(
+        namespace=namespace, manifests_dir=manifests_dir, plan_configmap=plan_configmap,
+        poll_interval=poll_interval, job_timeout=job_timeout, in_cluster=in_cluster,
+    )
+    try:
+        summary = orchestrator.run()
         click.echo(json.dumps(summary, indent=2, default=str))
         sys.exit(0 if summary["status"] == "success" else 1)
     except KeyboardInterrupt:

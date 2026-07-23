@@ -34,6 +34,10 @@ dns_service_ip               = "10.0.0.10"
 acr_name = "pgcyanacr"
 acr_sku  = "Standard"
 
+# GitHub repo publish-image.yml's `publish`/`deploy` jobs run in — the OIDC
+# federated credential trusts only this exact "org/repo".
+github_repo = "berenguel/pgcyan"
+
 # Monitoring
 log_retention_in_days = 30
 

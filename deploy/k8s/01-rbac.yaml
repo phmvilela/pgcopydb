@@ -52,6 +52,12 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # PodDisruptionBudgets ship alongside the snapshot-holder/follow-cdc
+  # Deployments (50/80) -- the orchestrator applies whatever a phase manifest
+  # contains, which includes these.
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
   # Read pod status/logs to detect shard failures and surface progress.
   - apiGroups: [""]
     resources: ["pods", "pods/log"]

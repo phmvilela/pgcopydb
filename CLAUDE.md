@@ -10,10 +10,11 @@ minimal downtime, across three stages: **pre-migration → migration →
 post-migration**. Deliverables are a mix of Python (checks/orchestration) and
 Terraform (Azure provisioning). See `README.md` for the user-facing view.
 
-Current state: the **pre-migration preflight** checks, the **source parameter
-inventory** (`source-parameters`), the **source metrics collector**
-(`source-pg-metrics`), and the Terraform **worker VM** exist. Migration and
-post-migration are not built yet.
+Current state: the **pre-migration** stages (`preflight`, `source-parameters`,
+`source-pg-metrics`, `source-largeobjects`, `plan`), the **migration DAG
+orchestrator** (`orchestrate`, driving the `deploy/k8s/` sharded pgcopydb
+Jobs/Deployments), and the Terraform **worker VM** / **AKS cluster** modules
+exist. Post-migration is not built yet.
 
 ## Where work comes from
 
@@ -65,8 +66,8 @@ literals — never f-string user/config values into SQL.
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
 `preflight`, `source-parameters`, `source-pg-metrics`,
-`source-largeobjects`, and `plan` are implemented. Options default to
-`PG_SOURCE_*` env vars so the same invocation works locally
+`source-largeobjects`, `plan`, and `orchestrate` are implemented. Options
+default to `PG_SOURCE_*` env vars so the same invocation works locally
 and in the container. Exit codes: `0` ready/success, `1` not ready/failure,
 `2` interrupted — keep these stable.
 
@@ -127,6 +128,29 @@ large objects. Fixed at N=4 shards for now; the FK graph is emitted as
 scope (both deferred to follow-ups, per the resolved sub-questions in #38).
 This is the phase `-1` node in `deploy/k8s/30-job-planner.yaml`; its output
 populates `12-configmap-plan.yaml`.
+
+`orchestrate` (`pg_cyan/orchestrator.py`, `PgCyanOrchestrator`) is the
+**migration DAG orchestrator** (issue #40) -- the `deploy/k8s/` manifests are
+the nodes, this is the edges. Design decision for the ticket's open question
+(custom Python vs. Argo Workflows): **custom Python**, using the official
+`kubernetes` client, because `01-rbac.yaml` already scopes a plain
+ServiceAccount for exactly this (Job/Deployment/ConfigMap verbs, no CRDs), and
+every other stage is already this same `PgCyan<Stage>` + `_log_event` pattern
+-- see the rationale in the module docstring for the full argument. It walks
+the phases in order -- planner(-1) → pre-data(0) → snapshot-holder(1) → data
+shards(2, ×N) → index(3a, ×M) → FK(3b) → follow-CDC(4) -- applying each
+phase's manifest(s) (substituting the `${...}` placeholders in the
+`*.template.yaml` files once per `plan.json` entry for the templated phases)
+and **blocking on that phase's barrier**: Job phases wait for every Job to
+report `Complete`, Deployment phases (snapshot-holder, follow-CDC) wait for
+the desired ready-replica count, since those run forever by design.
+`run()` never raises and **fails fast** -- the first phase whose barrier does
+not resolve to success stops the walk; later phases are never applied.
+`plan.json` is read from the `pgcyan-plan` ConfigMap via the API right before
+phase 2 needs it (not mounted as a volume, since that ConfigMap does not exist
+until the phase-(-1) planner Job creates it). Out of scope for this ticket
+(assumed already applied): the namespace/RBAC/PVC/Secrets (00/01/10/20) and
+the input-collector phase -2 (`25-job-collect-inputs.yaml`).
 
 ## Configuration & secrets
 

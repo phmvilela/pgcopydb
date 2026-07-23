@@ -10,11 +10,42 @@ name: "Image: build, verify, publish"
 #   publish      : pushes the verified image to the ACR that terraform/aks
 #                  provisions, via passwordless OIDC. Runs on `v*` tags or manual
 #                  dispatch, and only if the Azure secrets are configured.
+#   deploy       : (issue #40 follow-up) manual-only -- `workflow_dispatch` with
+#                  `deploy_to_cluster: true`. Pins the digest `publish` just
+#                  pushed into deploy/k8s/kustomization.yaml and `kubectl
+#                  apply`s ONLY the cluster prerequisites (00-namespace,
+#                  01-rbac, 20-pvc-workdir) to the AKS cluster. Deliberately
+#                  does NOT apply the phase -2/-1/0/1/3b/4 manifests or start
+#                  the orchestrator -- those kick off real work (a live
+#                  migration run against real databases), which stays a
+#                  separate, deliberate human action. The full digest-pinned
+#                  bundle (kubectl kustomize deploy/k8s) is uploaded as a build
+#                  artifact for that human to apply from when ready.
 #
-# For `publish`, configure a federated credential on an Entra app/UAMI with
-# AcrPush on the registry and set repo secrets AZURE_CLIENT_ID / AZURE_TENANT_ID
-# / AZURE_SUBSCRIPTION_ID (and optionally the repo variable ACR_NAME, default
-# pgcyanacr).
+# The Azure identity both `publish` and `deploy` log in as is provisioned by
+# terraform/aks (a UAMI + federated credential, same shape as the in-cluster
+# workload identities -- see main.tf's "GitHub Actions OIDC identity"
+# section), not created ad hoc: `terraform apply` in terraform/aks grants it
+# Contributor scoped to the ACR (`publish`'s `az acr build` schedules a
+# server-side ACR Tasks run, which needs
+# Microsoft.ContainerRegistry/registries/scheduleRun/action -- the built-in
+# AcrPush role does NOT include this, it only covers `docker push`) and the
+# "Azure Kubernetes Service Cluster User Role" on the AKS cluster (`deploy`'s
+# `az aks get-credentials`). Its federated credential subject is the fixed
+# `repo:<org>/<repo>:environment:azure` (both jobs below declare
+# `environment: azure`, matching `var.github_repo` in terraform/aks) rather
+# than a `ref:refs/tags/<tag>` subject -- Azure federated credentials require
+# an exact subject match, so a tag-ref subject would need re-creating for
+# every new `v*` tag; the fixed `environment:azure` subject works for every
+# trigger (manual dispatch or any tag push) without ever touching Azure
+# again.
+#
+# After `terraform apply` in terraform/aks, set GitHub repo secrets
+# AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID from
+# `terraform output github_actions_client_id` / `_tenant_id` / `_subscription_id`,
+# and repo variables AKS_RESOURCE_GROUP / AKS_CLUSTER_NAME (+ ACR_NAME if it
+# differs from the default `pgcyanacr`) from the matching terraform outputs --
+# see terraform/aks/README.md step 6.
 
 on:
   workflow_dispatch:
@@ -23,6 +54,11 @@ on:
         description: "Image tag to publish (defaults to pg_cyan.__version__)"
         required: false
         type: string
+      deploy_to_cluster:
+        description: "Also sync namespace/RBAC/PVC prerequisites to the AKS cluster after publishing"
+        required: false
+        type: boolean
+        default: false
   pull_request:
     branches: [main]
     paths:
@@ -77,9 +113,19 @@ jobs:
     # Only when we actually intend to publish and the Azure identity is wired up.
     if: >-
       (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
+    # `environment:` (not branch/tag protection here -- just an OIDC subject) so
+    # the federated credential's subject is the fixed `environment:azure`
+    # rather than `ref:refs/tags/<tag>` -- Azure federated credentials require
+    # an EXACT subject match, so a tag-ref subject would need re-creating for
+    # every new `v*` tag. See the header comment for the `az ad app
+    # federated-credential create` command.
+    environment: azure
     env:
       ACR_NAME: ${{ vars.ACR_NAME || 'pgcyanacr' }}
       IMAGE_REPO: pgcyan
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      login_server: ${{ steps.digest.outputs.login_server }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -122,6 +168,7 @@ jobs:
             .
 
       - name: Report pushed digest
+        id: digest
         run: |
           login_server="$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)"
           digest="$(az acr repository show --name "${ACR_NAME}" \
@@ -130,3 +177,91 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- tag-pinned: \`${login_server}/${IMAGE_REPO}:${{ steps.tag.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest-pinned: \`${login_server}/${IMAGE_REPO}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "login_server=${login_server}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Sync cluster prerequisites (manual)
+    runs-on: ubuntu-latest
+    needs: publish
+    # Manual-only, and only when the operator explicitly opted in -- see the
+    # workflow header for why this never runs on a tag push.
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.deploy_to_cluster
+    # Same fixed OIDC subject as `publish` -- see the comment there.
+    environment: azure
+    env:
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Guard -- require AKS configuration
+        run: |
+          missing=()
+          [ -z "${AKS_RESOURCE_GROUP}" ] && missing+=("AKS_RESOURCE_GROUP repo variable")
+          [ -z "${AKS_CLUSTER_NAME}" ] && missing+=("AKS_CLUSTER_NAME repo variable")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::%s not set -- configure it before deploying (see workflow header).\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Azure login (OIDC, passwordless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Pin the published digest into the manifest bundle
+        working-directory: deploy/k8s
+        run: |
+          digest="${{ needs.publish.outputs.digest }}"
+          sed -i "s|digest: sha256:.*|digest: ${digest}|" kustomization.yaml
+          grep "digest:" kustomization.yaml
+
+      - name: Render full manifest bundle (reference only -- not all of it is applied below)
+        run: kubectl kustomize deploy/k8s > rendered-manifests.yaml
+
+      - name: Apply cluster prerequisites (namespace, RBAC, PVC)
+        run: |
+          kubectl apply -f deploy/k8s/00-namespace.yaml
+          kubectl apply -f deploy/k8s/01-rbac.yaml
+          kubectl apply -f deploy/k8s/20-pvc-workdir.yaml
+
+      - name: Upload rendered, digest-pinned manifest bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgcyan-manifests-rendered-${{ github.run_id }}
+          path: rendered-manifests.yaml
+
+      - name: Summary
+        run: |
+          {
+            echo "### pgcyan cluster sync"
+            echo
+            echo "Applied to \`${AKS_RESOURCE_GROUP}/${AKS_CLUSTER_NAME}\`: namespace, RBAC, PVC (00/01/20)"
+            echo "-- none of these three reference the pgcyan image. Published image, baked"
+            echo "into the rendered bundle below for the phase manifests that DO:"
+            echo "\`${{ needs.publish.outputs.login_server }}/pgcyan@${{ needs.publish.outputs.digest }}\`"
+            echo
+            echo "**Not applied** (by design -- these start real work against real databases):"
+            echo "the phase -2 input collector, planner, pre-data, snapshot-holder, FK, and"
+            echo "follow-CDC manifests, and the data-shard/index templates. The full bundle,"
+            echo "pinned to this run's digest, is attached as the \`pgcyan-manifests-rendered-${{ github.run_id }}\`"
+            echo "build artifact -- apply what you need by hand, or run the orchestrator when"
+            echo "you are ready to start a migration:"
+            echo '```'
+            echo "kubectl run pgcyan-orchestrator --rm -it --restart=Never \\"
+            echo "  --image=${{ needs.publish.outputs.login_server }}/pgcyan@${{ needs.publish.outputs.digest }} \\"
+            echo "  --serviceaccount=pgcyan-orchestrator -n pgcyan-migration \\"
+            echo "  -- python -m pg_cyan.cli orchestrate"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

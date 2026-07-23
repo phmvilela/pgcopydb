@@ -88,10 +88,17 @@ so a killed pod resumes per-table instead of from zero).
 ## Barriers are the orchestrator's job, not YAML's
 
 Plain manifests can't express "wait until every shard succeeded." The
-**orchestrator** (RBAC in `01`) applies a phase, watches Job completion, and only
-then applies the next. The manifests are the *nodes*; the orchestrator is the
-*edges*. If you'd rather make the DAG declarative, Argo Workflows / Jobs `dependsOn`
-is a drop-in — the node objects don't change.
+**orchestrator** (`pg_cyan.cli orchestrate`, `pg_cyan/orchestrator.py`, issue
+#40, RBAC in `01`) applies a phase, watches Job completion (or Deployment
+readiness for the two long-lived phases), and only then applies the next,
+failing fast — stopping the walk — the moment a phase's barrier does not
+resolve to success. The manifests are the *nodes*; the orchestrator is the
+*edges*. Implemented as custom Python against the Kubernetes client rather
+than Argo Workflows (see the module docstring for the rationale — mainly:
+`01-rbac.yaml`'s plain ServiceAccount is already exactly what it needs, no new
+CRDs/controller). If you'd rather make the DAG declarative later, Argo
+Workflows / Jobs `dependsOn` is still a drop-in — the node objects don't
+change.
 
 ## Biggest open TODOs (tracked inline in the YAML)
 
@@ -104,6 +111,13 @@ is a drop-in — the node objects don't change.
   `source-pg-metrics.json` now reports `heap_bytes`/`index_bytes` per table and
   in `table_totals`, so phase 2 (COPY, heap) and phase 3 (index build) can be
   sized independently.
+- ~~**Orchestrator app doesn't exist**~~ — done (issue #40): `pg_cyan.cli
+  orchestrate` (`pg_cyan/orchestrator.py`) walks planner(-1) → pre-data(0) →
+  snapshot-holder(1) → data shards(2) → index(3a) → FK(3b) → follow-CDC(4),
+  substituting the `${...}` template placeholders from `plan.json` and
+  blocking on each phase's barrier (Job completion, or Deployment readiness
+  for the two long-lived phases) before applying the next; fails fast on the
+  first phase that doesn't succeed.
 - **Range-split of a single table across shards** — pgcopydb splits *within* a job
   (`--split-tables-larger-than`); splitting one giant table *across* shards is a
   planner responsibility not yet designed. The `plan` command (issue #38) keeps
@@ -113,8 +127,25 @@ is a drop-in — the node objects don't change.
   `fk_graph.status: "deferred"` (empty edges); no artifact collects FK edges yet.
   Phase-3b applies all constraints in one non-sharded pass regardless, so this is
   informational once implemented.
-- **Image + secrets** — `REPLACE_ME/pgcyan:latest` must be built (pgcopydb + planner
-  CLI); prefer Azure Workload Identity over the example Secret (`10`).
+- ~~**Image + secrets**~~ — image built (issue #39, `.github/workflows/publish-image.yml`);
+  every manifest is digest-pinned. Prefer Azure Workload Identity over the
+  example Secret (`10`) still.
+- ~~**No way to sync a fresh digest across every manifest**~~ — done (issue #40
+  follow-up): `deploy/k8s/kustomization.yaml` bundles the directly-appliable
+  manifests with an `images:` override; `publish-image.yml`'s manual-only
+  `deploy` job rewrites the digest there after each publish and applies the
+  00/01/20 cluster prerequisites (never the phase manifests — starting those
+  is a deliberate separate human action).
+- **Self-referential image digest** — the phase manifests (25/30/40/50/60/70/71/80)
+  reference the SAME image whose build bundles them (`Dockerfile` `COPY
+  deploy/k8s/`), so a manifest cannot know its own build's digest at the
+  moment it's baked in — the digest committed/rendered into a manifest is
+  always from a *previous* build. Fine for now (the orchestrator's own default
+  `--manifests-dir` is only a convenience fallback; `kustomization.yaml`'s
+  `images:` override is the actual source of truth for a given deploy), but a
+  cleaner fix would have the orchestrator read manifests from a freshly
+  rendered ConfigMap/volume supplied at run time instead of its own image's
+  bundled copy. Not yet designed.
 
 **Related:** [pgcopydb-and-pgdump-tooling-assessment.md](pgcopydb-and-pgdump-tooling-assessment.md)
 (where custom code earns its keep), [issue-22-migration-stage-assessment.md](issue-22-migration-stage-assessment.md)

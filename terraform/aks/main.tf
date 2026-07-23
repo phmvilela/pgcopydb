@@ -25,6 +25,8 @@ provider "azurerm" {
   features {}
 }
 
+data "azurerm_client_config" "current" {}
+
 locals {
   # Common tags applied to every resource. Mirrors the tagging shape used by the
   # worker-VM module (../main.tf) so both modules read consistently.
@@ -218,6 +220,59 @@ resource "azurerm_federated_identity_credential" "worker" {
   audience            = [local.federated_audience]
   issuer              = azurerm_kubernetes_cluster.aks.oidc_issuer_url
   subject             = "system:serviceaccount:${local.k8s_namespace}:${local.worker_sa_name}"
+}
+
+# ---------------------------------------------------------------------------
+# GitHub Actions OIDC identity (CI/CD — publish-image.yml's `publish`/`deploy`)
+# ---------------------------------------------------------------------------
+# Same shape as the orchestrator/worker identities above — a UAMI + a
+# federated credential — rather than an Entra App Registration (what
+# `az ad app create` makes, the previous approach in
+# scripts/setup-github-oidc.sh, now removed). A UAMI needs no Microsoft Graph
+# Application.ReadWrite.All permission to manage, and being Terraform state
+# instead of "look up by display name and reuse", it can't end up silently
+# duplicated the way the old imperative script's idempotency check could.
+# `azure/login@v2` accepts a UAMI's client-id exactly like an App
+# Registration's.
+#
+# Azure federated credentials require an EXACT subject match (no wildcards),
+# so this pins to the fixed `environment: azure` subject both the `publish`
+# and `deploy` jobs declare, rather than a `ref:refs/tags/<tag>` subject that
+# would need a new federated credential for every `v*` tag.
+resource "azurerm_user_assigned_identity" "github_actions" {
+  name                = "${var.cluster_name}-github-actions"
+  resource_group_name = azurerm_resource_group.aks.name
+  location            = azurerm_resource_group.aks.location
+  tags                = local.tags
+}
+
+resource "azurerm_federated_identity_credential" "github_actions" {
+  name                = "${var.cluster_name}-github-actions-fedcred"
+  resource_group_name = azurerm_resource_group.aks.name
+  parent_id           = azurerm_user_assigned_identity.github_actions.id
+  audience            = [local.federated_audience]
+  issuer              = "https://token.actions.githubusercontent.com"
+  subject             = "repo:${var.github_repo}:environment:azure"
+}
+
+# `publish` runs `az acr build` — a server-side ACR Tasks run, which needs
+# Microsoft.ContainerRegistry/registries/scheduleRun/action. The built-in
+# AcrPush role does NOT include this (it only covers `docker push`), so this
+# grants Contributor scoped to just the ACR resource instead.
+resource "azurerm_role_assignment" "github_actions_acr_contributor" {
+  scope                            = azurerm_container_registry.aks.id
+  role_definition_name             = "Contributor"
+  principal_id                     = azurerm_user_assigned_identity.github_actions.principal_id
+  skip_service_principal_aad_check = true
+}
+
+# `deploy` runs `az aks get-credentials` / `azure/aks-set-context@v4` to fetch
+# a kubeconfig, then `kubectl apply`s the cluster prerequisites.
+resource "azurerm_role_assignment" "github_actions_aks_user" {
+  scope                            = azurerm_kubernetes_cluster.aks.id
+  role_definition_name             = "Azure Kubernetes Service Cluster User Role"
+  principal_id                     = azurerm_user_assigned_identity.github_actions.principal_id
+  skip_service_principal_aad_check = true
 }
 
 # ---------------------------------------------------------------------------

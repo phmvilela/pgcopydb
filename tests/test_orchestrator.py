@@ -1,0 +1,387 @@
+"""
+Unit tests for the migration DAG orchestrator (`pg_cyan.cli orchestrate`, issue #40).
+
+Cluster-free by nature: every Kubernetes API client (batch/apps/policy/core) is
+injected as a fake, so nothing here needs a real cluster. Tests exercise
+``${...}`` template substitution, manifest loading against the REAL
+``deploy/k8s`` files (so a drift between the templates and the substitution
+keys is caught), apply idempotency, Job/Deployment barrier outcomes, and the
+end-to-end phase walk (fail-fast + successful run).
+"""
+import json
+
+import pytest
+import yaml
+from kubernetes.client.rest import ApiException
+
+from pg_cyan.orchestrator import OrchestratorError, PgCyanOrchestrator
+
+
+# --------------------------------------------------------------------- fakes
+
+class _Obj:
+    """Minimal attribute bag standing in for a Kubernetes API model.
+
+    The real ``kubernetes.client`` model classes (``V1Job``, ``V1Deployment``,
+    ...) enforce required-field validation unrelated to what the orchestrator
+    reads (e.g. ``V1JobSpec`` demands a ``template``) -- these fakes carry only
+    the attributes ``pg_cyan.orchestrator`` actually looks at.
+    """
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class FakeBatchApi:
+    def __init__(self, job_outcomes=None, create_conflicts=None):
+        self.created = []
+        self.status_calls = {}
+        self._job_outcomes = job_outcomes or {}
+        self._create_conflicts = create_conflicts or set()
+
+    def create_namespaced_job(self, namespace, body):
+        name = body["metadata"]["name"]
+        if name in self._create_conflicts:
+            raise ApiException(status=409, reason="AlreadyExists")
+        self.created.append((namespace, name, body))
+
+    def read_namespaced_job_status(self, name, namespace):
+        self.status_calls[name] = self.status_calls.get(name, 0) + 1
+        sequence = self._job_outcomes.get(name, ["complete"])
+        idx = min(self.status_calls[name] - 1, len(sequence) - 1)
+        state = sequence[idx]
+        if state == "running":
+            status = _Obj(succeeded=None, failed=None, conditions=None)
+        elif state == "complete":
+            status = _Obj(succeeded=1, failed=None, conditions=[_Obj(type="Complete", status="True", message=None)])
+        elif state == "failed":
+            status = _Obj(
+                succeeded=None, failed=1,
+                conditions=[_Obj(type="Failed", status="True", message="boom")],
+            )
+        else:
+            raise AssertionError(f"unknown state {state}")
+        return _Obj(spec=_Obj(backoff_limit=3), status=status)
+
+
+class FakeAppsApi:
+    def __init__(self, deployment_outcomes=None, create_conflicts=None):
+        self.created = []
+        self._outcomes = deployment_outcomes or {}
+        self._create_conflicts = create_conflicts or set()
+
+    def create_namespaced_deployment(self, namespace, body):
+        name = body["metadata"]["name"]
+        if name in self._create_conflicts:
+            raise ApiException(status=409, reason="AlreadyExists")
+        self.created.append((namespace, name, body))
+
+    def read_namespaced_deployment_status(self, name, namespace):
+        ready = self._outcomes.get(name, 1)
+        return _Obj(
+            spec=_Obj(replicas=1),
+            status=_Obj(ready_replicas=ready, conditions=[]),
+        )
+
+
+class FakePolicyApi:
+    def __init__(self):
+        self.created = []
+
+    def create_namespaced_pod_disruption_budget(self, namespace, body):
+        self.created.append((namespace, body["metadata"]["name"], body))
+
+
+class FakeCoreApi:
+    def __init__(self, plan=None, missing=False):
+        self._plan = plan
+        self._missing = missing
+
+    def read_namespaced_config_map(self, name, namespace):
+        if self._missing:
+            raise ApiException(status=404, reason="NotFound")
+        return _Obj(data={"plan.json": json.dumps(self._plan)})
+
+
+SAMPLE_PLAN = {
+    "run_id": "pgcyan-test-run",
+    "data_shards": [
+        {
+            "name": "shard-0", "filter_file": "shard-0.filters", "table_jobs": 4,
+            "split_tables_larger_than": "50GB", "resources": {"cpu": "2", "memory": "4Gi"},
+        },
+        {
+            "name": "shard-1", "filter_file": "shard-1.filters", "table_jobs": 8,
+            "split_tables_larger_than": "50GB", "resources": {"cpu": "4", "memory": "8Gi"},
+        },
+    ],
+    "index_shards": [
+        {"name": "idx-0", "filter_file": "shard-0.filters", "index_jobs": 4},
+        {"name": "idx-1", "filter_file": "shard-1.filters", "index_jobs": 4},
+    ],
+}
+
+
+def make_orchestrator(**kwargs):
+    defaults = dict(
+        batch_api=FakeBatchApi(),
+        apps_api=FakeAppsApi(),
+        policy_api=FakePolicyApi(),
+        core_api=FakeCoreApi(plan=SAMPLE_PLAN),
+        poll_interval=0,
+    )
+    defaults.update(kwargs)
+    return PgCyanOrchestrator(**defaults)
+
+
+# ------------------------------------------------------------- ${...} render
+
+def test_render_yaml_substitutes_every_placeholder():
+    orch = make_orchestrator()
+    template = "name: pgcyan-${THING}-x\nvalue: \"${THING}\"\n"
+    doc = orch._render_yaml(template, {"THING": "widget"})
+    assert doc == {"name": "pgcyan-widget-x", "value": "widget"}
+
+
+def test_render_yaml_raises_on_unknown_placeholder():
+    orch = make_orchestrator()
+    with pytest.raises(OrchestratorError, match="UNKNOWN"):
+        orch._render_yaml("value: ${UNKNOWN}\n", {})
+
+
+# --------------------------------------------------------- manifest loading
+
+def test_load_phase_manifests_static_phase_reads_real_files():
+    orch = make_orchestrator()
+    phase = {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"}
+    docs = orch._load_phase_manifests(phase, plan=None)
+    assert len(docs) == 1
+    assert docs[0]["kind"] == "Job"
+    assert docs[0]["metadata"]["name"] == "pgcyan-phase0-predata"
+
+
+def test_load_phase_manifests_static_phase_multi_doc():
+    orch = make_orchestrator()
+    phase = {"id": "1", "name": "snapshot-holder", "manifest": "50-deployment-snapshot-holder.yaml"}
+    docs = orch._load_phase_manifests(phase, plan=None)
+    kinds = {d["kind"] for d in docs}
+    assert kinds == {"Deployment", "PodDisruptionBudget"}
+
+
+def test_load_phase_manifests_templated_phase_renders_one_job_per_shard():
+    orch = make_orchestrator()
+    phase = dict(PgCyanOrchestrator.PHASES[3])  # data-shards
+    assert phase["id"] == "2"
+    docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
+    assert [d["metadata"]["name"] for d in docs] == [
+        "pgcyan-datashard-shard-0", "pgcyan-datashard-shard-1",
+    ]
+    # no leftover placeholders anywhere in the rendered doc
+    assert "${" not in yaml.safe_dump(docs[0])
+
+
+def test_load_phase_manifests_index_template_renders_one_job_per_index_shard():
+    orch = make_orchestrator()
+    phase = dict(PgCyanOrchestrator.PHASES[4])  # index
+    assert phase["id"] == "3a"
+    docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
+    assert [d["metadata"]["name"] for d in docs] == ["pgcyan-index-idx-0", "pgcyan-index-idx-1"]
+
+
+def test_load_phase_manifests_templated_phase_requires_plan_entries():
+    orch = make_orchestrator()
+    phase = dict(PgCyanOrchestrator.PHASES[3])
+    with pytest.raises(OrchestratorError, match="data_shards"):
+        orch._load_phase_manifests(phase, plan={"data_shards": []})
+
+
+# ------------------------------------------------------------------- apply
+
+def test_apply_creates_job():
+    batch_api = FakeBatchApi()
+    orch = make_orchestrator(batch_api=batch_api)
+    orch._apply({"kind": "Job", "metadata": {"name": "pgcyan-phase0-predata"}})
+    assert batch_api.created == [("pgcyan-migration", "pgcyan-phase0-predata",
+                                   {"kind": "Job", "metadata": {"name": "pgcyan-phase0-predata",
+                                                                 "namespace": "pgcyan-migration"}})]
+
+
+def test_apply_treats_conflict_as_idempotent_noop():
+    batch_api = FakeBatchApi(create_conflicts={"pgcyan-phase0-predata"})
+    orch = make_orchestrator(batch_api=batch_api)
+    orch._apply({"kind": "Job", "metadata": {"name": "pgcyan-phase0-predata"}})  # must not raise
+    assert batch_api.created == []
+
+
+def test_apply_unsupported_kind_raises():
+    orch = make_orchestrator()
+    with pytest.raises(OrchestratorError, match="ConfigMap"):
+        orch._apply({"kind": "ConfigMap", "metadata": {"name": "x"}})
+
+
+# -------------------------------------------------------------------- wait
+
+def test_wait_for_job_success_first_poll():
+    orch = make_orchestrator(batch_api=FakeBatchApi(job_outcomes={"j1": ["complete"]}))
+    success, message = orch._wait_for("Job", "j1", timeout=10)
+    assert success is True
+    assert message is None
+
+
+def test_wait_for_job_polls_until_complete():
+    orch = make_orchestrator(batch_api=FakeBatchApi(job_outcomes={"j1": ["running", "running", "complete"]}))
+    success, message = orch._wait_for("Job", "j1", timeout=10)
+    assert success is True
+
+
+def test_wait_for_job_failure():
+    orch = make_orchestrator(batch_api=FakeBatchApi(job_outcomes={"j1": ["failed"]}))
+    success, message = orch._wait_for("Job", "j1", timeout=10)
+    assert success is False
+    assert "boom" in message
+
+
+def test_wait_for_job_times_out(monkeypatch):
+    from pg_cyan import orchestrator as orchestrator_module
+
+    clock = iter([0, 0, 100, 100])  # jumps well past a timeout=10 on the 2nd check
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", lambda: next(clock))
+    orch = make_orchestrator(batch_api=FakeBatchApi(job_outcomes={"j1": ["running"]}))
+    success, message = orch._wait_for("Job", "j1", timeout=10)
+    assert success is False
+    assert "Timed out" in message
+
+
+def test_wait_for_deployment_ready():
+    orch = make_orchestrator(apps_api=FakeAppsApi(deployment_outcomes={"d1": 1}))
+    success, message = orch._wait_for("Deployment", "d1", timeout=10)
+    assert success is True
+    assert message is None
+
+
+def test_wait_for_deployment_not_ready_times_out(monkeypatch):
+    from pg_cyan import orchestrator as orchestrator_module
+
+    clock = iter([0, 0, 100, 100])
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", lambda: next(clock))
+    orch = make_orchestrator(apps_api=FakeAppsApi(deployment_outcomes={"d1": 0}))
+    success, message = orch._wait_for("Deployment", "d1", timeout=10)
+    assert success is False
+    assert "Timed out" in message
+
+
+# -------------------------------------------------------------- plan i/o
+
+def test_read_plan_configmap_parses_json():
+    orch = make_orchestrator(core_api=FakeCoreApi(plan=SAMPLE_PLAN))
+    plan = orch._read_plan_configmap()
+    assert plan == SAMPLE_PLAN
+
+
+def test_read_plan_configmap_missing_raises():
+    orch = make_orchestrator(core_api=FakeCoreApi(missing=True))
+    with pytest.raises(OrchestratorError):
+        orch._read_plan_configmap()
+
+
+def test_read_plan_configmap_bad_json_raises():
+    class BadCoreApi:
+        def read_namespaced_config_map(self, name, namespace):
+            return _Obj(data={"plan.json": "{not json"})
+
+    orch = make_orchestrator(core_api=BadCoreApi())
+    with pytest.raises(OrchestratorError, match="not valid JSON"):
+        orch._read_plan_configmap()
+
+
+# --------------------------------------------------------------------- run
+
+def _all_jobs_complete_batch_api():
+    return FakeBatchApi(job_outcomes={
+        "pgcyan-planner": ["complete"],
+        "pgcyan-phase0-predata": ["complete"],
+        "pgcyan-datashard-shard-0": ["complete"],
+        "pgcyan-datashard-shard-1": ["complete"],
+        "pgcyan-index-idx-0": ["complete"],
+        "pgcyan-index-idx-1": ["complete"],
+        "pgcyan-phase3-fk": ["complete"],
+    })
+
+
+def _all_deployments_ready_apps_api():
+    return FakeAppsApi(deployment_outcomes={"pgcyan-snapshot-holder": 1, "pgcyan-follow-cdc": 1})
+
+
+def test_run_happy_path_applies_all_seven_phases_in_order():
+    batch_api = _all_jobs_complete_batch_api()
+    apps_api = _all_deployments_ready_apps_api()
+    orch = make_orchestrator(batch_api=batch_api, apps_api=apps_api,
+                              core_api=FakeCoreApi(plan=SAMPLE_PLAN))
+    summary = orch.run()
+
+    assert summary["status"] == "success"
+    assert summary["run_id"] == "pgcyan-test-run"
+    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "1", "2", "3a", "3b", "4"]
+    assert all(p["success"] for p in summary["phases"])
+    # data + index shards + fk + pre-data + planner Jobs were all created
+    created_job_names = {name for _, name, _ in batch_api.created}
+    assert created_job_names == {
+        "pgcyan-planner", "pgcyan-phase0-predata", "pgcyan-datashard-shard-0",
+        "pgcyan-datashard-shard-1", "pgcyan-index-idx-0", "pgcyan-index-idx-1",
+        "pgcyan-phase3-fk",
+    }
+    created_deployment_names = {name for _, name, _ in apps_api.created}
+    assert created_deployment_names == {"pgcyan-snapshot-holder", "pgcyan-follow-cdc"}
+
+
+def test_run_fails_fast_and_stops_the_dag():
+    batch_api = FakeBatchApi(job_outcomes={
+        "pgcyan-planner": ["complete"],
+        "pgcyan-phase0-predata": ["failed"],
+    })
+    apps_api = _all_deployments_ready_apps_api()
+    orch = make_orchestrator(batch_api=batch_api, apps_api=apps_api,
+                              core_api=FakeCoreApi(plan=SAMPLE_PLAN))
+    summary = orch.run()
+
+    assert summary["status"] == "failure"
+    # planner (-1) ran, pre-data (0) failed, nothing after it was even attempted
+    assert [p["phase"] for p in summary["phases"]] == ["-1", "0"]
+    assert summary["phases"][0]["success"] is True
+    assert summary["phases"][1]["success"] is False
+    assert "snapshot-holder" not in {n for _, n, _ in apps_api.created}
+
+
+def test_run_stops_before_reading_plan_if_earlier_phase_fails():
+    """The plan ConfigMap must not even be read if phase -1/0/1 already failed."""
+    batch_api = FakeBatchApi(job_outcomes={"pgcyan-planner": ["failed"]})
+
+    class ExplodingCoreApi:
+        def read_namespaced_config_map(self, name, namespace):
+            raise AssertionError("plan should not be read before phase 2")
+
+    orch = make_orchestrator(batch_api=batch_api, core_api=ExplodingCoreApi())
+    summary = orch.run()
+    assert summary["status"] == "failure"
+    assert [p["phase"] for p in summary["phases"]] == ["-1"]
+
+
+def test_run_fails_fast_when_one_of_two_data_shards_fails():
+    batch_api = FakeBatchApi(job_outcomes={
+        "pgcyan-planner": ["complete"],
+        "pgcyan-phase0-predata": ["complete"],
+        "pgcyan-datashard-shard-0": ["complete"],
+        "pgcyan-datashard-shard-1": ["failed"],
+    })
+    apps_api = _all_deployments_ready_apps_api()
+    orch = make_orchestrator(batch_api=batch_api, apps_api=apps_api,
+                              core_api=FakeCoreApi(plan=SAMPLE_PLAN))
+    summary = orch.run()
+
+    assert summary["status"] == "failure"
+    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "1", "2"]
+    data_phase = summary["phases"][-1]
+    assert data_phase["success"] is False
+    targets_by_name = {t["name"]: t for t in data_phase["targets"]}
+    assert targets_by_name["pgcyan-datashard-shard-0"]["success"] is True
+    assert targets_by_name["pgcyan-datashard-shard-1"]["success"] is False
