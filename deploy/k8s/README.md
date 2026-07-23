@@ -87,6 +87,8 @@ any data — use the manual `.github/workflows/run-planner.yml` workflow (issue
 `pgcyan-source-pg` Secret from GitHub secrets, applies jobs `25` then `30` with
 a completion barrier between them, and uploads `plan.json` + both Jobs' logs as
 a build artifact. A source with any large object correctly fails the planner
-(LOB abort gate) with no plan written. The cluster itself is provisioned by the
-companion `.github/workflows/terraform-aks.yml` (`terraform/aks`). See each
-workflow's header for the required repo secrets/variables.
+(LOB abort gate) with no plan written. The cluster itself is provisioned from
+`terraform/aks` by a human running `terraform apply` (Azure Cloud Shell or
+local — it needs Owner-level rights, so it is not a CI action; the companion
+`.github/workflows/terraform-aks.yml` only `fmt`/`validate`s the module). See
+each workflow's header for the required repo secrets/variables.

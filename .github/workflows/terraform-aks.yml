@@ -1,43 +1,35 @@
-name: "Terraform: AKS cluster"
+name: "Terraform: AKS cluster (validate)"
 
-# Provision / update the AKS cluster (terraform/aks) that runs the deploy/k8s
+# Lint/validate the AKS cluster module (terraform/aks) that runs the deploy/k8s
 # sharded pgcopydb migration -- issue #50.
 #
-#   validate : fmt -check + init -backend=false + validate. Runs on every PR that
-#              touches terraform/aks/** -- no Azure needed, so it works on forks
-#              and before any credentials exist.
-#   plan/apply : manual-only (`workflow_dispatch` with `action: plan|apply`).
-#              Logs in to Azure passwordless (OIDC), regenerates the gitignored
-#              backend.hcl with bootstrap-backend.sh (idempotent; storage account
-#              name is derived from the subscription id, so it is stable), then
-#              `terraform init`/`plan`/`apply`.
+#   validate : fmt -check + init -backend=false + validate. Runs on PRs that
+#              touch terraform/aks/**, and on manual dispatch. No Azure needed,
+#              so it works on forks and before any credentials exist.
 #
-# All variables in terraform/aks/variables.tf have defaults, so no *.tfvars is
-# needed -- override a default by editing the file or wiring a tfvars in later.
-#
+# WHY NO plan/apply JOB
 # ---------------------------------------------------------------------------
-# BOOTSTRAP CHICKEN-AND-EGG (read before the first apply):
-# The Azure identity this workflow logs in as (the `github_actions` UAMI + its
-# federated credential) is CREATED BY terraform/aks itself. So the FIRST apply
-# cannot run here -- a human must run it locally once:
-#     az login
-#     cd terraform && ./bootstrap-backend.sh
+# `terraform apply` of this module provisions an entire cluster AND the IAM role
+# assignments around it, so the executing identity needs broad rights --
+# Contributor to CRUD every resource PLUS User Access Administrator to create the
+# role assignments (Microsoft.Authorization/roleAssignments/write), i.e.
+# effectively Owner at subscription scope. The federated CI identity is
+# deliberately narrow (ACR Contributor + AKS Cluster User, for publish-image.yml)
+# and must stay that way, so provisioning is NOT run from CI.
+#
+# Instead, apply is a deliberate human action from Azure Cloud Shell (or local),
+# run as a user who already holds Owner:
+#
+#     git clone https://github.com/berenguel/pgcyan.git && cd pgcyan/terraform
+#     ./bootstrap-backend.sh                                   # one-time: state storage
 #     cd aks && terraform init -backend-config=backend.hcl && terraform apply
-# then set the GitHub repo secrets/vars from its outputs (see
-# terraform/aks/README.md step 6 and publish-image.yml's header). ONLY AFTER
-# that do the AZURE_* secrets exist and this workflow's plan/apply can run.
-# It is safe to re-run thereafter -- terraform/aks is idempotent.
-# ---------------------------------------------------------------------------
+#
+# then set the GitHub repo secrets/vars from its outputs (terraform/aks/README.md
+# step 6 + publish-image.yml's header) so the image publish/deploy workflows and
+# run-planner.yml can run. See terraform/aks/README.md for the full runbook.
 
 on:
   workflow_dispatch:
-    inputs:
-      action:
-        description: "Terraform action to run"
-        required: true
-        type: choice
-        default: plan
-        options: [plan, apply]
   pull_request:
     branches: [main]
     paths:
@@ -45,7 +37,6 @@ on:
       - ".github/workflows/terraform-aks.yml"
 
 permissions:
-  id-token: write   # OIDC token for azure/login (plan/apply)
   contents: read
 
 jobs:
@@ -72,76 +63,3 @@ jobs:
 
       - name: terraform validate
         run: terraform validate
-
-  plan-apply:
-    name: ${{ inputs.action }} (Azure OIDC)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    # Same fixed OIDC subject (`repo:<org>/<repo>:environment:azure`) the
-    # federated credential in terraform/aks trusts -- see publish-image.yml.
-    environment: azure
-    defaults:
-      run:
-        working-directory: terraform/aks
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Guard -- require Azure identity secrets
-        env:
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-        run: |
-          if [ -z "${AZURE_CLIENT_ID}" ]; then
-            echo "::error::AZURE_CLIENT_ID not set. Run the first terraform/aks apply"
-            echo "::error::locally (see this workflow's header), then set the AZURE_* secrets."
-            exit 1
-          fi
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Azure login (OIDC, passwordless)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      # Regenerate the gitignored backend.hcl (idempotent -- creates the state
-      # storage if missing, derives its name from the subscription id). Runs from
-      # terraform/ where the script lives; it writes backend.hcl into both modules.
-      - name: Bootstrap remote-state backend
-        working-directory: terraform
-        run: ./bootstrap-backend.sh
-
-      - name: terraform init
-        run: terraform init -backend-config=backend.hcl
-
-      - name: terraform plan
-        run: terraform plan -input=false -out=tfplan
-
-      - name: terraform apply
-        if: inputs.action == 'apply'
-        run: terraform apply -input=false tfplan
-
-      - name: Outputs to set as GitHub secrets/variables
-        if: inputs.action == 'apply'
-        run: |
-          {
-            echo "### terraform/aks applied"
-            echo
-            echo "Set these repo **secrets** from the outputs below:"
-            echo '- `AZURE_CLIENT_ID` = `github_actions_client_id`'
-            echo '- `AZURE_TENANT_ID` = `github_actions_tenant_id`'
-            echo '- `AZURE_SUBSCRIPTION_ID` = `github_actions_subscription_id`'
-            echo
-            echo "Set these repo **variables**:"
-            echo '- `AKS_RESOURCE_GROUP` = `resource_group_name`'
-            echo '- `AKS_CLUSTER_NAME` = `cluster_name`'
-            echo '- `ACR_NAME` (if not the default `pgcyanacr`)'
-            echo
-            echo "And fill the two \`azure.workload.identity/client-id\` annotations"
-            echo "in \`deploy/k8s/01-rbac.yaml\` from \`orchestrator_identity_client_id\`"
-            echo "/ \`worker_identity_client_id\`."
-          } >> "$GITHUB_STEP_SUMMARY"
-          terraform output
