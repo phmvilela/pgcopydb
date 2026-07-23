@@ -1,4 +1,4 @@
-# H1 Use cases #
+# Use cases #
 - Enable geo-backups in Azure Database for PostgreSQL
 - Major Version Upgrades with a Read Replica or Multiple read replicas
 - Major Version Upgrades with blocked extensions (age, anon)
