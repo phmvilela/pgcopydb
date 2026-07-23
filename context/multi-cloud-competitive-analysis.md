@@ -1,59 +1,221 @@
-# Multi-Cloud competitive analysis #
+# Multi-cloud competitive analysis
+## Managed PostgreSQL reconfiguration and migration
 
-These are all outside what any 1:1 topology-clone feature can do:
+**Question:** where do the hyperscaler platform features end, and what remains
+unserved?
 
-Fleet consolidation. N under-utilised Flex servers → one. Blue/green is 1:1 by construction. This is a live cost-optimisation ask.
-Server split. One server → several, extracting a database or schema onto its own instance.
-Cross-subscription and cross-tenant, generally — not just Elastic Clusters.
-Exit migrations. Flex → on-prem, another cloud, self-managed. No vendor will ever build this, and customers ask for it.
-Flex → Elastic Clusters. A sharding topology change, not a version change.
-Collation and encoding changes. Immutable everywhere, rebuild-only.
-Rollback after cutover. Reverse replication once traffic is on the new server and blue is gone. Blue/green gives you a stale old instance, not a way back.
-Databases where apply won't converge. AWS's own blue/green docs punt to DMS for high write volume. Azure's will inherit the same single-threaded apply ceiling. Your 32TB customers are unserved by blue/green on day one.
-Fleet-scale orchestration. Blue/green is a per-server operation. Running the same change across eighty servers with sequencing, verification, and rollback is a different product.
-The reframe
+---
 
-If both ship, pgcyan's centre of gravity moves from "reconfigure a server" to three things a platform feature structurally won't do: cross boundaries a clone can't cross, handle scale one apply worker can't reach, and operate above the single-server unit.
+## 1. The primitive, and what it structurally is not
 
-That's narrower than nine use cases, and more defensible than any of them — none of it is waiting on a roadmap to close.
+AWS, Azure, and GCP are converging on the same building block for low-downtime
+change: a **staging clone of a production server**, kept in sync by replication,
+promoted in a fast switchover. AWS calls it Blue/Green Deployments. GCP has no
+equivalent yet. Azure has none today and is expected to ship one.
 
-There's also an option you shouldn't dismiss: don't compete with the primitive, wrap it. If Azure ships blue/green, pgcyan's planner, preflight refusals, convergence math, and verification are just as useful driving their blue/green as driving your own pgcopydb path. The loader was always meant to be swappable. Azure's blue/green becomes one more implementation behind the same interface, and you keep the layer that nobody else builds.
+Two properties of that primitive matter more than any individual limitation:
 
-On timing
+**It is 1:1.** One source server produces one target server. This is not a v1
+constraint that later releases relax — it is the definition of the operation.
 
-A year is enough to ship, get field adoption, and become the tool people reach for — but building the four dying use cases now is spending effort on a known-closing gap. If it were me, I'd build the happy path you've already scoped, and put the investment into the planner and the fleet layer rather than into breadth of use cases. Those are the parts that are still valuable the day blue/green ships.
+**It is a topology clone.** The staging environment inherits the source's shape:
+replicas, storage configuration, backup settings, HA posture. Only a small,
+explicitly enumerated set of properties can differ. Every generation of the
+feature widens that set; none of them changes the 1:1 shape.
 
-I still think that the postgres tetris is valuable.. but not too sure. Azure historically do not let you change many of their configurations or it is always a feature that will come in the feature. can I survive with it?
+Those two facts, rather than any current gap, determine what stays out of scope
+permanently.
 
-Weighed vendor timing advantage against durable competitive moat
-Weighed vendor timing advantage against durable competitive moat
+---
 
-Your read on Azure is empirically right, and there's a sharper version of it: v1 features are always narrow, and they stay narrow. AWS shipped blue/green in 2022 and it still can't change encryption state, still can't cross accounts, still inherits the blue storage configuration, and still tells you to go use DMS when write volume is high. Four years in. Azure's v1 will be narrower than AWS's current state, not equal to it — and the edges it leaves are exactly the ones you've been listing.
+## 2. AWS — the mature implementation
 
-So the gap doesn't close. It shrinks, unevenly, and leaves a fringe.
+### Trajectory
 
-But name the weakness in that argument: "the vendor is slow" is a timing bet, not a moat. It's a real tailwind and it buys you runway — I'd guess 18 to 36 months before the obvious cases close — but it's not something you can build a thesis on, because you don't control it.
+| Date | Release |
+|---|---|
+| Nov 2022 | Blue/Green launches for Aurora MySQL, RDS MySQL, RDS MariaDB. **No PostgreSQL.** |
+| Oct 2023 | PostgreSQL support (Aurora PostgreSQL, RDS PostgreSQL) via community logical replication, versions 11.21+, 12.16+, 13.12+, 14.9+, 15.4+ |
+| Nov 2024 | Physical replication for minor version upgrades; **storage volume shrink**; managed green-storage initialisation |
+| Nov 2025 | Aurora Global Database support |
+| Jan 2026 | Switchover downtime reduced to typically under five seconds |
+| Apr 2026 | RDS Proxy integration, removing DNS propagation delay at switchover |
 
-Why tetris is the better frame anyway
+PostgreSQL support is roughly two years and nine months old, with meaningful
+releases about twice a year and no sign of slowing. **The assumption that a v1
+ships narrow and stays narrow is not supported by this record.** Planning should
+assume Azure follows a comparable cadence once its own feature lands.
 
-Every platform feature — AWS's, Azure's, GCP's — operates on one server, cloning to one server. That's not a v1 limitation, it's what the primitive is. Blue/green is definitionally 1:1.
+Note the November 2024 positioning in particular: multiple database changes —
+minor version upgrade, storage shrink, maintenance, instance scaling — applied
+in a *single switchover event*. That is the same "reconfigure without repeated
+downtime" value proposition, already claimed.
 
-Tetris is N:M. Consolidate eight under-utilised servers into two. Split one server's schemas across three. Move a subscription's worth of databases into a new tenant. Reshape a fleet for HorizonDB adoption. No 1:1 clone feature reaches any of that, no matter how many versions it ships.
+### Replication method
 
-That's the first framing you've used that isn't waiting on someone else's roadmap.
+RDS selects the method automatically, and the choice drives the limitation set:
 
-What actually determines survival
+| Source version | Action | Method |
+|---|---|---|
+| 16.1+, 15.4+, 14.9+, 13.12+, 12.16+, 11.21+ | Major version upgrade | Logical |
+| All supported | Minor upgrade, or no upgrade | Physical |
 
-Not competition. Two other things.
+Major version upgrades are unsupported for sources at or below 15.3, 14.8,
+13.11, 12.15, and 11.20 — those instances must reach a qualifying minor version
+first.
 
-Frequency. Migration tools have a structural commercial problem: a customer uses one once and is done. Tetris is more recurring than a one-time migration but still episodic — a customer reshapes their fleet maybe annually. That's thin for a product. It's abundant for a field tool, because you and PG-CAT do it across every account, continuously. The frequency is high on your side of the relationship, not the customer's. That's the third time in this conversation the evidence has pointed at field tool rather than product, and I'd stop resisting it.
+### What it still cannot do (current documentation)
 
-Your time. The most likely way pgcyan dies isn't Azure shipping blue/green. It's becoming a half-finished side project competing with a demanding day job. That risk is entirely under your control and it's larger than the competitive one.
+- Change encryption state in either direction
+- Cross AWS accounts — blue and green must be in the same account
+- Support cascading read replicas, cross-Region read replicas, Multi-AZ DB
+  clusters, or CloudFormation
+- Under physical replication: any schema change on green, which is strictly
+  read-only, or a manual major version upgrade once green exists
+- Under logical replication: replicate DDL or DCL, replicate large objects, or
+  auto-refresh materialized views. DDL or large-object activity on blue puts
+  green into **Replication degraded**, requiring the deployment and all green
+  databases to be deleted and recreated.
+- Keep up under sustained high write volume. Apply on green is single-threaded;
+  AWS's own guidance is to consider DMS instead for major version upgrades with
+  high-volume write workloads.
 
-A test worth running
+That last item is the significant one: **the vendor documents a throughput
+ceiling and hands the customer to a different product when it is exceeded.**
 
-Go through the customer accounts you touched this year and count how many had a tetris need — consolidation, split, tenant move, HorizonDB, or a reconfiguration that required a rebuild. Not "would have benefited." Actually needed, and did it by hand or didn't do it.
+### In-place major version upgrade
 
-If that number is a handful, it's a field tool and you should build it as one — narrow, fast, yours. If it's most of them, you have something bigger and the investment case makes itself.
+Separately from Blue/Green, RDS has upgraded all in-Region read replicas
+concurrently with the primary since 2020. A replica can be skipped by promoting
+or deleting it first, but this is not required. Replicas are therefore *not* a
+blocker for in-place MVU on AWS.
 
-You have the data. Nobody else building in this space does.
+---
+
+## 3. GCP — no blue/green
+
+Cloud SQL for PostgreSQL offers two documented major-version paths, both with
+downtime:
+
+- **In-place**, using `pg_upgrade`, retaining instance name, IP address, and
+  settings.
+- **Migrate data**, exporting from the current instance and importing into a new
+  one, with the source placed in read-only mode for the duration.
+
+The second is a cold export/import, not a replicated cutover. For a live-sync
+path, GCP directs customers to Database Migration Service.
+
+**Replicas are not a blocker.** `--include-replicas-for-major-version-upgrade`
+upgrades the primary and all replicas, including cross-region and cascading
+replicas. Without the flag, replicas must be upgraded *before* the primary.
+Neither path requires deleting them. External replicas cannot be upgraded
+in place at all.
+
+Two details with direct product relevance:
+
+- **In-place MVU deletes every logical replication slot on the instance.** Slots
+  must be recorded beforehand and recreated afterward or replication streams
+  break silently.
+- **GCP ships a pre-upgrade check.** `pre-check-major-version-upgrade` returns
+  findings typed `INFO` / `WARNING` / `ERROR`, each with a message and an
+  `actions_required` field; `ERROR` blocks the upgrade. It covers incompatible
+  extensions, unsupported dependencies, and data incompatibilities.
+
+GCP also publishes hard numeric ceilings worth borrowing as gate thresholds:
+more than 10 million large objects causes the upgrade to fail and roll back;
+Cloud SQL is optimised to roughly 100,000 relations, beyond which upgrades are
+less reliable and may fail after a six-hour timeout; instances with more than
+1,000 databases may time out.
+
+---
+
+## 4. Azure — the widest gap today
+
+No blue/green feature. The migration service is built on `pgcopydb follow` and
+inherits its logical-decoding restrictions. It carries a 7-day migration
+lifetime and a 72-hour online cutover window, permits only one active migration
+per flexible server, and offers no object-level migration. **There is no
+first-party Flex-to-Flex path.**
+
+Flex also has a materially larger immutability surface than RDS:
+
+| Property | RDS | Flexible Server |
+|---|---|---|
+| Public accessibility | Modifiable flag | Creation-time, immutable |
+| VPC / VNet | Change the DB subnet group | VNet injection is fixed at creation |
+| Cross-region backup | Toggled after creation | Geo-redundant backup is creation-time only |
+| Storage type | gp2 / gp3 / io1 / io2 in place | — |
+| Storage shrink | Supported via Blue/Green since Nov 2024 | Not possible; tiers double upward only |
+| Read replicas at MVU | Upgraded concurrently | Must be deleted first |
+
+Immutable on every platform: encryption state, collation and encoding,
+major version downgrade, and cross-account or cross-tenant moves.
+
+---
+
+## 5. Capability classes outside the 1:1 clone model
+
+None of the following is reachable by a staging-clone feature on any cloud,
+regardless of how many versions it ships. These are structural, not
+roadmap-dependent.
+
+**N:M fleet reshaping**
+- Consolidation: several under-utilised servers into one. A live
+  cost-optimisation request.
+- Split: one server into several, extracting a database or schema onto its own
+  instance.
+- Flex → Elastic Clusters: a sharding topology change, not a version change.
+
+**Boundaries a clone cannot cross**
+- Cross-subscription and cross-tenant moves generally.
+- Cross-product: Flexible Server → Azure HorizonDB.
+- Exit migrations: to on-premises, another cloud, or self-managed. No vendor
+  will build this, and customers ask for it.
+- Collation and encoding changes — rebuild-only everywhere.
+
+**Scale beyond a single apply worker**
+- Databases whose write rate exceeds what one logical apply process can replay.
+  AWS documents this ceiling and redirects to DMS; any Azure implementation
+  built on logical replication inherits it. Multi-terabyte, write-heavy estates
+  are unserved by blue/green on day one.
+
+**Operations above the single-server unit**
+- Fleet-scale orchestration: applying the same change across dozens of servers
+  with sequencing, verification, and rollback.
+- Rollback after cutover: reverse replication once traffic is on the new server.
+  A blue/green deployment leaves a stale former primary, not a path back.
+
+---
+
+## 6. Assessment
+
+The platform features are converging on the same capability and improving
+steadily. Any position that depends on vendors being slow is a timing
+assumption, not a durable one — and the AWS record argues against it.
+
+The defensible position is orthogonal rather than adjacent: **cross boundaries a
+clone cannot cross, handle scale a single apply worker cannot reach, and operate
+above the single-server unit.** None of those is on the observed release
+trajectory of any of the three clouds.
+
+A second, complementary option is to treat the platform primitive as an
+implementation rather than a competitor. Planning, preflight refusal,
+convergence estimation, and post-cutover verification are equally useful driving
+a vendor's blue/green as driving a self-managed pgcopydb path. With a swappable
+loader interface, a future Azure blue/green becomes one more backend — and the
+orchestration and judgment layer, which no vendor builds, is retained either
+way.
+
+---
+
+## Sources
+
+- RDS Blue/Green overview — https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html
+- RDS Blue/Green limitations and considerations — https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-considerations.html
+- PostgreSQL replication methods for blue/green — https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-replication-type.html
+- RDS PostgreSQL engine upgrades — https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_UpgradeDBInstance.PostgreSQL.html
+- DMS homogeneous data migration limitations — https://docs.aws.amazon.com/dms/latest/userguide/data-migrations.html
+- Cloud SQL in-place major version upgrade — https://cloud.google.com/sql/docs/postgres/upgrade-major-db-version-inplace
+- Cloud SQL major version upgrade by migrating data — https://cloud.google.com/sql/docs/postgres/upgrade-major-db-version-migrate
+- Azure migration service known issues — https://learn.microsoft.com/en-us/azure/postgresql/migrate/migration-service/concepts-known-issues-migration-service
+- Azure migration service best practices — https://learn.microsoft.com/en-us/azure/postgresql/migrate/migration-service/best-practices-migration-service-postgresql
