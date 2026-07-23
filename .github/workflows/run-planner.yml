@@ -1,0 +1,211 @@
+name: "Run: planner pipeline (phase -2 collector + phase -1 planner)"
+
+# Run the migration PLANNING pipeline end-to-end on the AKS cluster -- issue #50.
+# This is the planning half only: it moves NO data. It runs, in order and with a
+# barrier between them, the two control-plane Jobs from deploy/k8s:
+#
+#   phase -2  25-job-collect-inputs.yaml  -> reads the source DB, writes the
+#                                            pgcyan-planner-inputs ConfigMap
+#   phase -1  30-job-planner.yaml         -> reads those inputs, runs the LOB
+#                                            abort gate + bin-packer, writes the
+#                                            pgcyan-plan ConfigMap (plan.json +
+#                                            shard-<n>.filters)
+#
+# then uploads plan.json + both Jobs' logs as a build artifact for human review.
+# It deliberately does NOT start phases 0-4 (they move real data).
+#
+# Manual only (`workflow_dispatch`) -- it hits a real source database and the
+# real cluster, exactly like integration-pre-migration.yml.
+#
+# ---------------------------------------------------------------------------
+# PREREQUISITES (all one-time, see issue #50):
+#   * terraform/aks applied (cluster + ACR + workload identities) and the
+#     namespace/RBAC synced -- run publish-image.yml's `deploy` job, or this
+#     workflow re-applies 00/01 idempotently below.
+#   * The pgcyan image built + pushed to the ACR (publish-image.yml). Pass its
+#     digest as `image_ref` if it differs from what deploy/k8s pins.
+#   * GitHub config:
+#       secrets:  AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
+#                 PG_SOURCE_USER / PG_SOURCE_PASSWORD
+#       variables: AKS_RESOURCE_GROUP / AKS_CLUSTER_NAME
+#                  PG_SOURCE_HOST / PG_SOURCE_PORT / PG_SOURCE_DATABASE
+#     (Same PG_SOURCE_* split as integration-pre-migration.yml: credentials are
+#     secrets, non-sensitive host/port/db are plain variables.)
+#
+# SECRETS POLICY: the source-DB credentials live ONLY as GitHub secrets and are
+# materialized into the in-cluster `pgcyan-source-pg` Secret at apply time --
+# no vault, nothing in git. (Azure Key Vault + CSI is a later hardening step.)
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: "Override the pgcyan image for jobs 25/30 (e.g. myacr.azurecr.io/pgcyan@sha256:...). Blank = use the digest pinned in deploy/k8s."
+        required: false
+        type: string
+
+permissions:
+  id-token: write   # OIDC token for azure/login
+  contents: read
+
+jobs:
+  run-planner:
+    name: Collect inputs, then plan
+    runs-on: ubuntu-latest
+    # Same fixed OIDC subject the federated credential trusts -- see
+    # publish-image.yml / terraform-aks.yml.
+    environment: azure
+    env:
+      NS: pgcyan-migration
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Guard -- require Azure + AKS + source-DB config
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          PG_SOURCE_USER: ${{ secrets.PG_SOURCE_USER }}
+          PG_SOURCE_PASSWORD: ${{ secrets.PG_SOURCE_PASSWORD }}
+          PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
+          PG_SOURCE_DATABASE: ${{ vars.PG_SOURCE_DATABASE }}
+        run: |
+          missing=()
+          [ -z "${AZURE_CLIENT_ID}" ]     && missing+=("AZURE_CLIENT_ID secret")
+          [ -z "${AKS_RESOURCE_GROUP}" ]  && missing+=("AKS_RESOURCE_GROUP variable")
+          [ -z "${AKS_CLUSTER_NAME}" ]    && missing+=("AKS_CLUSTER_NAME variable")
+          [ -z "${PG_SOURCE_USER}" ]      && missing+=("PG_SOURCE_USER secret")
+          [ -z "${PG_SOURCE_PASSWORD}" ]  && missing+=("PG_SOURCE_PASSWORD secret")
+          [ -z "${PG_SOURCE_HOST}" ]      && missing+=("PG_SOURCE_HOST variable")
+          [ -z "${PG_SOURCE_DATABASE}" ]  && missing+=("PG_SOURCE_DATABASE variable")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::%s not set -- configure it before running (see workflow header).\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Azure login (OIDC, passwordless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      # Idempotent -- safe whether or not publish-image.yml's deploy job already
+      # applied these. The planner-inputs/plan ConfigMaps are NOT applied here;
+      # the two Jobs create them. The PVC (20) is not on the planner path.
+      - name: Ensure namespace + RBAC
+        run: |
+          kubectl apply -f deploy/k8s/00-namespace.yaml
+          kubectl apply -f deploy/k8s/01-rbac.yaml
+
+      # Source-DB creds: GitHub secrets -> in-cluster Secret. Never in git.
+      # Azure Postgres requires TLS, hence PGSSLMODE=require.
+      - name: Create/refresh source-DB Secret
+        env:
+          PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
+          PG_SOURCE_PORT: ${{ vars.PG_SOURCE_PORT }}
+          PG_SOURCE_USER: ${{ secrets.PG_SOURCE_USER }}
+          PG_SOURCE_PASSWORD: ${{ secrets.PG_SOURCE_PASSWORD }}
+          PG_SOURCE_DATABASE: ${{ vars.PG_SOURCE_DATABASE }}
+        run: |
+          kubectl create secret generic pgcyan-source-pg -n "$NS" \
+            --from-literal=PG_SOURCE_HOST="$PG_SOURCE_HOST" \
+            --from-literal=PG_SOURCE_PORT="${PG_SOURCE_PORT:-5432}" \
+            --from-literal=PG_SOURCE_USER="$PG_SOURCE_USER" \
+            --from-literal=PG_SOURCE_PASSWORD="$PG_SOURCE_PASSWORD" \
+            --from-literal=PG_SOURCE_DATABASE="$PG_SOURCE_DATABASE" \
+            --from-literal=PGSSLMODE=require \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Optionally repoint jobs 25/30 at a freshly-published image. Blank input
+      # leaves the digest pinned in the committed manifests untouched.
+      - name: Pin image override (optional)
+        if: inputs.image_ref != ''
+        run: |
+          for f in deploy/k8s/25-job-collect-inputs.yaml deploy/k8s/30-job-planner.yaml; do
+            sed -i "s|image: \".*\"|image: \"${{ inputs.image_ref }}\"|" "$f"
+            grep -n 'image:' "$f"
+          done
+
+      # Jobs are immutable -- drop any leftovers from a prior run so re-applies
+      # don't fail with "field is immutable".
+      - name: Clear any prior Jobs
+        run: |
+          kubectl delete job pgcyan-collect-inputs pgcyan-planner \
+            -n "$NS" --ignore-not-found --wait=true
+
+      # A Job-completion barrier that respects backoffLimit: waits for the
+      # terminal Complete OR Failed *condition*, not the transient .status.failed
+      # counter (which ticks up on each retry before the final give-up).
+      - name: Phase -2 -- collect inputs (barrier)
+        run: |
+          set -euo pipefail
+          wait_job() {
+            local job="$1" timeout="${2:-900}" elapsed=0 done_s fail_s
+            echo "waiting for job/$job (timeout ${timeout}s) ..."
+            while true; do
+              done_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+              fail_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+              [ "$done_s" = "True" ] && { echo "job/$job Complete"; return 0; }
+              [ "$fail_s" = "True" ] && { echo "::error::job/$job Failed"; return 1; }
+              [ "$elapsed" -ge "$timeout" ] && { echo "::error::job/$job timed out after ${timeout}s"; return 1; }
+              sleep 10; elapsed=$((elapsed + 10))
+            done
+          }
+          kubectl apply -f deploy/k8s/25-job-collect-inputs.yaml
+          wait_job pgcyan-collect-inputs 900
+
+      # Applied only after the collector succeeds -- this is the DAG edge the
+      # orchestrator would otherwise enforce. If the source has ANY large object,
+      # the planner's LOB abort gate exits non-zero and this barrier fails with NO
+      # plan written -- that is the correct, expected outcome, not a workflow bug.
+      - name: Phase -1 -- plan (barrier)
+        run: |
+          set -euo pipefail
+          wait_job() {
+            local job="$1" timeout="${2:-900}" elapsed=0 done_s fail_s
+            echo "waiting for job/$job (timeout ${timeout}s) ..."
+            while true; do
+              done_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+              fail_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+              [ "$done_s" = "True" ] && { echo "job/$job Complete"; return 0; }
+              [ "$fail_s" = "True" ] && { echo "::error::job/$job Failed (LOB abort gate is one legitimate cause)"; return 1; }
+              [ "$elapsed" -ge "$timeout" ] && { echo "::error::job/$job timed out after ${timeout}s"; return 1; }
+              sleep 10; elapsed=$((elapsed + 10))
+            done
+          }
+          kubectl apply -f deploy/k8s/30-job-planner.yaml
+          wait_job pgcyan-planner 900
+
+      # Always collect evidence -- especially on failure (LOB abort / DB error).
+      - name: Gather plan + logs
+        if: always()
+        run: |
+          mkdir -p planner-output
+          kubectl logs -l pgcyan.dev/phase=collect-inputs -n "$NS" --tail=-1 \
+            > planner-output/collect-inputs.log 2>&1 || true
+          kubectl logs -l pgcyan.dev/phase=planner -n "$NS" --tail=-1 \
+            > planner-output/planner.log 2>&1 || true
+          kubectl get configmap pgcyan-plan -n "$NS" \
+            -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{$v}}{{"\n"}}{{end}}' \
+            > planner-output/pgcyan-plan.txt 2>/dev/null || echo "pgcyan-plan ConfigMap not present" > planner-output/pgcyan-plan.txt
+          kubectl get configmap pgcyan-plan -n "$NS" \
+            -o jsonpath='{.data.plan\.json}' > planner-output/plan.json 2>/dev/null || true
+          echo "---- planner-output ----" && ls -la planner-output
+
+      - name: Upload plan + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgcyan-plan-${{ github.run_id }}
+          path: planner-output/*
+          if-no-files-found: warn
+          retention-days: 30

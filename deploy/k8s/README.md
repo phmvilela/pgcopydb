@@ -77,3 +77,16 @@ databases, and stays a separate, deliberate action a human takes (e.g. the
 that job's summary). See the workflow file's header comment for the Azure
 role assignment and `AKS_RESOURCE_GROUP` / `AKS_CLUSTER_NAME` repo variables
 it needs.
+
+## Running just the planning phases end-to-end
+
+To execute the **planning half only** — the phase −2 collector (`25`) and the
+phase −1 planner (`30`), producing the `pgcyan-plan` ConfigMap without moving
+any data — use the manual `.github/workflows/run-planner.yml` workflow (issue
+#50). It logs in to the cluster (OIDC), materializes the source-DB
+`pgcyan-source-pg` Secret from GitHub secrets, applies jobs `25` then `30` with
+a completion barrier between them, and uploads `plan.json` + both Jobs' logs as
+a build artifact. A source with any large object correctly fails the planner
+(LOB abort gate) with no plan written. The cluster itself is provisioned by the
+companion `.github/workflows/terraform-aks.yml` (`terraform/aks`). See each
+workflow's header for the required repo secrets/variables.
