@@ -56,14 +56,14 @@ spec:
       # the main container can read, so we do not hard-code it.
       initContainers:
         - name: read-snapshot
-          image: "REPLACE_ME/pgcyan:latest"
+          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
           command: ["sh", "-c", "cp /work/coordinator/snapshot /work/${SHARD_NAME}/snapshot.id"]
           volumeMounts:
             - name: workdir
               mountPath: /work
       containers:
         - name: pgcopydb-copy
-          image: "REPLACE_ME/pgcyan:latest"   # TODO: pin image with pgcopydb
+          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
           # `clone --skip-extensions --no-acl ...` limited to this shard's tables.
           # Using `copy-db`/`clone` restricted to the include-only filter set.
           command: ["sh", "-c"]

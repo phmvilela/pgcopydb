@@ -48,7 +48,7 @@ spec:
       # priorityClassName: pgcyan-critical
       containers:
         - name: snapshot
-          image: "REPLACE_ME/pgcyan:latest"   # TODO: pin image with pgcopydb
+          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
           # `pgcopydb snapshot` exports and HOLDS the snapshot, writing its id to
           # /work/coordinator/snapshot, and blocks (keeps the txn open) until
           # terminated. Shards read that file.

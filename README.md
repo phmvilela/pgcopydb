@@ -36,7 +36,7 @@ pg_cyan/
   postgres/            PostgreSQL connection/introspection utils (skeleton)
 terraform/             Azure worker-VM provisioning (VNet, NSG, VM, cloud-init)
 tests/                 pytest suite (DB-free unit tests)
-Dockerfile             Multi-stage, non-root image; entrypoint = the CLI
+Dockerfile             Non-root image: pgcopydb + kubectl + the CLI (default cmd)
 requirements.txt       Pinned Python dependencies
 ```
 

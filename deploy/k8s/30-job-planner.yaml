@@ -43,8 +43,10 @@ spec:
       restartPolicy: Never
       containers:
         - name: planner
-          # TODO: publish and pin this image (planner CLI + pgcopydb + kubectl).
-          image: "REPLACE_ME/pgcyan:latest"
+          # Bundles the planner CLI + pgcopydb + kubectl (built by the repo
+          # Dockerfile, pushed to ACR -- see .github/workflows/publish-image.yml).
+          # Repoint to your ACR login server if acr_name differs from the default.
+          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
           # Run the planner into a scratch dir, then publish plan.json +
           # shard-<n>.filters into the pgcyan-plan ConfigMap. If the LOB abort
           # gate fires, `plan` exits non-zero here and the Job fails without

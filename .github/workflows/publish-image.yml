@@ -1,0 +1,132 @@
+name: "Image: build, verify, publish"
+
+# The single migration image (pgcopydb + kubectl + pg_cyan CLI) that backs every
+# deploy/k8s/ pod -- issue #39.
+#
+#   build-verify : builds the image and runs the issue-#39 acceptance commands
+#                  (`pgcopydb --version`, `python -m pg_cyan.cli --help`). Runs
+#                  on every push/PR -- no Azure needed. This is the proof the
+#                  image actually runs.
+#   publish      : pushes the verified image to the ACR that terraform/aks
+#                  provisions, via passwordless OIDC. Runs on `v*` tags or manual
+#                  dispatch, and only if the Azure secrets are configured.
+#
+# For `publish`, configure a federated credential on an Entra app/UAMI with
+# AcrPush on the registry and set repo secrets AZURE_CLIENT_ID / AZURE_TENANT_ID
+# / AZURE_SUBSCRIPTION_ID (and optionally the repo variable ACR_NAME, default
+# pgcyanacr).
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to publish (defaults to pg_cyan.__version__)"
+        required: false
+        type: string
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "requirements.txt"
+      - "pg_cyan/**"
+      - ".github/workflows/publish-image.yml"
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+
+permissions:
+  id-token: write   # OIDC token for azure/login (publish job)
+  contents: read
+
+jobs:
+  build-verify:
+    name: Build image and run acceptance checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load into local Docker)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: pgcyan:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Issue #39 acceptance criteria, executed against the built image.
+      - name: Acceptance -- pgcopydb --version
+        run: docker run --rm pgcyan:ci pgcopydb --version
+
+      - name: Acceptance -- pg_cyan CLI help
+        run: docker run --rm pgcyan:ci python -m pg_cyan.cli --help
+
+      - name: Acceptance -- kubectl present (planner publishes the plan CM)
+        run: docker run --rm pgcyan:ci kubectl version --client
+
+  publish:
+    name: Publish to ACR
+    runs-on: ubuntu-latest
+    needs: build-verify
+    # Only when we actually intend to publish and the Azure identity is wired up.
+    if: >-
+      (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
+    env:
+      ACR_NAME: ${{ vars.ACR_NAME || 'pgcyanacr' }}
+      IMAGE_REPO: pgcyan
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          tag="${{ inputs.image_tag }}"
+          if [ -z "$tag" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"        # v0.1.0 -> 0.1.0
+          fi
+          if [ -z "$tag" ]; then
+            tag="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' pg_cyan/__init__.py)"
+          fi
+          echo "image_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Guard -- require Azure identity secrets
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        run: |
+          if [ -z "${AZURE_CLIENT_ID}" ]; then
+            echo "::error::AZURE_CLIENT_ID not set -- configure the OIDC/ACR secrets before publishing (see workflow header)."
+            exit 1
+          fi
+
+      - name: Azure login (OIDC, passwordless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push image (ACR Tasks)
+        run: |
+          az acr build \
+            --registry "${ACR_NAME}" \
+            --image "${IMAGE_REPO}:${{ steps.tag.outputs.image_tag }}" \
+            --image "${IMAGE_REPO}:latest" \
+            --file Dockerfile \
+            .
+
+      - name: Report pushed digest
+        run: |
+          login_server="$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)"
+          digest="$(az acr repository show --name "${ACR_NAME}" \
+            --image "${IMAGE_REPO}:${{ steps.tag.outputs.image_tag }}" --query digest -o tsv)"
+          echo "### pgcyan image published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag-pinned: \`${login_server}/${IMAGE_REPO}:${{ steps.tag.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest-pinned: \`${login_server}/${IMAGE_REPO}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"

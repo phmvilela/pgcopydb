@@ -1,0 +1,74 @@
+# 25-job-collect-inputs.yaml
+# ---------------------------------------------------------------------------
+# PHASE -2 (control plane): the INPUT COLLECTOR.
+#
+# This is the only pre-plan step that TALKS TO THE SOURCE DATABASE. It runs the
+# read-only pg_cyan collectors against the source Postgres and publishes their
+# JSON artifacts into the `pgcyan-planner-inputs` ConfigMap that the planner
+# (30-job-planner.yaml) consumes. The planner itself never opens a DB
+# connection -- it is a pure offline transform over these files.
+#
+# It runs, in order:
+#   * `pg_cyan.cli source-pg-metrics`     -> source-pg-metrics.json
+#   * `pg_cyan.cli source-largeobjects`   -> source-pg-largeobjects.json
+# then publishes both into the ConfigMap with kubectl (needs the orchestrator
+# RBAC: configmaps create/patch). Each collector exits non-zero on failure and
+# writes a *-errors.json instead, so a connection/query failure fails this Job
+# and NOTHING is published -- the planner never sees a half-populated input set.
+#
+# It replaces the illustrative stub in 11-configmap-inputs.yaml with real data.
+#
+# DB auth: reads PG_SOURCE_* (+ PGSSLMODE) from the `pgcyan-source-pg` Secret,
+# created out-of-band (never in git):
+#   kubectl create secret generic pgcyan-source-pg -n pgcyan-migration \
+#     --from-literal=PG_SOURCE_HOST=... --from-literal=PG_SOURCE_PORT=5432 \
+#     --from-literal=PG_SOURCE_USER=... --from-literal=PG_SOURCE_PASSWORD=... \
+#     --from-literal=PG_SOURCE_DATABASE=... --from-literal=PGSSLMODE=require
+# (Azure Postgres requires TLS -> PGSSLMODE=require. Prefer Workload Identity /
+# an Entra token over a static password once the CLI supports it.)
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pgcyan-collect-inputs
+  namespace: pgcyan-migration
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400   # keep for a day for post-mortem, then GC
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/phase: "collect-inputs"
+    spec:
+      serviceAccountName: pgcyan-orchestrator   # needs configmap write RBAC
+      restartPolicy: Never
+      containers:
+        - name: collector
+          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
+          # Collect metrics + large-object count into a scratch dir, then publish
+          # the two required planner inputs into the pgcyan-planner-inputs
+          # ConfigMap. If either collector fails it exits non-zero here and the
+          # && chain stops before anything is published.
+          command: ["sh", "-c"]
+          args:
+            - >
+              python -m pg_cyan.cli source-pg-metrics --output-dir=/work
+              &&
+              python -m pg_cyan.cli source-largeobjects --output-dir=/work
+              &&
+              kubectl create configmap pgcyan-planner-inputs
+              --from-file=source-pg-metrics.json=/work/source-pg-metrics.json
+              --from-file=source-pg-largeobjects.json=/work/source-pg-largeobjects.json
+              --dry-run=client -o yaml | kubectl apply -f -
+          envFrom:
+            - secretRef:
+                name: pgcyan-source-pg   # PG_SOURCE_* (+ PGSSLMODE)
+          volumeMounts:
+            - name: work
+              mountPath: /work
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "512Mi" }
+      volumes:
+        - name: work
+          emptyDir: {}

@@ -17,7 +17,8 @@ numbered in apply order.
 | `11-configmap-inputs.yaml` | −1 | ConfigMap | planner inputs (metrics/params/constraints) |
 | `12-configmap-plan.yaml` | −1 | ConfigMap | planner OUTPUT: `plan.json` + per-shard `--filters` |
 | `20-pvc-workdir.yaml` | — | PVC (RWX) | shared `/work`: snapshot id + resume state |
-| `30-job-planner.yaml` | −1 | Job | runs the planner (**TODO: app**) |
+| `25-job-collect-inputs.yaml` | −2 | Job | collectors hit the source DB → write the inputs ConfigMap |
+| `30-job-planner.yaml` | −1 | Job | runs the planner (`pg_cyan.cli plan`) |
 | `40-job-phase0-predata.yaml` | 0 | Job | schema without secondary idx/FK |
 | `50-deployment-snapshot-holder.yaml` | 1 | Deployment(1)+PDB | holds the consistent snapshot |
 | `60-job-phase2-datashard.template.yaml` | 2 | Job × N | concurrent HEAP-only COPY shards |
@@ -28,5 +29,21 @@ numbered in apply order.
 `.template.yaml` files contain `${...}` placeholders the orchestrator substitutes
 once per plan entry — they are **not** directly `kubectl apply`-able as-is.
 
-Every file carries its assumptions and TODOs as inline comments. Nothing here is
-runnable until the `REPLACE_ME/pgcyan` image is built and the planner app exists.
+Every file carries its assumptions and TODOs as inline comments.
+
+## The image
+
+Every pod runs one image — `pgcyanacr.azurecr.io/pgcyan:0.1.0`, digest-pinned
+`@sha256:…` for immutability — bundling **pgcopydb**, **kubectl**, and the
+**`pg_cyan` CLI** (issue #39). Build and push it to the ACR that `terraform/aks`
+provisions:
+
+```sh
+# server-side build in ACR Tasks (no local Docker needed)
+../../scripts/build-and-push-image.sh
+```
+
+or let CI do it (`.github/workflows/publish-image.yml`, on a `v*` tag or manual
+dispatch). If your `acr_name` differs from the default `pgcyanacr`, repoint the
+`image:` field in each manifest at your registry's login server (and prefer
+pinning by `@sha256:` digest — the build script and workflow both print it).
