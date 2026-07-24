@@ -10,111 +10,107 @@
 
 \set ON_ERROR_STOP on
 
-DROP SCHEMA IF EXISTS shop  CASCADE;
-DROP SCHEMA IF EXISTS media CASCADE;
-CREATE SCHEMA shop;
-CREATE SCHEMA media;
 
 -- ---------------------------------------------------------------- shop component
-CREATE TABLE shop.customers (
+CREATE TABLE public.customers (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     email       text NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now(),
     region      text NOT NULL
 );
 
-CREATE TABLE shop.products (
+CREATE TABLE public.products (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     sku         text NOT NULL UNIQUE,
     name        text NOT NULL,
     price_cents int  NOT NULL
 );
 
-CREATE TABLE shop.orders (
+CREATE TABLE public.orders (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    customer_id bigint NOT NULL REFERENCES shop.customers(id),
+    customer_id bigint NOT NULL REFERENCES public.customers(id),
     placed_at   timestamptz NOT NULL DEFAULT now(),
     status      text NOT NULL
 );
 
-CREATE TABLE shop.order_items (
+CREATE TABLE public.order_items (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    order_id    bigint NOT NULL REFERENCES shop.orders(id),
-    product_id  bigint NOT NULL REFERENCES shop.products(id),
+    order_id    bigint NOT NULL REFERENCES public.orders(id),
+    product_id  bigint NOT NULL REFERENCES public.products(id),
     qty         int NOT NULL,
     unit_cents  int NOT NULL
 );
 
 -- ---------------------------------------------------------------- media component
-CREATE TABLE media.authors (
+CREATE TABLE public.authors (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     handle      text NOT NULL UNIQUE,
     joined_at   timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE media.articles (
+CREATE TABLE public.articles (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    author_id   bigint NOT NULL REFERENCES media.authors(id),
+    author_id   bigint NOT NULL REFERENCES public.authors(id),
     title       text NOT NULL,
     body        text NOT NULL,
     published_at timestamptz
 );
 
-CREATE TABLE media.comments (
+CREATE TABLE public.comments (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    article_id  bigint NOT NULL REFERENCES media.articles(id),
-    author_id   bigint NOT NULL REFERENCES media.authors(id),
+    article_id  bigint NOT NULL REFERENCES public.articles(id),
+    author_id   bigint NOT NULL REFERENCES public.authors(id),
     body        text NOT NULL,
     posted_at   timestamptz NOT NULL DEFAULT now()
 );
 
 -- ---------------------------------------------------------------- data
 -- Dimensions first (parents), then facts (children). Multipliers set the size.
-INSERT INTO shop.customers (email, region)
+INSERT INTO public.customers (email, region)
 SELECT 'cust'||g||'@example.com',
        (ARRAY['us','eu','apac','latam'])[1+floor(random()*4)]
 FROM generate_series(1, 100000) g;
 
-INSERT INTO shop.products (sku, name, price_cents)
+INSERT INTO public.products (sku, name, price_cents)
 SELECT 'SKU-'||g, 'Product '||g, 100+floor(random()*9900)::int
 FROM generate_series(1, 2000) g;
 
-INSERT INTO media.authors (handle)
+INSERT INTO public.authors (handle)
 SELECT 'author_'||g FROM generate_series(1, 5000) g;
 
-INSERT INTO shop.orders (customer_id, placed_at, status)
+INSERT INTO public.orders (customer_id, placed_at, status)
 SELECT 1+floor(random()*100000)::bigint,
        now() - (floor(random()*365)||' days')::interval,
        (ARRAY['pending','shipped','delivered','cancelled'])[1+floor(random()*4)]
 FROM generate_series(1, 1000000) g;
 
-INSERT INTO shop.order_items (order_id, product_id, qty, unit_cents)
+INSERT INTO public.order_items (order_id, product_id, qty, unit_cents)
 SELECT 1+floor(random()*1000000)::bigint,
        1+floor(random()*2000)::bigint,
        1+floor(random()*5)::int,
        100+floor(random()*9900)::int
 FROM generate_series(1, 2500000) g;
 
-INSERT INTO media.articles (author_id, title, body, published_at)
+INSERT INTO public.articles (author_id, title, body, published_at)
 SELECT 1+floor(random()*5000)::bigint,
        'Title '||g, repeat(md5(g::text), 8),
        now() - (floor(random()*200)||' days')::interval
 FROM generate_series(1, 200000) g;
 
-INSERT INTO media.comments (article_id, author_id, body)
+INSERT INTO public.comments (article_id, author_id, body)
 SELECT 1+floor(random()*200000)::bigint,
        1+floor(random()*5000)::bigint,
        repeat(md5(g::text), 2)
 FROM generate_series(1, 1000000) g;
 
 -- ---------------------------------------------------------------- secondary indexes
-CREATE INDEX ON shop.orders      (customer_id);
-CREATE INDEX ON shop.orders      (placed_at);
-CREATE INDEX ON shop.order_items (order_id);
-CREATE INDEX ON shop.order_items (product_id);
-CREATE INDEX ON media.articles   (author_id);
-CREATE INDEX ON media.comments   (article_id);
-CREATE INDEX ON media.comments   (author_id);
+CREATE INDEX ON public.orders      (customer_id);
+CREATE INDEX ON public.orders      (placed_at);
+CREATE INDEX ON public.order_items (order_id);
+CREATE INDEX ON public.order_items (product_id);
+CREATE INDEX ON public.articles   (author_id);
+CREATE INDEX ON public.comments   (article_id);
+CREATE INDEX ON public.comments   (author_id);
 
 ANALYZE;
 
