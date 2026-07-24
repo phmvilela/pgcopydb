@@ -26,10 +26,37 @@
 # filter mechanism; today pgcopydb splits WITHIN a job, so range-across-jobs is
 # a planner responsibility -- see note).
 #
-# RESUME: `--dir=/work/${SHARD_NAME}` (own subPath) + `--resume`. A killed shard
-# pod restarts and continues at per-table / per-part granularity, never redoing
-# a completed table. backoffLimit lets k8s do that restart automatically.
+# RESUME: `--dir=/work` on this shard's OWN ReadWriteOnce managed disk
+# (pgcyan-workdir-${SHARD_NAME}, stamped from the PVC document below) + `--resume`.
+# A killed shard pod restarts, re-attaches the same disk, and continues at
+# per-table / per-part granularity, never redoing a completed table --
+# backoffLimit lets k8s do that restart automatically. The disk is RWO (one pod
+# at a time) and local ext4, so pgcopydb's SQLite/WAL catalog gets the file
+# locking Azure Files (SMB) cannot provide (issue #58).
+#
+# SNAPSHOT: `--snapshot="${SNAPSHOT_ID}"` where SNAPSHOT_ID comes from the
+# `pgcyan-snapshot` ConfigMap the holder publishes (phase 1) -- no shared volume,
+# no initContainer. All shards read the same key, so they copy the same instant.
 # ---------------------------------------------------------------------------
+# The per-shard work disk. The orchestrator stamps one of these per
+# plan.json > data_shards entry (same ${SHARD_NAME} substitution as the Job).
+# ReadWriteOnce: exactly one shard pod uses it at a time. See 20-pvc-workdir.yaml
+# for the full rationale (issue #58).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgcyan-workdir-${SHARD_NAME}
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/phase: "data"
+    pgcyan.dev/shard: "${SHARD_NAME}"
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: managed-csi   # TODO: confirm the RWO class name on the target cluster
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -52,15 +79,6 @@ spec:
     spec:
       serviceAccountName: pgcyan-worker
       restartPolicy: Never
-      # An initContainer lifts the snapshot id from the shared file into a place
-      # the main container can read, so we do not hard-code it.
-      initContainers:
-        - name: read-snapshot
-          image: "${PGCYAN_IMAGE}"
-          command: ["sh", "-c", "cp /work/coordinator/snapshot /work/${SHARD_NAME}/snapshot.id"]
-          volumeMounts:
-            - name: workdir
-              mountPath: /work
       containers:
         - name: pgcopydb-copy
           image: "${PGCYAN_IMAGE}"
@@ -70,9 +88,9 @@ spec:
           args:
             - >
               pgcopydb clone
-              --dir=/work/${SHARD_NAME}
+              --dir=/work
               --filters=/plan/${FILTER_FILE}
-              --snapshot="$(cat /work/${SHARD_NAME}/snapshot.id)"
+              --snapshot="$(SNAPSHOT_ID)"
               --table-jobs=${TABLE_JOBS}
               --index-jobs=0
               --split-tables-larger-than=${SPLIT_TABLES_LARGER_THAN}
@@ -89,6 +107,15 @@ spec:
                 name: pgcyan-db-uris
           # TODO(orchestrator): substitute these from plan.json > data_shards[i].
           env:
+            # The exported snapshot id, published by the phase-1 holder into the
+            # pgcyan-snapshot ConfigMap. Every shard reads the same key, so they
+            # all pin the same consistent instant (issue #58 -- replaces the old
+            # shared-volume file + initContainer handoff).
+            - name: SNAPSHOT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: pgcyan-snapshot
+                  key: snapshot
             - name: FILTER_FILE
               value: "${FILTER_FILE}"            # e.g. shard-0.filters
             - name: TABLE_JOBS
@@ -109,7 +136,7 @@ spec:
       volumes:
         - name: workdir
           persistentVolumeClaim:
-            claimName: pgcyan-workdir
+            claimName: pgcyan-workdir-${SHARD_NAME}
         - name: plan
           configMap:
             name: pgcyan-plan

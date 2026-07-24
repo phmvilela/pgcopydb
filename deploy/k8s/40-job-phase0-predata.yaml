@@ -37,16 +37,21 @@ spec:
           image: "${PGCYAN_IMAGE}"
           command: ["pgcopydb", "restore", "pre-data"]
           args:
-            - "--dir=/work/phase0"
+            - "--dir=/work"
             - "--resume"
             - "--no-owner"          # ASSUMPTION: target roles pre-created by Terraform; drop if not
             - "--snapshot=$(SNAPSHOT_ID)"
           env:
             - name: SNAPSHOT_ID
-              # TODO: an initContainer should read /work/coordinator/snapshot
-              # (written by the snapshot holder) into this env var. Placeholder
-              # wiring shown; see 50-deployment-snapshot-holder.yaml.
-              value: "REPLACE_VIA_INITCONTAINER"
+              # TODO: source this from the `pgcyan-snapshot` ConfigMap the phase-1
+              # holder publishes (issue #58), the same way the data shards do:
+              #   valueFrom: { configMapKeyRef: { name: pgcyan-snapshot, key: snapshot } }
+              # NOTE: the current DAG applies pre-data (phase 0) BEFORE the holder
+              # (phase 1), so that ConfigMap does not exist yet here -- wiring it
+              # via configMapKeyRef would wedge this pod in
+              # CreateContainerConfigError. Resolving pre-data's snapshot ordering
+              # is a separate follow-up; left as a placeholder for now.
+              value: "REPLACE_VIA_CONFIGMAP"
           envFrom:
             - secretRef:
                 name: pgcyan-db-uris   # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI
@@ -58,6 +63,8 @@ spec:
             requests: { cpu: "250m", memory: "256Mi" }
             limits:   { cpu: "1",    memory: "1Gi" }
       volumes:
+        # Pre-data's own ReadWriteOnce work disk (SQLite/WAL off Azure Files --
+        # issue #58). Pre-applied from 20-pvc-workdir.yaml.
         - name: workdir
           persistentVolumeClaim:
-            claimName: pgcyan-workdir
+            claimName: pgcyan-workdir-predata

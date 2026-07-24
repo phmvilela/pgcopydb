@@ -1,68 +1,104 @@
 # 20-pvc-workdir.yaml
 # ---------------------------------------------------------------------------
-# The shared pgcopydb work directory (the `--dir` target).
+# pgcopydb work directories (the `--dir` target) -- one PER WORKLOAD, on
+# ReadWriteOnce managed disks. This is the resolution of issue #58.
 #
-# WHY it must be persistent and shared:
-#   * RESUME: pgcopydb stores its SQLite catalogs, per-table lock/done markers
-#     and COPY summaries under --dir. If a shard pod is OOM-killed or the node is
-#     drained, a restarted pod pointing at the SAME --dir resumes at per-table
-#     (per-shard-part) granularity instead of re-copying from zero. Losing the
-#     dir = losing all resume state.
-#   * SNAPSHOT HANDOFF: the snapshot-holder writes the exported snapshot id to a
-#     file under its subPath; every data shard reads it to pass `--snapshot`,
-#     so they all see the SAME consistent point-in-time. This is the mechanism
-#     that keeps the shared-nothing shards mutually consistent.
+# THE PROBLEM (issue #58, first hit by the holder in #57): pgcopydb stores its
+# catalog as a SQLite DB under `--dir` and opens it in WAL mode, which needs
+# file locking + shared memory that Azure Files (SMB) does NOT provide. On a
+# shared `azurefile-csi` RWX volume pgcopydb aborts before doing any work:
+#     ERROR catalog.c [SQLite]: PRAGMA journal_mode = WAL failed:
+#           database is locked  (rc=12)
 #
-# WHY ReadWriteMany:
-#   Multiple pods (snapshot holder + N shards + index/FK jobs) mount this
-#   volume simultaneously. Each uses its own subPath (coordinator/, shard-0/,
-#   ...) so there is no write contention -- RWX is only needed for concurrent
-#   MOUNT, not concurrent writes to the same file.
+# THE FIX (option 2b): give every pgcopydb pod its OWN ReadWriteOnce managed
+# disk (local ext4 block device -- exactly the environment SQLite WAL expects,
+# with real POSIX locking). Unlike a node-local `emptyDir`, a managed disk
+# PERSISTS across pod restarts: a killed/OOM-drained shard re-attaches the same
+# disk and pgcopydb `--resume` picks up at per-table (per-part) granularity
+# instead of re-copying its whole table set from zero. This is the resume
+# guarantee the shards need and an emptyDir cannot give.
 #
-# ASSUMPTION: Azure Files (SMB/NFS) provides RWX on AKS. If you would rather use
-# per-shard ReadWriteOnce disks (faster, cheaper), you must switch the shards
-# from Jobs to a StatefulSet (Jobs cannot own volumeClaimTemplates) and copy the
-# snapshot id out-of-band. RWX + subPath is the simplest shape and is chosen
-# here deliberately.
+# WHY NOT the alternatives:
+#   * Azure Files NFS (`azurefile-csi-nfs`): a one-line StorageClass swap, but
+#     SQLite-over-NFS with WAL is discouraged upstream -- correctness on the
+#     resume path would have to be load-validated. We engineer the risk out
+#     instead of betting on it.
+#   * A StatefulSet with `volumeClaimTemplates`: unnecessary. A plain Job pod
+#     can mount a PRE-CREATED RWO PVC by claimName -- one pod per shard is
+#     already RWO-shaped. Only *dynamic per-replica* provisioning needs a
+#     StatefulSet, and going there would break the orchestrator's Job-completion
+#     barrier (StatefulSet pods restart on exit 0; they never "Complete").
 #
-# TODO: size this from the plan. Rule of thumb: the work dir holds catalogs +
-# metadata, NOT table data, so it is small (single-digit GiB) UNLESS CTID-split
-# spill or wal2json transform files land here for the CDC phase. Set generously.
+# WHY RWO is safe here: exactly one pod uses each disk at a time (one pod per
+# shard; the index/FK/CDC singletons run in their own phases). RWO -- attach to
+# one node at a time -- is all that is required.
+#
+# SNAPSHOT HANDOFF no longer rides a shared volume: the holder publishes the
+# exported snapshot id to the `pgcyan-snapshot` ConfigMap (see
+# 50-deployment-snapshot-holder.yaml), which the data shards read via
+# `configMapKeyRef`. So there is NO shared RWX PVC any more.
+#
+# WHICH PVCs live where:
+#   * The SINGLETON phases -- pre-data (0), FK (3b), follow-CDC (4) -- each get
+#     one of the three PVCs below (applied once, up front, like the old shared
+#     PVC was).
+#   * The FANNED-OUT phases -- data shards (2) and index shards (3a) -- get one
+#     PVC per plan entry, stamped by the orchestrator from the PVC document at
+#     the top of 60-/70-*.template.yaml (named pgcyan-workdir-<shard>).
+#
+# RECLAIM / lifecycle: the catalog holds resume state, so if you want resume to
+# survive a full namespace teardown the RWO StorageClass should use
+# `reclaimPolicy: Retain`. Within a single migration run the PVC persists across
+# pod restarts regardless, which is what the resume guarantee needs.
+#
+# SIZE: the work dir holds catalogs + metadata, NOT table data, so it is small
+# (single-digit GiB) unless CTID-split spill lands here. 10Gi is generous;
+# Azure bills managed disks per performance tier, so this is cheap.
 # ---------------------------------------------------------------------------
+#
+# ASSUMPTION: a dynamic RWO managed-disk StorageClass exists. On AKS this is
+# `managed-csi` (Standard SSD) or `managed-csi-premium` (Premium SSD, higher
+# IOPS). Set explicitly rather than relying on the cluster default. If your
+# class name differs, update it here AND in the two `.template.yaml` PVC docs.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: pgcyan-workdir
+  name: pgcyan-workdir-predata      # phase 0 (40-job-phase0-predata.yaml)
   namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/workdir: "predata"
 spec:
-  accessModes:
-    - ReadWriteMany
+  accessModes: ["ReadWriteOnce"]
   resources:
     requests:
-      storage: 20Gi   # TODO: raise if --follow/wal2json transform files spill here
-  # ASSUMPTION: a dynamic RWX StorageClass exists. On AKS this is typically
-  # `azurefile` or `azurefile-csi`. Set explicitly rather than relying on the
-  # cluster default (the default is often an RWO managed-disk class, which will
-  # NOT satisfy the ReadWriteMany claim above and the PVC will hang Pending).
-  storageClassName: azurefile-csi   # TODO: confirm the RWX class name on the target cluster
+      storage: 10Gi
+  storageClassName: managed-csi     # TODO: confirm the RWO class name on the target cluster
 ---
-# ASSUMPTION: dynamic provisioning is available, so no hand-authored
-# PersistentVolume is required. If the cluster has NO dynamic RWX provisioner,
-# uncomment and complete a static PV like the following and point the PVC at it
-# via `volumeName: pgcyan-workdir-pv`.
-#
-# apiVersion: v1
-# kind: PersistentVolume
-# metadata:
-#   name: pgcyan-workdir-pv
-# spec:
-#   capacity:
-#     storage: 20Gi
-#   accessModes: ["ReadWriteMany"]
-#   persistentVolumeReclaimPolicy: Retain   # keep resume state if the claim is deleted
-#   # TODO: fill in the concrete backend (csi / nfs / azureFile share name + secret)
-#   csi:
-#     driver: file.csi.azure.com
-#     volumeHandle: REPLACE_ME
-#     volumeAttributes:
-#       shareName: REPLACE_ME
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgcyan-workdir-fk           # phase 3b (71-job-phase3-fk.yaml)
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/workdir: "fk"
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: managed-csi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgcyan-workdir-cdc          # phase 4 (80-deployment-follow-cdc.yaml)
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/workdir: "cdc"
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      # CDC may spill wal2json transform files here -- give it more headroom.
+      storage: 20Gi
+  storageClassName: managed-csi

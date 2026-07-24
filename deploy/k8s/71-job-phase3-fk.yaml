@@ -49,7 +49,7 @@ spec:
           args:
             - >
               pgcopydb restore constraints
-              --dir=/work/phase3-fk
+              --dir=/work
               --restore-jobs=${RESTORE_JOBS}
               --resume
           envFrom:
@@ -68,6 +68,8 @@ spec:
             requests: { cpu: "100m", memory: "128Mi" }
             limits:   { cpu: "500m", memory: "512Mi" }
       volumes:
+        # FK phase's own ReadWriteOnce work disk (SQLite/WAL off Azure Files --
+        # issue #58). Pre-applied from 20-pvc-workdir.yaml.
         - name: workdir
           persistentVolumeClaim:
-            claimName: pgcyan-workdir
+            claimName: pgcyan-workdir-fk

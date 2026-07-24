@@ -64,9 +64,12 @@ spec:
           # safe. Zero lag is necessary but not sufficient -- see post-cutover
           # verification in pgcopydb-and-pgdump-tooling-assessment.md §3.
       volumes:
+        # CDC's own ReadWriteOnce work disk (SQLite/WAL off Azure Files -- issue
+        # #58). Pre-applied from 20-pvc-workdir.yaml. RWO is safe: the CDC
+        # Deployment is a strict singleton (replicas: 1, Recreate).
         - name: workdir
           persistentVolumeClaim:
-            claimName: pgcyan-workdir
+            claimName: pgcyan-workdir-cdc
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

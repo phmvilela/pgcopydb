@@ -20,13 +20,13 @@ phase −2 input collector are assumed already applied).
 | `10-secrets.example.yaml` | — | Secret (EXAMPLE) | DB URIs; **do not commit real values** — prefer Workload Identity |
 | `11-configmap-inputs.yaml` | −1 | ConfigMap | planner inputs (metrics/params/constraints) |
 | `12-configmap-plan.yaml` | −1 | ConfigMap | planner OUTPUT: `plan.json` + per-shard `--filters` |
-| `20-pvc-workdir.yaml` | — | PVC (RWX) | shared `/work`: snapshot id + resume state |
+| `20-pvc-workdir.yaml` | — | PVC (RWO ×3) | per-workload pgcopydb `--dir` disks (pre-data/FK/CDC); shards get one each, stamped by the templates — issue #58 |
 | `25-job-collect-inputs.yaml` | −2 | Job | collectors hit the source DB → write the inputs ConfigMap |
 | `30-job-planner.yaml` | −1 | Job | runs the planner (`pg_cyan.cli plan`) |
 | `40-job-phase0-predata.yaml` | 0 | Job | schema without secondary idx/FK |
-| `50-deployment-snapshot-holder.yaml` | 1 | Deployment(1)+PDB | `pg_cyan.cli snapshot-hold`: creates publication + pgoutput slot, exports & HOLDS the consistent snapshot |
-| `60-job-phase2-datashard.template.yaml` | 2 | Job × N | concurrent HEAP-only COPY shards |
-| `70-job-phase3-index.template.yaml` | 3a | Job × M | secondary index builds (shardable) |
+| `50-deployment-snapshot-holder.yaml` | 1 | Deployment(1)+PDB | `pg_cyan.cli snapshot-hold`: creates publication + pgoutput slot, exports & HOLDS the consistent snapshot, publishes the id to the `pgcyan-snapshot` ConfigMap |
+| `60-job-phase2-datashard.template.yaml` | 2 | PVC+Job × N | concurrent HEAP-only COPY shards, each on its own RWO work disk |
+| `70-job-phase3-index.template.yaml` | 3a | PVC+Job × M | secondary index builds (shardable), each on its own RWO work disk |
 | `71-job-phase3-fk.yaml` | 3b | Job (single) | FK/constraint single coordinated pass |
 | `80-deployment-follow-cdc.yaml` | 4 | Deployment(1)+PDB | optional CDC catch-up → cutover |
 

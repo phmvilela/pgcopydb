@@ -104,12 +104,15 @@ def _pgcyan_image_env(monkeypatch):
 
 
 class FakeCoreApi:
-    def __init__(self, plan=None, missing=False, pod_containers=None):
+    def __init__(self, plan=None, missing=False, pod_containers=None, pvc_conflicts=None):
         self._plan = plan
         self._missing = missing
         #: list of (name, image) tuples for read_namespaced_pod, used by the
         #: image-resolution tests that clear the PGCYAN_IMAGE override.
         self._pod_containers = pod_containers or [("orchestrator", TEST_IMAGE)]
+        #: PVCs the orchestrator creates (issue #58 per-shard RWO work disks).
+        self.created_pvcs = []
+        self._pvc_conflicts = pvc_conflicts or set()
 
     def read_namespaced_config_map(self, name, namespace):
         if self._missing:
@@ -119,6 +122,12 @@ class FakeCoreApi:
     def read_namespaced_pod(self, name, namespace):
         containers = [_Obj(name=n, image=img) for n, img in self._pod_containers]
         return _Obj(spec=_Obj(containers=containers))
+
+    def create_namespaced_persistent_volume_claim(self, namespace, body):
+        name = body["metadata"]["name"]
+        if name in self._pvc_conflicts:
+            raise ApiException(status=409, reason="AlreadyExists")
+        self.created_pvcs.append((namespace, name, body))
 
 
 SAMPLE_PLAN = {
@@ -157,8 +166,23 @@ def make_orchestrator(**kwargs):
 def test_render_yaml_substitutes_every_placeholder():
     orch = make_orchestrator()
     template = "name: pgcyan-${THING}-x\nvalue: \"${THING}\"\n"
-    doc = orch._render_yaml(template, {"THING": "widget"})
-    assert doc == {"name": "pgcyan-widget-x", "value": "widget"}
+    docs = orch._render_yaml(template, {"THING": "widget"})
+    assert docs == [{"name": "pgcyan-widget-x", "value": "widget"}]
+
+
+def test_render_yaml_renders_every_document_in_a_multi_doc_template():
+    orch = make_orchestrator()
+    template = (
+        "kind: PersistentVolumeClaim\n"
+        "metadata:\n  name: pvc-${N}\n"
+        "---\n"
+        "kind: Job\n"
+        "metadata:\n  name: job-${N}\n"
+    )
+    docs = orch._render_yaml(template, {"N": "0"})
+    assert [d["kind"] for d in docs] == ["PersistentVolumeClaim", "Job"]
+    assert docs[0]["metadata"]["name"] == "pvc-0"
+    assert docs[1]["metadata"]["name"] == "job-0"
 
 
 def test_render_yaml_raises_on_unknown_placeholder():
@@ -186,24 +210,38 @@ def test_load_phase_manifests_static_phase_multi_doc():
     assert kinds == {"Deployment", "PodDisruptionBudget"}
 
 
-def test_load_phase_manifests_templated_phase_renders_one_job_per_shard():
+def test_load_phase_manifests_templated_phase_renders_pvc_and_job_per_shard():
     orch = make_orchestrator()
     phase = dict(PgCyanOrchestrator.PHASES[3])  # data-shards
     assert phase["id"] == "2"
     docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
-    assert [d["metadata"]["name"] for d in docs] == [
+    # one RWO work-dir PVC + one Job per shard (issue #58), PVC first so it is
+    # applied before the Job that mounts it.
+    jobs = [d for d in docs if d["kind"] == "Job"]
+    pvcs = [d for d in docs if d["kind"] == "PersistentVolumeClaim"]
+    assert [d["metadata"]["name"] for d in jobs] == [
         "pgcyan-datashard-shard-0", "pgcyan-datashard-shard-1",
     ]
-    # no leftover placeholders anywhere in the rendered doc
-    assert "${" not in yaml.safe_dump(docs[0])
+    assert [d["metadata"]["name"] for d in pvcs] == [
+        "pgcyan-workdir-shard-0", "pgcyan-workdir-shard-1",
+    ]
+    assert docs[0]["kind"] == "PersistentVolumeClaim"  # PVC precedes its Job
+    # the shard Job mounts its own per-shard PVC and reads the snapshot ConfigMap
+    shard0 = jobs[0]["spec"]["template"]["spec"]
+    assert shard0["volumes"][0]["persistentVolumeClaim"]["claimName"] == "pgcyan-workdir-shard-0"
+    # no leftover placeholders anywhere in the rendered docs
+    assert "${" not in yaml.safe_dump(docs)
 
 
-def test_load_phase_manifests_index_template_renders_one_job_per_index_shard():
+def test_load_phase_manifests_index_template_renders_pvc_and_job_per_index_shard():
     orch = make_orchestrator()
     phase = dict(PgCyanOrchestrator.PHASES[4])  # index
     assert phase["id"] == "3a"
     docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
-    assert [d["metadata"]["name"] for d in docs] == ["pgcyan-index-idx-0", "pgcyan-index-idx-1"]
+    jobs = [d["metadata"]["name"] for d in docs if d["kind"] == "Job"]
+    pvcs = [d["metadata"]["name"] for d in docs if d["kind"] == "PersistentVolumeClaim"]
+    assert jobs == ["pgcyan-index-idx-0", "pgcyan-index-idx-1"]
+    assert pvcs == ["pgcyan-workdir-idx-0", "pgcyan-workdir-idx-1"]
 
 
 def test_load_phase_manifests_templated_phase_requires_plan_entries():
@@ -240,9 +278,13 @@ def test_templated_manifest_image_placeholder_filled():
     orch = make_orchestrator()
     phase = dict(PgCyanOrchestrator.PHASES[3])  # data-shards
     docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
-    for doc in docs:
-        assert _container_image(doc) == TEST_IMAGE
-    assert "${" not in yaml.safe_dump(docs[0])  # no leftover placeholders
+    # Templated phases are multi-doc now (a per-shard PVC precedes each Job,
+    # issue #58); the image placeholder lives on the Job containers.
+    jobs = [d for d in docs if d["kind"] == "Job"]
+    assert jobs
+    for job in jobs:
+        assert _container_image(job) == TEST_IMAGE
+    assert "${" not in yaml.safe_dump(docs)  # no leftover placeholders anywhere
 
 
 def test_resolve_image_env_override_wins():
@@ -292,6 +334,20 @@ def test_apply_unsupported_kind_raises():
     orch = make_orchestrator()
     with pytest.raises(OrchestratorError, match="ConfigMap"):
         orch._apply({"kind": "ConfigMap", "metadata": {"name": "x"}})
+
+
+def test_apply_creates_persistent_volume_claim():
+    core_api = FakeCoreApi(plan=SAMPLE_PLAN)
+    orch = make_orchestrator(core_api=core_api)
+    orch._apply({"kind": "PersistentVolumeClaim", "metadata": {"name": "pgcyan-workdir-shard-0"}})
+    assert [n for _, n, _ in core_api.created_pvcs] == ["pgcyan-workdir-shard-0"]
+
+
+def test_apply_pvc_conflict_is_idempotent_noop():
+    core_api = FakeCoreApi(plan=SAMPLE_PLAN, pvc_conflicts={"pgcyan-workdir-shard-0"})
+    orch = make_orchestrator(core_api=core_api)
+    orch._apply({"kind": "PersistentVolumeClaim", "metadata": {"name": "pgcyan-workdir-shard-0"}})  # no raise
+    assert core_api.created_pvcs == []
 
 
 # -------------------------------------------------------------------- wait
@@ -390,14 +446,19 @@ def _all_deployments_ready_apps_api():
 def test_run_happy_path_applies_all_seven_phases_in_order():
     batch_api = _all_jobs_complete_batch_api()
     apps_api = _all_deployments_ready_apps_api()
-    orch = make_orchestrator(batch_api=batch_api, apps_api=apps_api,
-                              core_api=FakeCoreApi(plan=SAMPLE_PLAN))
+    core_api = FakeCoreApi(plan=SAMPLE_PLAN)
+    orch = make_orchestrator(batch_api=batch_api, apps_api=apps_api, core_api=core_api)
     summary = orch.run()
 
     assert summary["status"] == "success"
     assert summary["run_id"] == "pgcyan-test-run"
     assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "1", "2", "3a", "3b", "4"]
     assert all(p["success"] for p in summary["phases"])
+    # each data + index shard got its own RWO work-dir PVC stamped (issue #58)
+    assert {n for _, n, _ in core_api.created_pvcs} == {
+        "pgcyan-workdir-shard-0", "pgcyan-workdir-shard-1",
+        "pgcyan-workdir-idx-0", "pgcyan-workdir-idx-1",
+    }
     # data + index shards + fk + pre-data + planner Jobs were all created
     created_job_names = {name for _, name, _ in batch_api.created}
     assert created_job_names == {

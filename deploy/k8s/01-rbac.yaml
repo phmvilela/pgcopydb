@@ -62,10 +62,17 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch"]
-  # Publish the generated plan and read the collected inputs.
+  # Publish the generated plan + the snapshot id, and read the collected inputs.
+  # (The snapshot holder runs as this SA and publishes the pgcyan-snapshot
+  # ConfigMap; the planner Job publishes pgcyan-plan -- see issue #58 / #38.)
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create", "get", "list", "watch", "patch", "update"]
+  # Stamp one ReadWriteOnce work-dir PVC per data/index shard so pgcopydb's
+  # SQLite/WAL catalog runs on a local managed disk, not Azure Files (issue #58).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

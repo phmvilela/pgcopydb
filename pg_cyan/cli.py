@@ -316,18 +316,28 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
 @click.option("--pgcopydb-bin",
               default=lambda: os.getenv("PGCOPYDB_BIN", PgCyanSnapshot.DEFAULT_PGCOPYDB_BIN),
               show_default="$PGCOPYDB_BIN", help="pgcopydb executable name/path.")
+@click.option("--snapshot-configmap", default=lambda: os.getenv("PGCYAN_SNAPSHOT_CONFIGMAP"),
+              show_default="$PGCYAN_SNAPSHOT_CONFIGMAP",
+              help="ConfigMap to publish the snapshot id into for the shards (blank = skip, local runs).")
+@click.option("--configmap-namespace", default=lambda: os.getenv("PGCYAN_NAMESPACE"),
+              show_default="$PGCYAN_NAMESPACE (else kubectl's namespace)",
+              help="Namespace for the snapshot ConfigMap.")
+@click.option("--kubectl-bin", default=lambda: os.getenv("KUBECTL_BIN", "kubectl"),
+              show_default="$KUBECTL_BIN", help="kubectl executable used to publish the snapshot id.")
 def snapshot_hold(source_pguri: str, host: str, port: int, user: str, password: str,
                   database: str, timeout: int, publication_name: str, slot_name: str,
                   snapshot_mode: str, plugin: str, work_dir: str, output_dir: str,
-                  plan_file: str, pgcopydb_bin: str) -> None:
+                  plan_file: str, pgcopydb_bin: str, snapshot_configmap: str,
+                  configmap_namespace: str, kubectl_bin: str) -> None:
     """Establish and HOLD the source's consistent publication + slot + snapshot.
 
     Creates the publication FOR ALL TABLES, creates the pgoutput slot and exports
-    its consistent snapshot (writing the id to the shared /work volume), then
-    blocks -- keeping the exporting connection open -- until SIGTERM/SIGINT, at
-    which point it terminates pgcopydb so the source connection closes cleanly.
-    Writes ``source-pg-slot.json`` + ``source-pg-publication.json`` on success,
-    or matching ``*-errors.json`` on failure.
+    its consistent snapshot, publishes the id into the ``pgcyan-snapshot``
+    ConfigMap for the shards (issue #58), then blocks -- keeping the exporting
+    connection open -- until SIGTERM/SIGINT, at which point it terminates
+    pgcopydb so the source connection closes cleanly. Writes
+    ``source-pg-slot.json`` + ``source-pg-publication.json`` on success, or
+    matching ``*-errors.json`` on failure.
     """
     holder = PgCyanSnapshot(
         source_pguri=source_pguri or None,
@@ -337,6 +347,9 @@ def snapshot_hold(source_pguri: str, host: str, port: int, user: str, password: 
         snapshot_mode=snapshot_mode, plugin=plugin, work_dir=work_dir,
         output_dir=output_dir or None, plan_file=plan_file or None,
         pgcopydb_bin=pgcopydb_bin,
+        snapshot_configmap=snapshot_configmap or None,
+        configmap_namespace=configmap_namespace or None,
+        kubectl_bin=kubectl_bin,
     )
     try:
         summary = holder.establish()

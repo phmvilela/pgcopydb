@@ -24,7 +24,9 @@ name: Integration tests
 # PREREQUISITES (all one-time, see issue #50):
 #   * terraform/aks applied (cluster + ACR + workload identities).
 #   * build.yml has published pgcyan:<short-sha> for the commit being tested.
-#   * A dynamic RWX StorageClass for 20-pvc-workdir.yaml (azurefile-csi on AKS).
+#   * The snapshot holder needs no PVC (--dir is a node-local emptyDir; the
+#     snapshot id goes to the pgcyan-snapshot ConfigMap). The data shards need a
+#     dynamic RWO managed-disk StorageClass (managed-csi on AKS) -- issue #58.
 #   * The SOURCE server allows logical replication (wal_level=logical) and the
 #     login role can CREATE PUBLICATION FOR ALL TABLES + a replication slot.
 #   * GitHub config:
@@ -253,11 +255,14 @@ jobs:
           resource-group: ${{ env.AKS_RESOURCE_GROUP }}
           cluster-name: ${{ env.AKS_CLUSTER_NAME }}
 
-      - name: Ensure namespace + RBAC + work-dir PVC
+      # The holder needs no PVC now (--dir is a node-local emptyDir; the snapshot
+      # id goes to the pgcyan-snapshot ConfigMap -- issue #58). 01-rbac.yaml
+      # defines the pgcyan-orchestrator SA it runs as (configmaps create/patch),
+      # required for the publish step.
+      - name: Ensure namespace + RBAC
         run: |
           kubectl apply -f deploy/k8s/00-namespace.yaml
           kubectl apply -f deploy/k8s/01-rbac.yaml
-          kubectl apply -f deploy/k8s/20-pvc-workdir.yaml
 
       # The holder reads pgcopydb's native PGCOPYDB_SOURCE_PGURI from the
       # `pgcyan-db-uris` Secret. Build it from the same PG_SOURCE_* GitHub
@@ -284,11 +289,13 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       # Start clean so a leftover holder from a prior run can't mask a fresh
-      # snapshot (its /work/coordinator/snapshot would be stale).
+      # snapshot, and drop any stale pgcyan-snapshot ConfigMap so a prior run's
+      # id cannot linger.
       - name: Clear any prior holder
         run: |
           envsubst '${PGCYAN_IMAGE}' < deploy/k8s/50-deployment-snapshot-holder.yaml \
             | kubectl delete -f - -n "$NS" --ignore-not-found --wait=true
+          kubectl delete configmap/pgcyan-snapshot -n "$NS" --ignore-not-found
 
       - name: Apply the snapshot holder
         run: envsubst '${PGCYAN_IMAGE}' < deploy/k8s/50-deployment-snapshot-holder.yaml | kubectl apply -f -
@@ -304,23 +311,30 @@ jobs:
           echo "waiting for the Deployment to report an available replica ..."
           kubectl rollout status deploy/"$DEPLOY" -n "$NS" --timeout=300s
 
-      # Acceptance: the outputs must be visible on the shared /work volume.
-      - name: Verify outputs on /work
+      # Acceptance: the outputs exist in the pod's node-local scratch dir AND the
+      # snapshot id was published to the pgcyan-snapshot ConfigMap for the shards.
+      - name: Verify outputs + snapshot ConfigMap
         run: |
           set -euo pipefail
           pod="$(kubectl get pod -l pgcyan.dev/phase=snapshot-holder -n "$NS" \
                    -o jsonpath='{.items[0].metadata.name}')"
           echo "holder pod: $pod"
-          echo "---- /work/coordinator ----"
-          kubectl exec "$pod" -n "$NS" -- ls -la /work/coordinator
+          echo "---- /pgcopydb ----"
+          kubectl exec "$pod" -n "$NS" -- ls -la /pgcopydb
           for f in source-pg-slot.json source-pg-publication.json snapshot; do
-            echo "asserting /work/coordinator/$f is present and non-empty ..."
-            kubectl exec "$pod" -n "$NS" -- test -s "/work/coordinator/$f"
+            echo "asserting /pgcopydb/$f is present and non-empty ..."
+            kubectl exec "$pod" -n "$NS" -- test -s "/pgcopydb/$f"
           done
           echo "---- source-pg-slot.json ----"
-          kubectl exec "$pod" -n "$NS" -- cat /work/coordinator/source-pg-slot.json
-          echo "---- source-pg-publication.json ----"
-          kubectl exec "$pod" -n "$NS" -- cat /work/coordinator/source-pg-publication.json
+          kubectl exec "$pod" -n "$NS" -- cat /pgcopydb/source-pg-slot.json
+          echo "---- pgcyan-snapshot ConfigMap ----"
+          # The shards read this key via configMapKeyRef -- it must be non-empty
+          # and match the exported snapshot id in the scratch dir.
+          cm_id="$(kubectl get configmap pgcyan-snapshot -n "$NS" -o jsonpath='{.data.snapshot}')"
+          file_id="$(kubectl exec "$pod" -n "$NS" -- cat /pgcopydb/snapshot | tr -d '[:space:]')"
+          echo "ConfigMap snapshot=[$cm_id]  file snapshot=[$file_id]"
+          [ -n "$cm_id" ] || { echo "::error::pgcyan-snapshot ConfigMap has no 'snapshot' key"; exit 1; }
+          [ "$cm_id" = "$file_id" ] || { echo "::error::ConfigMap id does not match the exported snapshot id"; exit 1; }
 
       # Grab the outputs + logs BEFORE teardown, for the artifact.
       - name: Collect outputs + establish logs
@@ -331,10 +345,12 @@ jobs:
                    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
           if [ -n "${pod:-}" ]; then
             for f in source-pg-slot.json source-pg-publication.json snapshot; do
-              kubectl exec "$pod" -n "$NS" -- cat "/work/coordinator/$f" \
+              kubectl exec "$pod" -n "$NS" -- cat "/pgcopydb/$f" \
                 > "snapshot-output/$f" 2>/dev/null || true
             done
           fi
+          kubectl get configmap pgcyan-snapshot -n "$NS" -o yaml \
+            > snapshot-output/pgcyan-snapshot-configmap.yaml 2>/dev/null || true
           kubectl logs -l pgcyan.dev/phase=snapshot-holder -n "$NS" --tail=-1 \
             > snapshot-output/holder.log 2>&1 || true
           ls -la snapshot-output
@@ -350,6 +366,7 @@ jobs:
           kubectl delete deploy/"$DEPLOY" -n "$NS" \
             --cascade=foreground --wait=true --timeout=120s
           kubectl delete pdb/pgcyan-snapshot-holder -n "$NS" --ignore-not-found
+          kubectl delete configmap/pgcyan-snapshot -n "$NS" --ignore-not-found
           echo "waiting for the holder pod to fully terminate ..."
           # --for=delete exits non-zero with "no matching resources" if the pod
           # is already gone -- that's the success case, so tolerate it and let

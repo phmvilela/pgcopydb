@@ -148,27 +148,31 @@ snapshot name + captured `consistent_point`) and `source-pg-publication.json`
 mode default to the planner's (`PGCYAN_PUBLICATION`/`PGCYAN_SLOT`/
 `PGCYAN_SNAPSHOT_MODE`) and can be overridden from `plan.json` via
 `--plan-file`. Because the holder is **authoritative and non-resumable** (a
-restart == a brand-new snapshot) and its work dir lives on a **persistent** RWX
-PVC, `establish()` starts from a clean slate: it `reset_work_dir()`s any prior
-run's pgcopydb catalog (a leftover catalog pushes pgcopydb into `--resume` mode,
-which a consistent snapshot cannot use -> `Option --resume requires option
---not-consistent`) and stale output files (a leftover `source-pg-slot.json`
-would trip the readiness probe early), then `drop_stale_slot()`s any *inactive*
-leftover replication slot (a persistent slot survives a clean prior exit, and a
-fresh consistent snapshot can only be exported at slot creation). An **active**
-slot is a hard failure -- another holder or a leaked connection owns it.
-Separately, pgcopydb keeps a **SQLite** catalog under `--dir` and opens it in
-**WAL** mode, which needs locking/shared-memory that **Azure Files (SMB) does
-not provide** (`PRAGMA journal_mode = WAL failed: database is locked`). So the
-holder's `--dir` (`PGCYAN_WORK_DIR`, `work_dir`) lives on a **node-local
-`emptyDir`** -- fine, since the holder is non-resumable -- while only the handoff
-artifacts (JSON + the `snapshot` id) go to the shared `/work` volume
-(`PG_OUTPUT_DIR`, `output_dir`); `publish_snapshot_id()` mirrors the id from the
-local `--dir` to `output_dir/snapshot` for the shards. **NB:** the data/index
-shards (phases 0/2/3) still run pgcopydb with `--dir` on the shared SMB PVC and
-will hit the same WAL-on-SMB wall -- they need a storage decision (Azure Files
-**NFS**, or per-shard RWO disks) since they, unlike the holder, need real resume
-state. The lifecycle splits into `establish()` (create + hold + write
+restart == a brand-new snapshot), `establish()` starts from a clean slate: it
+`reset_work_dir()`s any prior run's pgcopydb catalog (a leftover catalog pushes
+pgcopydb into `--resume` mode, which a consistent snapshot cannot use ->
+`Option --resume requires option --not-consistent`) and stale output files (a
+leftover `source-pg-slot.json` would trip the readiness probe early), then
+`drop_stale_slot()`s any *inactive* leftover replication slot (a persistent slot
+survives a clean prior exit, and a fresh consistent snapshot can only be exported
+at slot creation). An **active** slot is a hard failure -- another holder or a
+leaked connection owns it. Separately, pgcopydb keeps a **SQLite** catalog under
+`--dir` and opens it in **WAL** mode, which needs locking/shared-memory that
+**Azure Files (SMB) does not provide** (`PRAGMA journal_mode = WAL failed:
+database is locked`). So the holder's `--dir` (`PGCYAN_WORK_DIR`, `work_dir`)
+lives on a **node-local `emptyDir`** -- fine, since the holder is non-resumable.
+The **snapshot-id handoff** (issue #58) no longer rides a shared volume:
+`publish_snapshot_configmap()` publishes the exported id to the **`pgcyan-snapshot`
+ConfigMap** via `kubectl` (mirroring how the planner publishes `plan.json`), and
+the data shards read it via `configMapKeyRef`. So the holder needs **no shared
+PVC at all** and runs under the **`pgcyan-orchestrator`** SA (for the ConfigMap
+write; DB auth is via the `pgcyan-db-uris` Secret, SA-independent). The
+data/index shards' own WAL-on-SMB problem is resolved the same-family way (issue
+#58, **option 2b**): each shard/singleton pgcopydb pod gets its **own
+ReadWriteOnce managed disk** for `--dir` (real POSIX locking, and — unlike an
+`emptyDir` — resume state survives a pod restart), so they stay plain Jobs
+(no StatefulSet) — see `deploy/k8s/20-pvc-workdir.yaml`. The lifecycle splits
+into `establish()` (create + hold + write
 outputs; returns a summary) and `hold()` (block until SIGTERM/SIGINT, then
 terminate pgcopydb so the replication connection closes -- a graceful pod exit
 leaves **no stale source connection**, per the ticket's PS). This is the node in
@@ -177,7 +181,8 @@ leaves **no stale source connection**, per the ticket's PS). This is the node in
 established. Because it is a Deployment (not a Job), its integration test is the
 `snapshot-holder` job of the manual `workflow_dispatch` workflow
 (`.github/workflows/integration-tests.yml`) that applies the holder, waits for
-the pod to be Ready, asserts the outputs are visible on `/work`, then tears it
+the pod to be Ready, asserts the exported id is visible in the pod's node-local
+scratch dir and that the `pgcyan-snapshot` ConfigMap carries it, then tears it
 down gracefully and checks the clean-shutdown log line -- rather than a
 `tests/integration` pytest.
 

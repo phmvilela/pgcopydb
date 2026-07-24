@@ -225,41 +225,70 @@ def test_reset_work_dir_clears_stale_output_when_output_dir_differs(tmp_path):
 
 # ------------------------------------------------------- snapshot id handoff
 
-def test_publish_snapshot_id_copies_to_shared_output_dir(tmp_path):
-    # pgcopydb's --dir (work) is node-local; the id must be mirrored to the
-    # shared output dir the shards read.
-    work = tmp_path / "pgcopydb"
-    out = tmp_path / "work"
-    work.mkdir()
-    out.mkdir()
-    holder = _make_holder(work, work_dir=str(work), output_dir=str(out))
-    dest = holder.publish_snapshot_id("SNAP-1")
-    assert dest == str(out / PgCyanSnapshot.SNAPSHOT_FILENAME)
-    assert (out / PgCyanSnapshot.SNAPSHOT_FILENAME).read_text().strip() == "SNAP-1"
+class _FakeCompleted:
+    def __init__(self, stdout=""):
+        self.stdout = stdout
 
 
-def test_publish_snapshot_id_noop_when_dirs_coincide(tmp_path):
-    # When work_dir == output_dir pgcopydb already wrote the file; don't clobber.
-    (tmp_path / PgCyanSnapshot.SNAPSHOT_FILENAME).write_text("SNAP-1\n")
-    holder = _make_holder(tmp_path)  # output_dir defaults to work_dir
-    dest = holder.publish_snapshot_id("SNAP-1")
-    assert dest == str(tmp_path / PgCyanSnapshot.SNAPSHOT_FILENAME)
+def _record_kubectl(monkeypatch):
+    """Capture kubectl invocations; return the recorded-calls list."""
+    calls = []
+
+    def _fake_run(cmd, *a, **k):
+        calls.append({"cmd": cmd, "input": k.get("input")})
+        return _FakeCompleted(stdout="apiVersion: v1\nkind: ConfigMap\n")
+
+    monkeypatch.setattr(snapshot_module.subprocess, "run", _fake_run)
+    return calls
 
 
-def test_establish_publishes_snapshot_to_shared_dir(monkeypatch, tmp_path):
-    # End-to-end: pgcopydb writes into the node-local work dir, establish() must
-    # surface the id on the shared output dir for the shards + readiness probe.
-    work = tmp_path / "pgcopydb"
-    out = tmp_path / "work"
-    work.mkdir()
-    out.mkdir()
-    _install_fakes(monkeypatch, work, snapshot_id="SNAP-9")
-    holder = _make_holder(work, work_dir=str(work), output_dir=str(out))
+def test_publish_snapshot_configmap_skips_when_unset(monkeypatch, tmp_path):
+    # No ConfigMap configured (local run) -> no-op success, no kubectl call.
+    calls = _record_kubectl(monkeypatch)
+    holder = _make_holder(tmp_path)  # snapshot_configmap defaults to None
+    assert holder.publish_snapshot_configmap("SNAP-1") is True
+    assert calls == []
+
+
+def test_publish_snapshot_configmap_invokes_kubectl(monkeypatch, tmp_path):
+    calls = _record_kubectl(monkeypatch)
+    holder = _make_holder(tmp_path, snapshot_configmap="pgcyan-snapshot",
+                          configmap_namespace="pgcyan-migration")
+    assert holder.publish_snapshot_configmap("SNAP-1") is True
+    # create --dry-run ... | apply -f -
+    assert [c["cmd"][:3] for c in calls] == [
+        ["kubectl", "create", "configmap"], ["kubectl", "apply", "-f"],
+    ]
+    assert "--from-literal=snapshot=SNAP-1" in calls[0]["cmd"]
+    assert calls[0]["cmd"][-2:] == ["--namespace", "pgcyan-migration"]
+    # the rendered yaml from the create step is piped into apply's stdin
+    assert calls[1]["input"] == "apiVersion: v1\nkind: ConfigMap\n"
+
+
+def test_publish_snapshot_configmap_failure_returns_false(monkeypatch, tmp_path):
+    import subprocess as real_subprocess
+
+    def _boom(cmd, *a, **k):
+        raise real_subprocess.CalledProcessError(1, cmd, stderr="forbidden")
+
+    monkeypatch.setattr(snapshot_module.subprocess, "run", _boom)
+    holder = _make_holder(tmp_path, snapshot_configmap="pgcyan-snapshot")
+    assert holder.publish_snapshot_configmap("SNAP-1") is False
+    assert any("ConfigMap" in e for e in holder.errors)
+
+
+def test_establish_publishes_snapshot_to_configmap(monkeypatch, tmp_path):
+    # End-to-end: pgcopydb writes the id into the node-local work dir; establish()
+    # publishes it into the ConfigMap and records the ConfigMap in the slot file.
+    calls = _record_kubectl(monkeypatch)
+    _install_fakes(monkeypatch, tmp_path, snapshot_id="SNAP-9")
+    holder = _make_holder(tmp_path, snapshot_configmap="pgcyan-snapshot")
     summary = holder.establish()
     assert summary["status"] == "success"
-    assert (out / PgCyanSnapshot.SNAPSHOT_FILENAME).read_text().strip() == "SNAP-9"
-    slot = json.loads((out / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).read_text())
-    assert slot["snapshot"]["id_file"] == str(out / PgCyanSnapshot.SNAPSHOT_FILENAME)
+    assert any("--from-literal=snapshot=SNAP-9" in c["cmd"] for c in calls)
+    slot = json.loads((tmp_path / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).read_text())
+    assert slot["snapshot"]["configmap"] == "pgcyan-snapshot"
+    assert slot["snapshot"]["configmap_key"] == "snapshot"
 
 
 # ---------------------------------------------------------------- stale slot

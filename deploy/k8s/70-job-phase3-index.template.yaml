@@ -17,7 +17,30 @@
 #   Sharding index builds across several Jobs helps ONLY up to the target's core
 #   count -- each CREATE INDEX pins ~1 target core; beyond ~target_vCPU total
 #   concurrent builds, extra jobs just queue on the server.
+#
+# STORAGE: like the data shards, each index Job gets its OWN ReadWriteOnce
+# managed disk for pgcopydb's `--dir` (SQLite/WAL needs the file locking Azure
+# Files/SMB cannot give -- issue #58). The disk below is stamped per plan.json >
+# index_shards entry. (A future optimisation could reuse the matching data
+# shard's disk so `restore indexes` reads the same catalog; kept separate here
+# to preserve the current per-index-shard --dir topology.)
 # ---------------------------------------------------------------------------
+# The per-index-shard work disk (one per plan.json > index_shards entry).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgcyan-workdir-${INDEX_SHARD_NAME}
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/phase: "post-data-index"
+    pgcyan.dev/shard: "${INDEX_SHARD_NAME}"
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: managed-csi   # TODO: confirm the RWO class name on the target cluster
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -47,7 +70,7 @@ spec:
           args:
             - >
               pgcopydb restore indexes
-              --dir=/work/${INDEX_SHARD_NAME}
+              --dir=/work
               --filters=/plan/${FILTER_FILE}
               --index-jobs=${INDEX_JOBS}
               --resume
@@ -75,7 +98,7 @@ spec:
       volumes:
         - name: workdir
           persistentVolumeClaim:
-            claimName: pgcyan-workdir
+            claimName: pgcyan-workdir-${INDEX_SHARD_NAME}
         - name: plan
           configMap:
             name: pgcyan-plan

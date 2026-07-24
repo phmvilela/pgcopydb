@@ -290,21 +290,23 @@ class PgCyanOrchestrator:
         except OSError as e:
             raise OrchestratorError(f"Could not read manifest {path}: {e}") from e
 
-    def _render_yaml(self, template_text: str, substitutions: Dict[str, str]) -> Dict:
+    def _render_yaml(self, template_text: str, substitutions: Dict[str, str]) -> List[Dict]:
         """
-        Parse ``template_text`` as YAML, then substitute every ``${KEY}`` in its
-        string values.
+        Parse ``template_text`` as (multi-document) YAML, then substitute every
+        ``${KEY}`` in its string values, returning one dict per document.
 
-        Parses BEFORE substituting (rather than regex-replacing the raw text) so
-        that YAML comments -- which mention placeholders like ``${SNAPSHOT_ID}``
-        purely as prose, e.g. in 60-job-phase2-datashard.template.yaml -- are
-        already stripped by the parser and never seen by the substitution pass.
+        Templated phase files carry MORE than one document -- each per-shard Job
+        is preceded by its own ReadWriteOnce work-dir PVC (issue #58) -- so this
+        returns a list. Parses BEFORE substituting (rather than regex-replacing
+        the raw text) so that YAML comments -- which mention placeholders like
+        ``${SNAPSHOT_ID}`` purely as prose -- are already stripped by the parser
+        and never seen by the substitution pass.
         """
         try:
-            doc = yaml.safe_load(template_text)
+            docs = [doc for doc in yaml.safe_load_all(template_text) if doc]
         except yaml.YAMLError as e:
             raise OrchestratorError(f"Manifest template is not valid YAML: {e}") from e
-        return self._substitute(doc, substitutions)
+        return [self._substitute(doc, substitutions) for doc in docs]
 
     def _substitute(self, value, substitutions: Dict[str, str]):
         if isinstance(value, str):
@@ -334,8 +336,10 @@ class PgCyanOrchestrator:
             docs = []
             for entry in entries:
                 subs = dict(phase["substitutions"](entry))
-                subs[self.IMAGE_PLACEHOLDER] = image  # let strict _substitute fill the image too
-                docs.append(self._render_yaml(template_text, subs))
+                subs[self.IMAGE_PLACEHOLDER] = image  # strict _substitute fills the image too
+                # Templated phase files carry MORE than one document -- a per-shard
+                # RWO work-dir PVC precedes each Job (issue #58) -- so extend.
+                docs.extend(self._render_yaml(template_text, subs))
             return docs
 
         text = self._read_manifest_file(phase["manifest"])
@@ -365,6 +369,11 @@ class PgCyanOrchestrator:
                 self.apps_api.create_namespaced_deployment(namespace=namespace, body=doc)
             elif kind == "PodDisruptionBudget":
                 self.policy_api.create_namespaced_pod_disruption_budget(namespace=namespace, body=doc)
+            elif kind == "PersistentVolumeClaim":
+                # Per-shard RWO work-dir disks stamped alongside the data/index
+                # Jobs (issue #58). Applied, not awaited -- binding happens when
+                # the shard pod schedules.
+                self.core_api.create_namespaced_persistent_volume_claim(namespace=namespace, body=doc)
             else:
                 raise OrchestratorError(f"Unsupported manifest kind for orchestrator apply: {kind}")
         except ApiException as e:

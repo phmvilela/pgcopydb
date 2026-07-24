@@ -24,26 +24,34 @@ PDB): if it dies the snapshot is gone and the in-flight initial copy must
 
 Prefer driving pgcopydb (a thin wrapper) over hand-rolled ``CREATE_REPLICATION
 _SLOT`` SQL: the slot + snapshot are created and held by ``pgcopydb snapshot
---follow --plugin pgoutput --slot-name <slot>`` as a child process, which also
-writes the snapshot id to ``<work-dir>/snapshot`` on the shared RWX ``/work``
-volume (``20-pvc-workdir.yaml``) and closes the replication connection cleanly
-when signalled -- so a graceful pod exit leaves no stale connection behind.
-the holder creates its own publication ``FOR ALL TABLES``. Separately, pgcopydb's
-``snapshot --follow --plugin pgoutput`` auto-manages a publication of its OWN,
-named after the slot (``snapshot`` has no ``--publication`` flag) and created
-with a non-idempotent ``CREATE PUBLICATION``; ``drop_stale_publication`` clears
-any leftover of that name from a prior partial run so pgcopydb can recreate it.
-The holder's own publication is a single ``CREATE PUBLICATION``, not the discouraged
-hand-rolled slot SQL) before starting the child.
+--follow --plugin pgoutput --slot-name <slot>`` as a child process, which writes
+the snapshot id to ``<work-dir>/snapshot`` on a **node-local** ``--dir`` (SQLite
+WAL cannot run on Azure Files/SMB -- issue #58) and closes the replication
+connection cleanly when signalled -- so a graceful pod exit leaves no stale
+connection behind. The holder creates its own publication ``FOR ALL TABLES``.
+Separately, pgcopydb's ``snapshot --follow --plugin pgoutput`` auto-manages a
+publication of its OWN, named after the slot (``snapshot`` has no
+``--publication`` flag) and created with a non-idempotent ``CREATE PUBLICATION``;
+``drop_stale_publication`` clears any leftover of that name from a prior partial
+run so pgcopydb can recreate it. The holder's own publication is a single
+``CREATE PUBLICATION``, not the discouraged hand-rolled slot SQL) before starting
+the child.
+
+The snapshot id is then **published to the ``pgcyan-snapshot`` ConfigMap** (issue
+#58) via ``kubectl``, mirroring how the planner Job publishes ``plan.json``; the
+data shards read it via ``configMapKeyRef``. This replaces the old shared-RWX
+``/work`` handoff, so the holder needs no shared volume at all.
 
 This node does NOT create or advance any replication origin -- that is the
 follow-CDC phase's job.
 
 Outputs (written to ``--output-dir`` / ``$PG_OUTPUT_DIR``, defaulting to the
-work dir so both land on the shared ``/work`` volume):
+node-local work dir; they feed the readiness probe, not the shards):
   * ``source-pg-publication.json`` -- publication name (+ FOR ALL TABLES).
   * ``source-pg-slot.json``        -- slot name, snapshot name, plugin, and the
                                       captured ``consistent_point`` LSN.
+  * the ``pgcyan-snapshot`` ConfigMap (key ``snapshot``) -- the exported id the
+                                      shards consume.
 On any failure a matching ``*-errors.json`` is written instead (the same
 success-vs-error two-file shape as the other stages; see ``CLAUDE.md``).
 
@@ -88,6 +96,10 @@ class PgCyanSnapshot:
     #: Basename pgcopydb writes the exported snapshot id to, under ``work_dir``.
     SNAPSHOT_FILENAME = "snapshot"
 
+    #: ConfigMap key the exported snapshot id is published under, read by the
+    #: data shards via ``configMapKeyRef`` (issue #58).
+    SNAPSHOT_CONFIGMAP_KEY = "snapshot"
+
     #: Defaults kept in lock-step with ``PgCyanPlanner`` so the holder and the
     #: plan agree on names/mode when a plan is not passed explicitly.
     DEFAULT_PUBLICATION = "pgcyan_pub"
@@ -121,6 +133,9 @@ class PgCyanSnapshot:
         pgcopydb_bin: str = DEFAULT_PGCOPYDB_BIN,
         snapshot_timeout: int = DEFAULT_SNAPSHOT_TIMEOUT,
         shutdown_timeout: int = DEFAULT_SHUTDOWN_TIMEOUT,
+        snapshot_configmap: Optional[str] = None,
+        configmap_namespace: Optional[str] = None,
+        kubectl_bin: str = "kubectl",
     ):
         """
         Initialize the snapshot holder.
@@ -142,6 +157,12 @@ class PgCyanSnapshot:
             pgcopydb_bin: pgcopydb executable name/path.
             snapshot_timeout: seconds to wait for the child to export the snapshot.
             shutdown_timeout: seconds to let the child close its connection.
+            snapshot_configmap: name of the ConfigMap to publish the snapshot id
+                into for the shards (issue #58). ``None``/empty skips publishing
+                (local runs without a cluster); in-cluster the holder sets it.
+            configmap_namespace: namespace for that ConfigMap; ``None`` lets
+                ``kubectl`` use the pod's own (in-cluster) namespace.
+            kubectl_bin: kubectl executable name/path used to publish the id.
         """
         self.source_pguri = source_pguri
         self.host = host
@@ -160,6 +181,9 @@ class PgCyanSnapshot:
         self.pgcopydb_bin = pgcopydb_bin
         self.snapshot_timeout = snapshot_timeout
         self.shutdown_timeout = shutdown_timeout
+        self.snapshot_configmap = snapshot_configmap
+        self.configmap_namespace = configmap_namespace
+        self.kubectl_bin = kubectl_bin
 
         self.conn = None
         self.proc: Optional[subprocess.Popen] = None
@@ -241,28 +265,12 @@ class PgCyanSnapshot:
         """
         Absolute path pgcopydb writes the exported snapshot id to.
 
-        This is under ``work_dir`` -- pgcopydb's private ``--dir``. In the pod
-        that is a node-local ``emptyDir`` (see below), so the id is then
-        *published* to the shared volume via ``published_snapshot_path`` for the
-        downstream shards to read.
+        This is under ``work_dir`` -- pgcopydb's private ``--dir``, a node-local
+        ``emptyDir`` in the pod (SQLite/WAL cannot run on Azure Files/SMB, issue
+        #58). The id is then *published* to the ``pgcyan-snapshot`` ConfigMap via
+        :meth:`publish_snapshot_configmap` for the downstream shards to read.
         """
         return os.path.join(self.work_dir, self.SNAPSHOT_FILENAME)
-
-    @property
-    def published_snapshot_path(self) -> str:
-        """
-        Shared-volume path the snapshot id is published to for the shards.
-
-        pgcopydb keeps a **SQLite** catalog under ``--dir`` and opens it in WAL
-        mode, which needs file locking + shared memory that **Azure Files (SMB)
-        does not provide** -- on the shared RWX PVC pgcopydb aborts with
-        ``PRAGMA journal_mode = WAL failed: database is locked``. So ``work_dir``
-        (pgcopydb's ``--dir``) lives on a node-local ``emptyDir`` while the
-        handoff artifacts land in ``output_dir`` on the shared ``/work`` volume.
-        The shards read ``<output_dir>/snapshot``; when the two dirs differ we
-        copy the id there after pgcopydb exports it.
-        """
-        return os.path.join(self.output_dir, self.SNAPSHOT_FILENAME)
 
     # ------------------------------------------------------------- work dir
 
@@ -644,40 +652,62 @@ class PgCyanSnapshot:
         except OSError:
             return None
 
-    def publish_snapshot_id(self, snapshot_id: str) -> Optional[str]:
+    def publish_snapshot_configmap(self, snapshot_id: str) -> bool:
         """
-        Copy the exported snapshot id onto the shared volume for the shards.
+        Publish the exported snapshot id into the ``pgcyan-snapshot`` ConfigMap.
 
-        pgcopydb writes the id to its private ``--dir`` (``snapshot_path``),
-        which is a node-local ``emptyDir`` so the SQLite/WAL catalog stays off
-        Azure Files (SMB). The downstream shards read ``published_snapshot_path``
-        on the shared ``/work`` volume, so once the id exists we mirror it there.
-        When ``output_dir`` and ``work_dir`` coincide the file is already in
-        place. Returns the shared path, or ``None`` if the copy failed (a failure
-        means the shards could not learn the snapshot, so the caller aborts).
+        pgcopydb writes the id to its private node-local ``--dir`` (issue #58:
+        the SQLite/WAL catalog cannot live on Azure Files/SMB). Rather than mirror
+        it onto a shared volume, the holder publishes it to a ConfigMap -- the
+        data shards then read it via ``configMapKeyRef`` (60-*.template.yaml).
+        This mirrors how the planner Job publishes ``plan.json`` to the
+        ``pgcyan-plan`` ConfigMap (30-job-planner.yaml), using the same
+        create-then-apply idiom so a re-run overwrites rather than errors.
+
+        When ``snapshot_configmap`` is unset (local runs without a cluster) this
+        is a no-op success. Returns ``False`` only on a real publish failure --
+        the shards could not then learn the snapshot, so the caller aborts. Never
+        raises.
         """
-        dest = self.published_snapshot_path
-        if os.path.abspath(dest) == os.path.abspath(self.snapshot_path):
-            return dest  # pgcopydb already wrote it where the shards will look
-        try:
-            os.makedirs(self.output_dir, exist_ok=True)
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(snapshot_id + "\n")
+        if not self.snapshot_configmap:
             self._log_event(
                 "publish_snapshot", "success",
-                "Published the snapshot id to the shared volume for the shards",
-                {"snapshot_name": snapshot_id, "path": dest},
+                "No snapshot ConfigMap configured; skipping publish (local run)",
+                {"snapshot_name": snapshot_id},
             )
-            return dest
-        except OSError as e:
+            return True
+
+        ns_args = ["--namespace", self.configmap_namespace] if self.configmap_namespace else []
+        render_cmd = [
+            self.kubectl_bin, "create", "configmap", self.snapshot_configmap,
+            f"--from-literal={self.SNAPSHOT_CONFIGMAP_KEY}={snapshot_id}",
+            "--dry-run=client", "-o", "yaml", *ns_args,
+        ]
+        apply_cmd = [self.kubectl_bin, "apply", "-f", "-", *ns_args]
+        try:
+            rendered = subprocess.run(  # noqa: S603 -- fixed argv, no shell
+                render_cmd, check=True, capture_output=True, text=True
+            ).stdout
+            subprocess.run(  # noqa: S603 -- fixed argv, no shell
+                apply_cmd, input=rendered, check=True, capture_output=True, text=True
+            )
+            self._log_event(
+                "publish_snapshot", "success",
+                "Published the snapshot id to the ConfigMap for the shards",
+                {"configmap": self.snapshot_configmap, "key": self.SNAPSHOT_CONFIGMAP_KEY,
+                 "snapshot_name": snapshot_id},
+            )
+            return True
+        except (OSError, subprocess.CalledProcessError) as e:
+            stderr = getattr(e, "stderr", "") or ""
             self._log_event(
                 "publish_snapshot", "failure",
-                "Failed to publish the snapshot id to the shared volume",
-                {"path": dest, "error": str(e),
-                 "remediation": "The shards read this file to pass --snapshot; ensure PG_OUTPUT_DIR is on the shared /work volume and writable"},
+                "Failed to publish the snapshot id to the ConfigMap",
+                {"configmap": self.snapshot_configmap, "error": str(e), "stderr": stderr,
+                 "remediation": "The shards read this ConfigMap for --snapshot; ensure the pod's ServiceAccount can create/patch configmaps and kubectl is on PATH"},
             )
-            self.errors.append(f"Failed to publish snapshot id: {str(e)}")
-            return None
+            self.errors.append(f"Failed to publish snapshot ConfigMap: {str(e)}")
+            return False
 
     def capture_consistent_point(self) -> Optional[str]:
         """
@@ -737,7 +767,8 @@ class PgCyanSnapshot:
                 "name": snapshot_name,
                 "mode": self.snapshot_mode,
                 "not_consistent": self.not_consistent,
-                "id_file": self.published_snapshot_path,
+                "configmap": self.snapshot_configmap,
+                "configmap_key": self.SNAPSHOT_CONFIGMAP_KEY,
             },
             "publication": {"name": self.publication_name},
         }
@@ -876,14 +907,17 @@ class PgCyanSnapshot:
                 )
                 return summary
 
-            # 4) Publish the id onto the shared volume so the shards can read it
-            # (pgcopydb wrote it to its node-local --dir). A failure here means no
-            # shard can learn the snapshot -> abort rather than leak the child.
-            if not self.publish_snapshot_id(snapshot_name):
+            # 4) Publish the id into the pgcyan-snapshot ConfigMap so the shards
+            # can read it via configMapKeyRef (pgcopydb wrote it only to its
+            # node-local --dir). Done BEFORE writing source-pg-slot.json (the
+            # readiness gate) so a Ready holder implies the ConfigMap exists. A
+            # failure here means no shard can learn the snapshot -> abort rather
+            # than leak the child.
+            if not self.publish_snapshot_configmap(snapshot_name):
                 self._terminate_child()
                 summary["slot_error_file"] = self._write_json(
                     self.SLOT_ERROR_FILENAME,
-                    self._build_error("Failed to publish the snapshot id to the shared volume"),
+                    self._build_error("Failed to publish the snapshot id to the ConfigMap"),
                 )
                 return summary
 
@@ -1061,6 +1095,9 @@ def _holder_from_env() -> "PgCyanSnapshot":
         pgcopydb_bin=os.getenv("PGCOPYDB_BIN", PgCyanSnapshot.DEFAULT_PGCOPYDB_BIN),
         snapshot_timeout=int(os.getenv("PGCYAN_SNAPSHOT_TIMEOUT", str(PgCyanSnapshot.DEFAULT_SNAPSHOT_TIMEOUT))),
         shutdown_timeout=int(os.getenv("PGCYAN_SHUTDOWN_TIMEOUT", str(PgCyanSnapshot.DEFAULT_SHUTDOWN_TIMEOUT))),
+        snapshot_configmap=os.getenv("PGCYAN_SNAPSHOT_CONFIGMAP") or None,
+        configmap_namespace=os.getenv("PGCYAN_NAMESPACE") or None,
+        kubectl_bin=os.getenv("KUBECTL_BIN", "kubectl"),
     )
 
 
