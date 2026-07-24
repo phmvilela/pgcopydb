@@ -210,6 +210,45 @@ def test_reset_work_dir_clears_stale_output_when_output_dir_differs(tmp_path):
     assert not (out / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).exists()
 
 
+# ------------------------------------------------------- snapshot id handoff
+
+def test_publish_snapshot_id_copies_to_shared_output_dir(tmp_path):
+    # pgcopydb's --dir (work) is node-local; the id must be mirrored to the
+    # shared output dir the shards read.
+    work = tmp_path / "pgcopydb"
+    out = tmp_path / "work"
+    work.mkdir()
+    out.mkdir()
+    holder = _make_holder(work, work_dir=str(work), output_dir=str(out))
+    dest = holder.publish_snapshot_id("SNAP-1")
+    assert dest == str(out / PgCyanSnapshot.SNAPSHOT_FILENAME)
+    assert (out / PgCyanSnapshot.SNAPSHOT_FILENAME).read_text().strip() == "SNAP-1"
+
+
+def test_publish_snapshot_id_noop_when_dirs_coincide(tmp_path):
+    # When work_dir == output_dir pgcopydb already wrote the file; don't clobber.
+    (tmp_path / PgCyanSnapshot.SNAPSHOT_FILENAME).write_text("SNAP-1\n")
+    holder = _make_holder(tmp_path)  # output_dir defaults to work_dir
+    dest = holder.publish_snapshot_id("SNAP-1")
+    assert dest == str(tmp_path / PgCyanSnapshot.SNAPSHOT_FILENAME)
+
+
+def test_establish_publishes_snapshot_to_shared_dir(monkeypatch, tmp_path):
+    # End-to-end: pgcopydb writes into the node-local work dir, establish() must
+    # surface the id on the shared output dir for the shards + readiness probe.
+    work = tmp_path / "pgcopydb"
+    out = tmp_path / "work"
+    work.mkdir()
+    out.mkdir()
+    _install_fakes(monkeypatch, work, snapshot_id="SNAP-9")
+    holder = _make_holder(work, work_dir=str(work), output_dir=str(out))
+    summary = holder.establish()
+    assert summary["status"] == "success"
+    assert (out / PgCyanSnapshot.SNAPSHOT_FILENAME).read_text().strip() == "SNAP-9"
+    slot = json.loads((out / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).read_text())
+    assert slot["snapshot"]["id_file"] == str(out / PgCyanSnapshot.SNAPSHOT_FILENAME)
+
+
 # ---------------------------------------------------------------- stale slot
 
 def test_drop_stale_slot_noop_when_absent(tmp_path):

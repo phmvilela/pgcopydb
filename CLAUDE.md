@@ -156,7 +156,19 @@ which a consistent snapshot cannot use -> `Option --resume requires option
 would trip the readiness probe early), then `drop_stale_slot()`s any *inactive*
 leftover replication slot (a persistent slot survives a clean prior exit, and a
 fresh consistent snapshot can only be exported at slot creation). An **active**
-slot is a hard failure -- another holder or a leaked connection owns it. The lifecycle splits into `establish()` (create + hold + write
+slot is a hard failure -- another holder or a leaked connection owns it.
+Separately, pgcopydb keeps a **SQLite** catalog under `--dir` and opens it in
+**WAL** mode, which needs locking/shared-memory that **Azure Files (SMB) does
+not provide** (`PRAGMA journal_mode = WAL failed: database is locked`). So the
+holder's `--dir` (`PGCYAN_WORK_DIR`, `work_dir`) lives on a **node-local
+`emptyDir`** -- fine, since the holder is non-resumable -- while only the handoff
+artifacts (JSON + the `snapshot` id) go to the shared `/work` volume
+(`PG_OUTPUT_DIR`, `output_dir`); `publish_snapshot_id()` mirrors the id from the
+local `--dir` to `output_dir/snapshot` for the shards. **NB:** the data/index
+shards (phases 0/2/3) still run pgcopydb with `--dir` on the shared SMB PVC and
+will hit the same WAL-on-SMB wall -- they need a storage decision (Azure Files
+**NFS**, or per-shard RWO disks) since they, unlike the holder, need real resume
+state. The lifecycle splits into `establish()` (create + hold + write
 outputs; returns a summary) and `hold()` (block until SIGTERM/SIGINT, then
 terminate pgcopydb so the replication connection closes -- a graceful pod exit
 leaves **no stale source connection**, per the ticket's PS). This is the node in

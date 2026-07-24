@@ -234,27 +234,51 @@ class PgCyanSnapshot:
 
     @property
     def snapshot_path(self) -> str:
-        """Absolute path pgcopydb writes the exported snapshot id to."""
+        """
+        Absolute path pgcopydb writes the exported snapshot id to.
+
+        This is under ``work_dir`` -- pgcopydb's private ``--dir``. In the pod
+        that is a node-local ``emptyDir`` (see below), so the id is then
+        *published* to the shared volume via ``published_snapshot_path`` for the
+        downstream shards to read.
+        """
         return os.path.join(self.work_dir, self.SNAPSHOT_FILENAME)
+
+    @property
+    def published_snapshot_path(self) -> str:
+        """
+        Shared-volume path the snapshot id is published to for the shards.
+
+        pgcopydb keeps a **SQLite** catalog under ``--dir`` and opens it in WAL
+        mode, which needs file locking + shared memory that **Azure Files (SMB)
+        does not provide** -- on the shared RWX PVC pgcopydb aborts with
+        ``PRAGMA journal_mode = WAL failed: database is locked``. So ``work_dir``
+        (pgcopydb's ``--dir``) lives on a node-local ``emptyDir`` while the
+        handoff artifacts land in ``output_dir`` on the shared ``/work`` volume.
+        The shards read ``<output_dir>/snapshot``; when the two dirs differ we
+        copy the id there after pgcopydb exports it.
+        """
+        return os.path.join(self.output_dir, self.SNAPSHOT_FILENAME)
 
     # ------------------------------------------------------------- work dir
 
     def reset_work_dir(self) -> None:
         """
-        Wipe any state a PRIOR holder left in the work dir before launching.
+        Wipe any state a PRIOR holder left behind before launching.
 
-        The work dir lives on the persistent shared ``/work`` PVC, so a previous
-        run's pgcopydb SQLite catalog and marker files survive here. pgcopydb
-        would then detect that leftover state, implicitly switch to *resume*
-        mode, and -- because a consistent snapshot cannot be resumed -- abort
-        with ``Option --resume requires option --not-consistent`` (issue #23).
-        The holder is authoritative and non-resumable by design (a restart == a
+        pgcopydb's ``--dir`` (``work_dir``) is a node-local ``emptyDir`` in the
+        pod, but the shared ``output_dir`` on the ``/work`` PVC persists across
+        runs. A leftover pgcopydb catalog would push pgcopydb into *resume* mode
+        and -- because a consistent snapshot cannot be resumed -- abort with
+        ``Option --resume requires option --not-consistent`` (issue #23). The
+        holder is authoritative and non-resumable by design (a restart == a
         brand-new snapshot), so it must always start from a clean dir.
 
-        This also removes any stale ``source-pg-slot.json`` from a prior run,
-        which would otherwise satisfy the readiness probe before *this* run has
-        established its own snapshot. Never raises -- a dir we cannot fully clear
-        is a loud warning, not a hard failure (pgcopydb may still succeed).
+        This also removes any stale ``source-pg-slot.json`` / published snapshot
+        id from a prior run in ``output_dir``, which would otherwise satisfy the
+        readiness probe before *this* run has established its own snapshot. Never
+        raises -- a dir we cannot fully clear is a loud warning, not a hard
+        failure (pgcopydb may still succeed).
         """
         try:
             if os.path.isdir(self.work_dir):
@@ -563,6 +587,41 @@ class PgCyanSnapshot:
         except OSError:
             return None
 
+    def publish_snapshot_id(self, snapshot_id: str) -> Optional[str]:
+        """
+        Copy the exported snapshot id onto the shared volume for the shards.
+
+        pgcopydb writes the id to its private ``--dir`` (``snapshot_path``),
+        which is a node-local ``emptyDir`` so the SQLite/WAL catalog stays off
+        Azure Files (SMB). The downstream shards read ``published_snapshot_path``
+        on the shared ``/work`` volume, so once the id exists we mirror it there.
+        When ``output_dir`` and ``work_dir`` coincide the file is already in
+        place. Returns the shared path, or ``None`` if the copy failed (a failure
+        means the shards could not learn the snapshot, so the caller aborts).
+        """
+        dest = self.published_snapshot_path
+        if os.path.abspath(dest) == os.path.abspath(self.snapshot_path):
+            return dest  # pgcopydb already wrote it where the shards will look
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(snapshot_id + "\n")
+            self._log_event(
+                "publish_snapshot", "success",
+                "Published the snapshot id to the shared volume for the shards",
+                {"snapshot_name": snapshot_id, "path": dest},
+            )
+            return dest
+        except OSError as e:
+            self._log_event(
+                "publish_snapshot", "failure",
+                "Failed to publish the snapshot id to the shared volume",
+                {"path": dest, "error": str(e),
+                 "remediation": "The shards read this file to pass --snapshot; ensure PG_OUTPUT_DIR is on the shared /work volume and writable"},
+            )
+            self.errors.append(f"Failed to publish snapshot id: {str(e)}")
+            return None
+
     def capture_consistent_point(self) -> Optional[str]:
         """
         Best-effort read of the slot's ``restart_lsn`` as its consistent point.
@@ -621,7 +680,7 @@ class PgCyanSnapshot:
                 "name": snapshot_name,
                 "mode": self.snapshot_mode,
                 "not_consistent": self.not_consistent,
-                "id_file": self.snapshot_path,
+                "id_file": self.published_snapshot_path,
             },
             "publication": {"name": self.publication_name},
         }
@@ -749,7 +808,18 @@ class PgCyanSnapshot:
                 )
                 return summary
 
-            # 4) Capture the consistent point, then release our own connection --
+            # 4) Publish the id onto the shared volume so the shards can read it
+            # (pgcopydb wrote it to its node-local --dir). A failure here means no
+            # shard can learn the snapshot -> abort rather than leak the child.
+            if not self.publish_snapshot_id(snapshot_name):
+                self._terminate_child()
+                summary["slot_error_file"] = self._write_json(
+                    self.SLOT_ERROR_FILENAME,
+                    self._build_error("Failed to publish the snapshot id to the shared volume"),
+                )
+                return summary
+
+            # 5) Capture the consistent point, then release our own connection --
             # only the pgcopydb child should hold a long-lived connection.
             consistent_point = self.capture_consistent_point()
             self.close_connection()

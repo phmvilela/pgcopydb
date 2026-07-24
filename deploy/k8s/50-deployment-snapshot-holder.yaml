@@ -66,10 +66,16 @@ spec:
           # receives SIGTERM. Shards read the snapshot id file.
           command: ["python", "-m", "pg_cyan.cli", "snapshot-hold"]
           env:
-            # Establish under the shared /work volume so phases 0/2 -- and the
-            # integration test -- see the snapshot id and the JSON outputs there.
+            # pgcopydb keeps a SQLite catalog under --dir and opens it in WAL
+            # mode, which needs file locking + shared memory that Azure Files
+            # (SMB) does NOT provide -- on the shared RWX PVC pgcopydb aborts with
+            # "PRAGMA journal_mode = WAL failed: database is locked". So --dir
+            # lives on a node-local emptyDir (scratch below); the holder is
+            # non-resumable by design, so it needs no persistence there.
             - name: PGCYAN_WORK_DIR
-              value: "/work/coordinator"
+              value: "/pgcopydb"
+            # The HANDOFF artifacts (snapshot id + JSON) still land on the shared
+            # /work volume so phases 0/2 -- and the integration test -- see them.
             - name: PG_OUTPUT_DIR
               value: "/work/coordinator"
             # Publication/slot/mode default to the planner's defaults; the
@@ -87,6 +93,10 @@ spec:
           volumeMounts:
             - name: workdir
               mountPath: /work
+            # pgcopydb's private --dir (SQLite/WAL catalog) on node-local disk,
+            # off Azure Files (SMB cannot satisfy SQLite WAL locking).
+            - name: pgcopydb-scratch
+              mountPath: /pgcopydb
           resources:
             # Holds one idle transaction. Essentially free.
             requests: { cpu: "50m",  memory: "128Mi" }
@@ -105,6 +115,11 @@ spec:
         - name: workdir
           persistentVolumeClaim:
             claimName: pgcyan-workdir
+        # Node-local scratch for pgcopydb's SQLite catalog. Ephemeral is fine:
+        # the holder is non-resumable (a restart == a new snapshot), so nothing
+        # here needs to survive the pod.
+        - name: pgcopydb-scratch
+          emptyDir: {}
 ---
 # Guard against voluntary disruption (node drain / autoscaler) evicting the
 # singleton holder mid-copy.
