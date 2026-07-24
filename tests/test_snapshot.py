@@ -33,8 +33,16 @@ class _FakeCursor:
         self.conn.executed.append(text or "CREATE PUBLICATION")
         if "pg_publication" in text:
             self._result = (1,) if self.conn.pub_exists else None
-        elif "pg_replication_slots" in text:
+        elif "restart_lsn" in text:
             self._result = (self.conn.restart_lsn,) if self.conn.restart_lsn else None
+        elif "pg_drop_replication_slot" in text:
+            self.conn.dropped_slots.append(params[0] if params else None)
+            self._result = None
+        elif "pg_replication_slots" in text:
+            self._result = (
+                (self.conn.slot_active, self.conn.active_pid)
+                if self.conn.slot_exists else None
+            )
         else:
             self._result = None
 
@@ -43,12 +51,18 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self, pub_exists=False, restart_lsn="0/16B3760"):
+    def __init__(self, pub_exists=False, restart_lsn="0/16B3760",
+                 slot_exists=False, slot_active=False, active_pid=4321):
         self.autocommit = False
         self.closed = False
         self.executed = []
         self.pub_exists = pub_exists
         self.restart_lsn = restart_lsn
+        # Stale-slot state used by drop_stale_slot().
+        self.slot_exists = slot_exists
+        self.slot_active = slot_active
+        self.active_pid = active_pid
+        self.dropped_slots = []
 
     def cursor(self):
         return _FakeCursor(self)
@@ -164,6 +178,65 @@ def test_create_publication_idempotent_when_present(tmp_path):
     assert not any("CREATE PUBLICATION" in e for e in conn.executed)
 
 
+# -------------------------------------------------------------- work-dir reset
+
+def test_reset_work_dir_clears_prior_pgcopydb_state(tmp_path):
+    # Simulate a leftover pgcopydb catalog + a stale slot file on the PVC.
+    (tmp_path / "schema").mkdir()
+    (tmp_path / "schema" / "source.db").write_text("stale-catalog")
+    (tmp_path / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).write_text("{}")
+    (tmp_path / PgCyanSnapshot.SNAPSHOT_FILENAME).write_text("STALE\n")
+
+    holder = _make_holder(tmp_path)
+    holder.reset_work_dir()
+
+    assert tmp_path.is_dir()
+    assert not (tmp_path / "schema").exists()
+    assert not (tmp_path / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).exists()
+    assert not (tmp_path / PgCyanSnapshot.SNAPSHOT_FILENAME).exists()
+
+
+def test_reset_work_dir_clears_stale_output_when_output_dir_differs(tmp_path):
+    work = tmp_path / "work"
+    out = tmp_path / "out"
+    work.mkdir()
+    out.mkdir()
+    # A prior run's slot file in a separate output dir would trip the probe.
+    (out / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).write_text("{}")
+
+    holder = _make_holder(work, work_dir=str(work), output_dir=str(out))
+    holder.reset_work_dir()
+
+    assert not (out / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).exists()
+
+
+# ---------------------------------------------------------------- stale slot
+
+def test_drop_stale_slot_noop_when_absent(tmp_path):
+    conn = _FakeConn(slot_exists=False)
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot")
+    holder.conn = conn
+    assert holder.drop_stale_slot() is True
+    assert conn.dropped_slots == []  # nothing to drop
+
+
+def test_drop_stale_slot_drops_inactive_leftover(tmp_path):
+    conn = _FakeConn(slot_exists=True, slot_active=False)
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot")
+    holder.conn = conn
+    assert holder.drop_stale_slot() is True
+    assert conn.dropped_slots == ["pgcyan_slot"]
+
+
+def test_drop_stale_slot_refuses_active_slot(tmp_path):
+    conn = _FakeConn(slot_exists=True, slot_active=True, active_pid=99)
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot")
+    holder.conn = conn
+    assert holder.drop_stale_slot() is False
+    assert conn.dropped_slots == []  # an active slot must NOT be dropped
+    assert any("active" in e for e in holder.errors)
+
+
 # ------------------------------------------------------------------ establish
 
 def test_establish_happy_path(monkeypatch, tmp_path):
@@ -218,6 +291,33 @@ def test_establish_snapshot_early_exit_writes_slot_error(monkeypatch, tmp_path):
     assert (tmp_path / PgCyanSnapshot.SLOT_ERROR_FILENAME).exists()
     # The publication succeeded and was recorded before the slot step failed.
     assert (tmp_path / PgCyanSnapshot.PUBLICATION_OUTPUT_FILENAME).exists()
+
+
+def test_establish_active_slot_writes_slot_error(monkeypatch, tmp_path):
+    # A live slot (another holder / leaked connection) is a hard failure -- we
+    # must not drop it or proceed to CREATE a fresh snapshot on top of it.
+    conn = _FakeConn(slot_exists=True, slot_active=True, active_pid=77)
+    _install_fakes(monkeypatch, tmp_path, conn=conn)
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot")
+    summary = holder.establish()
+    assert summary["status"] == "failure"
+    assert (tmp_path / PgCyanSnapshot.SLOT_ERROR_FILENAME).exists()
+    assert conn.dropped_slots == []
+    # The publication step ran and was recorded before the slot check failed.
+    assert (tmp_path / PgCyanSnapshot.PUBLICATION_OUTPUT_FILENAME).exists()
+
+
+def test_establish_clears_stale_slot_json_before_probe(monkeypatch, tmp_path):
+    # A leftover slot file from a prior run must be gone before the fresh one is
+    # written, so the readiness probe can't pass on stale output.
+    (tmp_path / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).write_text('{"stale": true}')
+    _install_fakes(monkeypatch, tmp_path, snapshot_id="FRESH-1")
+    holder = _make_holder(tmp_path)
+    summary = holder.establish()
+    assert summary["status"] == "success"
+    slot = json.loads((tmp_path / PgCyanSnapshot.SLOT_OUTPUT_FILENAME).read_text())
+    assert slot["status"] == "success"
+    assert "stale" not in slot
 
 
 def test_establish_removes_stale_snapshot_file(monkeypatch, tmp_path):

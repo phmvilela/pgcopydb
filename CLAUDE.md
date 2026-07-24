@@ -147,7 +147,16 @@ snapshot name + captured `consistent_point`) and `source-pg-publication.json`
 (publication name), or matching `*-errors.json` on failure. Publication/slot/
 mode default to the planner's (`PGCYAN_PUBLICATION`/`PGCYAN_SLOT`/
 `PGCYAN_SNAPSHOT_MODE`) and can be overridden from `plan.json` via
-`--plan-file`. The lifecycle splits into `establish()` (create + hold + write
+`--plan-file`. Because the holder is **authoritative and non-resumable** (a
+restart == a brand-new snapshot) and its work dir lives on a **persistent** RWX
+PVC, `establish()` starts from a clean slate: it `reset_work_dir()`s any prior
+run's pgcopydb catalog (a leftover catalog pushes pgcopydb into `--resume` mode,
+which a consistent snapshot cannot use -> `Option --resume requires option
+--not-consistent`) and stale output files (a leftover `source-pg-slot.json`
+would trip the readiness probe early), then `drop_stale_slot()`s any *inactive*
+leftover replication slot (a persistent slot survives a clean prior exit, and a
+fresh consistent snapshot can only be exported at slot creation). An **active**
+slot is a hard failure -- another holder or a leaked connection owns it. The lifecycle splits into `establish()` (create + hold + write
 outputs; returns a summary) and `hold()` (block until SIGTERM/SIGINT, then
 terminate pgcopydb so the replication connection closes -- a graceful pod exit
 leaves **no stale source connection**, per the ticket's PS). This is the node in

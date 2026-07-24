@@ -51,6 +51,7 @@ terminates the pgcopydb child and closes connections.
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -236,6 +237,62 @@ class PgCyanSnapshot:
         """Absolute path pgcopydb writes the exported snapshot id to."""
         return os.path.join(self.work_dir, self.SNAPSHOT_FILENAME)
 
+    # ------------------------------------------------------------- work dir
+
+    def reset_work_dir(self) -> None:
+        """
+        Wipe any state a PRIOR holder left in the work dir before launching.
+
+        The work dir lives on the persistent shared ``/work`` PVC, so a previous
+        run's pgcopydb SQLite catalog and marker files survive here. pgcopydb
+        would then detect that leftover state, implicitly switch to *resume*
+        mode, and -- because a consistent snapshot cannot be resumed -- abort
+        with ``Option --resume requires option --not-consistent`` (issue #23).
+        The holder is authoritative and non-resumable by design (a restart == a
+        brand-new snapshot), so it must always start from a clean dir.
+
+        This also removes any stale ``source-pg-slot.json`` from a prior run,
+        which would otherwise satisfy the readiness probe before *this* run has
+        established its own snapshot. Never raises -- a dir we cannot fully clear
+        is a loud warning, not a hard failure (pgcopydb may still succeed).
+        """
+        try:
+            if os.path.isdir(self.work_dir):
+                for entry in os.listdir(self.work_dir):
+                    path = os.path.join(self.work_dir, entry)
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+            os.makedirs(self.work_dir, exist_ok=True)
+            # If outputs land elsewhere, still clear stale artifacts there so a
+            # prior run's slot file cannot prematurely satisfy the readiness probe.
+            if os.path.abspath(self.output_dir) != os.path.abspath(self.work_dir):
+                for name in (
+                    self.SLOT_OUTPUT_FILENAME, self.PUBLICATION_OUTPUT_FILENAME,
+                    self.SLOT_ERROR_FILENAME, self.PUBLICATION_ERROR_FILENAME,
+                    self.SNAPSHOT_FILENAME,
+                ):
+                    try:
+                        os.remove(os.path.join(self.output_dir, name))
+                    except OSError:
+                        pass
+            self._log_event(
+                "reset_work_dir", "success",
+                "Cleared any prior holder state from the work dir",
+                {"work_dir": self.work_dir},
+            )
+        except OSError as e:
+            self._log_event(
+                "reset_work_dir", "warning",
+                "Could not fully clear the work dir; pgcopydb may enter resume mode",
+                {"work_dir": self.work_dir, "error": str(e),
+                 "remediation": "Ensure the /work PVC is writable and no prior holder still has the dir open"},
+            )
+
     # ------------------------------------------------------------ connection
 
     def connect(self) -> bool:
@@ -333,6 +390,64 @@ class PgCyanSnapshot:
                  "remediation": "The role needs privileges to CREATE PUBLICATION FOR ALL TABLES (superuser/azure_pg_admin)"},
             )
             self.errors.append(f"Publication creation failed: {str(e)}")
+            return False
+
+    # ------------------------------------------------------------------ slot
+
+    def drop_stale_slot(self) -> bool:
+        """
+        Drop a leftover replication slot of the same name before creating a fresh one.
+
+        A logical slot is persistent: a previously successful holder leaves
+        ``slot_name`` on the source even after it exits cleanly. pgcopydb's
+        ``snapshot --follow`` issues ``CREATE_REPLICATION_SLOT``, which would
+        fail ("slot already exists") -- and, more importantly, a slot's
+        *consistent snapshot* is only exported at creation time, so reusing an
+        old slot cannot yield a fresh consistent point. The holder must
+        therefore start from no slot. An *active* slot means another holder (or
+        a leaked connection) still owns it: dropping is impossible and
+        proceeding is unsafe, so that is a hard failure. Returns ``False`` only
+        on a real error; a missing slot is the happy path. Never raises.
+        """
+        if not self.conn:
+            self.errors.append("Cannot check for a stale slot: no source connection")
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = %s",
+                    (self.slot_name,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return True  # nothing to clean up -- the slot name is free
+                active, active_pid = row[0], row[1]
+                if active:
+                    self._log_event(
+                        "drop_stale_slot", "failure",
+                        f"Replication slot {self.slot_name} is still ACTIVE (pid {active_pid})",
+                        {"slot": self.slot_name, "active_pid": active_pid,
+                         "remediation": "Another snapshot holder or a leaked connection owns the slot; fully tear down the prior holder (kubectl delete deploy --wait) before retrying"},
+                    )
+                    self.errors.append(
+                        f"Replication slot {self.slot_name} is active (pid {active_pid}); refusing to drop"
+                    )
+                    return False
+                cur.execute("SELECT pg_drop_replication_slot(%s)", (self.slot_name,))
+            self._log_event(
+                "drop_stale_slot", "success",
+                f"Dropped stale replication slot {self.slot_name} from a prior run",
+                {"slot": self.slot_name},
+            )
+            return True
+        except PgError as e:
+            self._log_event(
+                "drop_stale_slot", "failure",
+                f"Failed to drop the stale replication slot {self.slot_name}",
+                {"slot": self.slot_name, "error": str(e),
+                 "remediation": "Drop it manually once inactive: SELECT pg_drop_replication_slot('<slot>');"},
+            )
+            self.errors.append(f"Failed to drop stale slot: {str(e)}")
             return False
 
     # --------------------------------------------------------------- snapshot
@@ -561,6 +676,12 @@ class PgCyanSnapshot:
             }
         """
         self.load_plan_overrides()
+        # Start from a clean slate: the /work PVC persists across runs, and the
+        # holder is non-resumable by design (a restart == a new snapshot). A
+        # leftover pgcopydb catalog here would push pgcopydb into resume mode and
+        # abort the consistent snapshot (issue #23); a leftover slot file would
+        # trip the readiness probe prematurely.
+        self.reset_work_dir()
         summary = {
             "status": "failure",
             "publication_file": None,
@@ -599,7 +720,18 @@ class PgCyanSnapshot:
                 )
                 return summary
 
-            # 2) Slot + snapshot via pgcopydb, held open by the child.
+            # 2) Free the slot name -- a prior successful holder leaves a
+            # persistent slot behind, and a fresh consistent snapshot needs a
+            # freshly-created slot. Drop any inactive leftover before pgcopydb
+            # issues CREATE_REPLICATION_SLOT.
+            if not self.drop_stale_slot():
+                summary["slot_error_file"] = self._write_json(
+                    self.SLOT_ERROR_FILENAME,
+                    self._build_error(f"Could not free the replication slot {self.slot_name}"),
+                )
+                return summary
+
+            # 3) Slot + snapshot via pgcopydb, held open by the child.
             if not self.start_snapshot():
                 summary["slot_error_file"] = self._write_json(
                     self.SLOT_ERROR_FILENAME,
@@ -617,7 +749,7 @@ class PgCyanSnapshot:
                 )
                 return summary
 
-            # 3) Capture the consistent point, then release our own connection --
+            # 4) Capture the consistent point, then release our own connection --
             # only the pgcopydb child should hold a long-lived connection.
             consistent_point = self.capture_consistent_point()
             self.close_connection()
