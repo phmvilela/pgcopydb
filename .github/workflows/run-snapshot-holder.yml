@@ -191,14 +191,25 @@ jobs:
 
       # Graceful teardown: deleting the Deployment SIGTERMs the pod; the wrapper
       # then SIGTERMs pgcopydb, which closes the replication connection cleanly
-      # within terminationGracePeriodSeconds. --wait blocks until the pod is
-      # actually gone, so a hung shutdown fails the step.
+      # within terminationGracePeriodSeconds (60s). A plain `kubectl delete
+      # deploy --wait` uses the *background* cascade -- it waits only for the
+      # Deployment object, NOT the pod, which then lingers in Terminating for up
+      # to the grace period. Use --cascade=foreground so the delete blocks until
+      # the owned pod is actually gone, then wait explicitly as a belt-and-braces
+      # guard (timeout > the 60s grace period).
       - name: Gracefully shut the holder down
         run: |
           set -euo pipefail
-          kubectl delete deploy/"$DEPLOY" -n "$NS" --wait=true --timeout=120s
+          kubectl delete deploy/"$DEPLOY" -n "$NS" \
+            --cascade=foreground --wait=true --timeout=120s
           kubectl delete pdb/pgcyan-snapshot-holder -n "$NS" --ignore-not-found
-          echo "holder deleted; verifying no pod remains ..."
+          echo "waiting for the holder pod to fully terminate ..."
+          # --for=delete exits non-zero with "no matching resources" if the pod
+          # is already gone -- that's the success case, so tolerate it and let
+          # the assertion below be the real gate.
+          kubectl wait --for=delete pod \
+            -l pgcyan.dev/phase=snapshot-holder -n "$NS" --timeout=90s || true
+          echo "verifying no pod remains ..."
           kubectl get pod -l pgcyan.dev/phase=snapshot-holder -n "$NS" 2>&1 | tee /tmp/pods.txt
           grep -q "No resources found" /tmp/pods.txt \
             || [ -z "$(kubectl get pod -l pgcyan.dev/phase=snapshot-holder -n "$NS" -o name)" ]
