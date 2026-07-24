@@ -127,25 +127,21 @@ change.
   `fk_graph.status: "deferred"` (empty edges); no artifact collects FK edges yet.
   Phase-3b applies all constraints in one non-sharded pass regardless, so this is
   informational once implemented.
-- ~~**Image + secrets**~~ — image built (issue #39, `.github/workflows/publish-image.yml`);
-  every manifest is digest-pinned. Prefer Azure Workload Identity over the
-  example Secret (`10`) still.
-- ~~**No way to sync a fresh digest across every manifest**~~ — done (issue #40
-  follow-up): `deploy/k8s/kustomization.yaml` bundles the directly-appliable
-  manifests with an `images:` override; `publish-image.yml`'s manual-only
-  `deploy` job rewrites the digest there after each publish and applies the
-  00/01/20 cluster prerequisites (never the phase manifests — starting those
-  is a deliberate separate human action).
-- **Self-referential image digest** — the phase manifests (25/30/40/50/60/70/71/80)
-  reference the SAME image whose build bundles them (`Dockerfile` `COPY
-  deploy/k8s/`), so a manifest cannot know its own build's digest at the
-  moment it's baked in — the digest committed/rendered into a manifest is
-  always from a *previous* build. Fine for now (the orchestrator's own default
-  `--manifests-dir` is only a convenience fallback; `kustomization.yaml`'s
-  `images:` override is the actual source of truth for a given deploy), but a
-  cleaner fix would have the orchestrator read manifests from a freshly
-  rendered ConfigMap/volume supplied at run time instead of its own image's
-  bundled copy. Not yet designed.
+- ~~**Image + secrets**~~ — image built (issue #39, `.github/workflows/build.yml`),
+  pushed to the ACR tagged by commit short SHA. Manifests carry an
+  `image: "${PGCYAN_IMAGE}"` placeholder rather than a pinned reference. Prefer
+  Azure Workload Identity over the example Secret (`10`) still.
+- ~~**No way to sync a fresh digest across every manifest**~~ — obsolete: no
+  digest is committed anywhere. The placeholder is filled at apply time —
+  `integration-tests.yml` via `envsubst '${PGCYAN_IMAGE}'`, the orchestrator via
+  its own resolved image — so there is nothing to keep in sync.
+- ~~**Self-referential image digest**~~ — resolved. The phase manifests
+  (25/30/40/50/60/70/71/80) no longer bake in a digest; they carry
+  `${PGCYAN_IMAGE}`. The orchestrator resolves its OWN running image at run time
+  (`PgCyanOrchestrator._resolve_image`: reads its pod spec via the API, or a
+  `PGCYAN_IMAGE` env override) and substitutes it into every phase it launches,
+  so the whole DAG runs on the exact build that started it — no previous-build
+  skew, no ConfigMap-rendering indirection needed.
 
 **Related:** [pgcopydb-and-pgdump-tooling-assessment.md](pgcopydb-and-pgdump-tooling-assessment.md)
 (where custom code earns its keep), [issue-22-migration-stage-assessment.md](issue-22-migration-stage-assessment.md)

@@ -1,9 +1,16 @@
 # kustomization.yaml
 # ---------------------------------------------------------------------------
 # Bundles every directly-appliable (non-template) deploy/k8s manifest so the
-# pgcyan image reference can be pinned to a freshly-published digest in one
-# place instead of hand-editing eight files (issue #40 follow-up: CI deploy,
-# see .github/workflows/publish-image.yml's `deploy` job).
+# whole set can be previewed/applied at once.
+#
+# The pgcyan image is NOT pinned here. Every manifest carries an
+# `image: "${PGCYAN_IMAGE}"` placeholder that is filled at apply time:
+#   * the integration-tests workflow substitutes the commit-short-SHA-tagged
+#     ACR image via `envsubst` before `kubectl apply`, and
+#   * the orchestrator (pg_cyan/orchestrator.py) substitutes its OWN running
+#     image so every phase Job/Deployment it launches matches its tag.
+# `kubectl kustomize deploy/k8s` therefore emits the literal `${PGCYAN_IMAGE}`
+# placeholder -- fill it (envsubst) before applying the rendered output.
 #
 # EXCLUDES:
 #   * 10-secrets.example.yaml -- an EXAMPLE; never apply placeholder secret
@@ -14,21 +21,12 @@
 #   * 60-job-phase2-datashard.template.yaml / 70-job-phase3-index.template.yaml
 #     -- NOT standalone-appliable (contain ${SHARD_NAME}/etc. placeholders the
 #     orchestrator substitutes once per plan.json entry -- see
-#     pg_cyan/orchestrator.py). The orchestrator applies these directly from
-#     this same directory with the image reference AS AUTHORED IN THE FILE,
-#     unaffected by this kustomization's `images:` override below -- see the
-#     "self-referencing image digest" gap noted in
-#     notes/k8s-sharded-migration-topology.md.
+#     pg_cyan/orchestrator.py).
 #
 # Usage:
-#   kubectl kustomize deploy/k8s          # preview the rendered, pinned bundle
-#   kubectl apply -k deploy/k8s           # apply the whole bundle yourself
-#
-# CI's `deploy` job (manual, workflow_dispatch only) rewrites the `images:`
-# digest below to whatever it just published, renders the full bundle as a
-# build artifact for reference, but APPLIES only the 00/01/20 subset
-# (namespace/RBAC/PVC) -- starting the phase -2/-1/... Jobs is a deliberate,
-# separate human action (see the workflow file for the rationale).
+#   kubectl kustomize deploy/k8s          # preview (placeholder image)
+#   PGCYAN_IMAGE=<reg>/pgcyan:<short-sha> \
+#     kubectl kustomize deploy/k8s | envsubst '${PGCYAN_IMAGE}' | kubectl apply -f -
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -42,11 +40,3 @@ resources:
   - 50-deployment-snapshot-holder.yaml
   - 71-job-phase3-fk.yaml
   - 80-deployment-follow-cdc.yaml
-
-# Placeholder digest -- CI's `deploy` job overwrites this line with the digest
-# it just published before rendering (see the workflow's "Pin the published
-# digest" step). Left at the issue-#39 build's digest so `kubectl kustomize`
-# still produces valid, pinned output when run locally without CI.
-images:
-  - name: pgcyanacr.azurecr.io/pgcyan
-    digest: sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a

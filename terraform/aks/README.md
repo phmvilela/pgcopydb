@@ -16,7 +16,7 @@ and is applied independently.
 | **Azure Container Registry** + **AcrPull** to the kubelet identity | Hosts the `REPLACE_ME/pgcyan` image so every Job/Deployment can pull it without imagePullSecrets. |
 | **Log Analytics** + **Container Insights** (`oms_agent`) | Cluster/pod observability for the migration run. |
 | **Azure CNI Overlay** VNet/subnet | Pod IPs come from an overlay CIDR, so heavy concurrent shard fan-out never exhausts the VNet. |
-| **GitHub Actions OIDC identity** (UAMI + federated credential) | Passwordless Azure login for `.github/workflows/publish-image.yml`'s `publish` (ACR push) and `deploy` (AKS sync) jobs — no static credentials in GitHub. |
+| **GitHub Actions OIDC identity** (UAMI + federated credential) | Passwordless Azure login for `.github/workflows/build.yml`'s `publish` (ACR push) and `integration-tests.yml`'s cluster jobs — no static credentials in GitHub. |
 
 ## Prerequisites
 

@@ -40,7 +40,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: pgcopydb-fk
-          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
+          image: "${PGCYAN_IMAGE}"
           # ASSUMPTION: `pgcopydb restore constraints` (post-data, no filter ->
           # whole DB) applies FKs and any remaining table constraints in one
           # coordinated pass. If a single global filter is not desired, run

@@ -37,58 +37,53 @@ Every file carries its assumptions and TODOs as inline comments.
 
 ## The image
 
-Every pod runs one image — `pgcyanacr.azurecr.io/pgcyan:0.1.0`, digest-pinned
-`@sha256:…` for immutability — bundling **pgcopydb**, **kubectl**, and the
-**`pg_cyan` CLI** (issue #39). Build and push it to the ACR that `terraform/aks`
-provisions:
+Every pod runs one image — bundling **pgcopydb**, **kubectl**, and the
+**`pg_cyan` CLI** (issue #39). The manifests do **not** hard-code it: each
+carries an `image: "${PGCYAN_IMAGE}"` placeholder filled at apply time. The
+image is built and pushed to the ACR that `terraform/aks` provisions by
+`.github/workflows/build.yml`, tagged by the **commit short SHA** only (no
+`latest`, no version tag) — so `<acr>.azurecr.io/pgcyan:<short-sha>` ties a
+running pod straight back to its source commit.
+
+Fill the placeholder before applying:
 
 ```sh
-# server-side build in ACR Tasks (no local Docker needed)
-../../scripts/build-and-push-image.sh
+export PGCYAN_IMAGE=pgcyanacr.azurecr.io/pgcyan:$(git rev-parse --short HEAD)
+envsubst '${PGCYAN_IMAGE}' < deploy/k8s/30-job-planner.yaml | kubectl apply -f -
 ```
 
-or let CI do it (`.github/workflows/publish-image.yml`, on a `v*` tag or manual
-dispatch). If your `acr_name` differs from the default `pgcyanacr`, repoint the
-`image:` field in each manifest at your registry's login server (and prefer
-pinning by `@sha256:` digest — the build script and workflow both print it).
+`envsubst '${PGCYAN_IMAGE}'` substitutes **only** that variable, leaving the
+manifests' runtime `$(SNAPSHOT_ID)` / `${RESTORE_JOBS}` refs untouched. When the
+**orchestrator** applies the phase manifests, it fills the same placeholder with
+its *own* running image (resolved from its pod spec), so every Job/Deployment it
+launches shares its exact build. If your `acr_name` differs from the default
+`pgcyanacr`, just set `PGCYAN_IMAGE` to your registry's login server.
 
-## Pinning the digest across every manifest at once
+## Previewing / applying the whole bundle
 
 `kustomization.yaml` bundles the directly-appliable manifests (everything
 except the example Secret, the two generated ConfigMap stubs, and the two
-non-standalone `.template.yaml` files — see the comments in that file) with an
-`images:` override, so a fresh digest only needs to be set in **one** place:
+non-standalone `.template.yaml` files — see the comments in that file):
 
 ```sh
-kubectl kustomize deploy/k8s              # preview the rendered, pinned bundle
-kubectl apply -k deploy/k8s               # apply the whole bundle yourself
+kubectl kustomize deploy/k8s                                 # preview (placeholder image)
+PGCYAN_IMAGE=pgcyanacr.azurecr.io/pgcyan:$(git rev-parse --short HEAD) \
+  kubectl kustomize deploy/k8s | envsubst '${PGCYAN_IMAGE}' | kubectl apply -f -
 ```
-
-CI's `deploy` job in `publish-image.yml` (manual-only —
-`workflow_dispatch` with `deploy_to_cluster: true`) does this automatically
-after a successful publish: it rewrites the `digest:` in `kustomization.yaml`
-to the image it just pushed, uploads the fully rendered bundle as a build
-artifact, but **applies only `00-namespace.yaml` / `01-rbac.yaml` /
-`20-pvc-workdir.yaml`** — the cluster-scoped prerequisites the orchestrator
-already assumes exist. It deliberately does not apply the phase manifests or
-start the orchestrator itself; that starts a real migration run against real
-databases, and stays a separate, deliberate action a human takes (e.g. the
-`kubectl run ... -- python -m pg_cyan.cli orchestrate` one-liner printed in
-that job's summary). See the workflow file's header comment for the Azure
-role assignment and `AKS_RESOURCE_GROUP` / `AKS_CLUSTER_NAME` repo variables
-it needs.
 
 ## Running just the planning phases end-to-end
 
 To execute the **planning half only** — the phase −2 collector (`25`) and the
 phase −1 planner (`30`), producing the `pgcyan-plan` ConfigMap without moving
-any data — use the manual `.github/workflows/run-planner.yml` workflow (issue
-#50). It logs in to the cluster (OIDC), materializes the source-DB
-`pgcyan-source-pg` Secret from GitHub secrets, applies jobs `25` then `30` with
-a completion barrier between them, and uploads `plan.json` + both Jobs' logs as
-a build artifact. A source with any large object correctly fails the planner
-(LOB abort gate) with no plan written. The cluster itself is provisioned from
-`terraform/aks` by a human running `terraform apply` (Azure Cloud Shell or
-local — it needs Owner-level rights, so it is not a CI action; the companion
-`.github/workflows/terraform-aks.yml` only `fmt`/`validate`s the module). See
-each workflow's header for the required repo secrets/variables.
+any data — use the `planner` job of the manual
+`.github/workflows/integration-tests.yml` workflow (issue #50). It logs in to
+the cluster (OIDC), materializes the source-DB `pgcyan-source-pg` Secret from
+GitHub secrets, fills `${PGCYAN_IMAGE}` with the commit-short-SHA image, applies
+jobs `25` then `30` with a completion barrier between them, and uploads
+`plan.json` + both Jobs' logs as a build artifact. A source with any large
+object correctly fails the planner (LOB abort gate) with no plan written. That
+same workflow's `snapshot-holder` job exercises phase 1. The cluster itself is
+provisioned from `terraform/aks` by a human running `terraform apply` (Azure
+Cloud Shell or local — it needs Owner-level rights, so it is not a CI action;
+the companion `.github/workflows/terraform-aks.yml` only `fmt`/`validate`s the
+module). See each workflow's header for the required repo secrets/variables.

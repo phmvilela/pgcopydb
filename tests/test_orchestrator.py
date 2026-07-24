@@ -92,15 +92,33 @@ class FakePolicyApi:
         self.created.append((namespace, body["metadata"]["name"], body))
 
 
+#: The image every test expects phase pods to be stamped with. An autouse
+#: fixture below exports it as PGCYAN_IMAGE so `_resolve_image` uses the
+#: override and never has to read a pod -- keeping the existing fakes pod-free.
+TEST_IMAGE = "test-registry.example.io/pgcyan:testsha"
+
+
+@pytest.fixture(autouse=True)
+def _pgcyan_image_env(monkeypatch):
+    monkeypatch.setenv("PGCYAN_IMAGE", TEST_IMAGE)
+
+
 class FakeCoreApi:
-    def __init__(self, plan=None, missing=False):
+    def __init__(self, plan=None, missing=False, pod_containers=None):
         self._plan = plan
         self._missing = missing
+        #: list of (name, image) tuples for read_namespaced_pod, used by the
+        #: image-resolution tests that clear the PGCYAN_IMAGE override.
+        self._pod_containers = pod_containers or [("orchestrator", TEST_IMAGE)]
 
     def read_namespaced_config_map(self, name, namespace):
         if self._missing:
             raise ApiException(status=404, reason="NotFound")
         return _Obj(data={"plan.json": json.dumps(self._plan)})
+
+    def read_namespaced_pod(self, name, namespace):
+        containers = [_Obj(name=n, image=img) for n, img in self._pod_containers]
+        return _Obj(spec=_Obj(containers=containers))
 
 
 SAMPLE_PLAN = {
@@ -193,6 +211,63 @@ def test_load_phase_manifests_templated_phase_requires_plan_entries():
     phase = dict(PgCyanOrchestrator.PHASES[3])
     with pytest.raises(OrchestratorError, match="data_shards"):
         orch._load_phase_manifests(phase, plan={"data_shards": []})
+
+
+# ----------------------------------------------------------- image handling
+
+def _container_image(doc):
+    return doc["spec"]["template"]["spec"]["containers"][0]["image"]
+
+
+def test_static_manifest_image_placeholder_filled_runtime_vars_preserved():
+    """${PGCYAN_IMAGE} is stamped with the resolved image; ${RESTORE_JOBS} and
+    $(SNAPSHOT_ID) -- runtime shell/env refs -- must survive untouched."""
+    orch = make_orchestrator()
+    fk = orch._load_phase_manifests(
+        {"id": "3b", "name": "fk", "manifest": "71-job-phase3-fk.yaml"}, plan=None
+    )[0]
+    assert _container_image(fk) == TEST_IMAGE
+    assert "${RESTORE_JOBS}" in yaml.safe_dump(fk)  # runtime shell var preserved
+
+    predata = orch._load_phase_manifests(
+        {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"}, plan=None
+    )[0]
+    assert _container_image(predata) == TEST_IMAGE
+    assert "$(SNAPSHOT_ID)" in yaml.safe_dump(predata)  # k8s env ref preserved
+
+
+def test_templated_manifest_image_placeholder_filled():
+    orch = make_orchestrator()
+    phase = dict(PgCyanOrchestrator.PHASES[3])  # data-shards
+    docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
+    for doc in docs:
+        assert _container_image(doc) == TEST_IMAGE
+    assert "${" not in yaml.safe_dump(docs[0])  # no leftover placeholders
+
+
+def test_resolve_image_env_override_wins():
+    orch = make_orchestrator()
+    assert orch._resolve_image() == TEST_IMAGE  # from the autouse fixture
+
+
+def test_resolve_image_reads_own_pod(monkeypatch):
+    monkeypatch.delenv("PGCYAN_IMAGE", raising=False)
+    monkeypatch.setattr("pg_cyan.orchestrator.socket.gethostname", lambda: "pgcyan-orch-xyz")
+    core_api = FakeCoreApi(pod_containers=[("orchestrator", "acr.io/pgcyan:deadbee")])
+    orch = make_orchestrator(core_api=core_api)
+    assert orch._resolve_image() == "acr.io/pgcyan:deadbee"
+
+
+def test_resolve_image_pod_read_failure_raises(monkeypatch):
+    monkeypatch.delenv("PGCYAN_IMAGE", raising=False)
+
+    class ExplodingPodCoreApi(FakeCoreApi):
+        def read_namespaced_pod(self, name, namespace):
+            raise ApiException(status=404, reason="NotFound")
+
+    orch = make_orchestrator(core_api=ExplodingPodCoreApi())
+    with pytest.raises(OrchestratorError, match="resolve the image"):
+        orch._resolve_image()
 
 
 # ------------------------------------------------------------------- apply

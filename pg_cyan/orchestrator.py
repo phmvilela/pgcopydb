@@ -61,6 +61,7 @@ import json
 import logging
 import os
 import re
+import socket
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -121,6 +122,13 @@ class PgCyanOrchestrator:
     PLAN_KEY = "plan.json"
     DEFAULT_POLL_INTERVAL = 5
     DEFAULT_JOB_TIMEOUT = 3600
+    #: Placeholder every manifest carries in place of a concrete image; the
+    #: orchestrator fills it with its OWN running image so every phase pod it
+    #: launches matches its tag (issue: single image per migration run).
+    IMAGE_PLACEHOLDER = "PGCYAN_IMAGE"
+    IMAGE_TOKEN = "${" + IMAGE_PLACEHOLDER + "}"
+    #: Container names that identify the pgcyan app container in the pod spec.
+    IMAGE_CONTAINER_NAMES = ("orchestrator", "pgcyan-orchestrator", "pgcyan")
 
     #: The DAG, in apply order. Static phases carry "manifest"; templated
     #: phases (stamped out once per plan.json entry) carry "template" +
@@ -173,6 +181,9 @@ class PgCyanOrchestrator:
         self.plan_configmap = plan_configmap
         self.poll_interval = poll_interval
         self.job_timeout = job_timeout
+        #: The image every phase Job/Deployment runs -- the orchestrator's OWN
+        #: image, resolved lazily on first use (see _resolve_image).
+        self._image: Optional[str] = None
 
         if None in (batch_api, apps_api, policy_api, core_api):
             self._load_kube_credentials(in_cluster)
@@ -202,6 +213,72 @@ class PgCyanOrchestrator:
             "details": details or {},
         }
         logger.info(json.dumps(event, default=str))
+
+    # -------------------------------------------------------------- own image
+
+    def _resolve_image(self) -> str:
+        """
+        Resolve the image every phase pod should run: the orchestrator's OWN.
+
+        Honours a ``PGCYAN_IMAGE`` env override (handy for local/dev runs);
+        otherwise reads the orchestrator's own pod -- its name is the pod
+        hostname in-cluster (``socket.gethostname()``) -- and returns the
+        pgcyan app container's image. Reusing the orchestrator's exact image
+        keeps a migration run on a single, self-consistent build (the same
+        commit-short-SHA tag it was launched with). Cached after the first call.
+        """
+        if self._image is not None:
+            return self._image
+
+        override = os.getenv("PGCYAN_IMAGE")
+        if override:
+            self._image = override
+            return override
+
+        pod_name = socket.gethostname()
+        try:
+            pod = self.core_api.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+        except ApiException as e:
+            raise OrchestratorError(
+                f"Could not read own pod '{pod_name}' to resolve the image "
+                f"(set PGCYAN_IMAGE to override): {e.reason or e}"
+            ) from e
+
+        containers = (pod.spec.containers if pod.spec else None) or []
+        image = next(
+            (c.image for c in containers if c.name in self.IMAGE_CONTAINER_NAMES),
+            None,
+        )
+        if image is None and containers:
+            image = containers[0].image
+        if not image:
+            raise OrchestratorError(
+                f"Own pod '{pod_name}' has no resolvable container image "
+                "(set PGCYAN_IMAGE to override)"
+            )
+        self._image = image
+        return image
+
+    def _substitute_image(self, value):
+        """Non-strict, targeted replace of only the ``${PGCYAN_IMAGE}`` token.
+
+        Unlike the strict ``_substitute`` used for template placeholders, this
+        leaves every OTHER ``${...}``/``$(...)`` intact -- static manifests
+        carry runtime shell/env references (``${RESTORE_JOBS}``,
+        ``$(SNAPSHOT_ID)``) that must survive to the applied object untouched.
+        """
+        image = self._resolve_image()
+
+        def _walk(node):
+            if isinstance(node, str):
+                return node.replace(self.IMAGE_TOKEN, image)
+            if isinstance(node, list):
+                return [_walk(item) for item in node]
+            if isinstance(node, dict):
+                return {key: _walk(item) for key, item in node.items()}
+            return node
+
+        return _walk(value)
 
     # ------------------------------------------------------------ manifests
 
@@ -253,13 +330,23 @@ class PgCyanOrchestrator:
                     f"{phase['id']} ({phase['name']})"
                 )
             template_text = self._read_manifest_file(phase["template"])
-            return [self._render_yaml(template_text, phase["substitutions"](entry)) for entry in entries]
+            image = self._resolve_image()
+            docs = []
+            for entry in entries:
+                subs = dict(phase["substitutions"](entry))
+                subs[self.IMAGE_PLACEHOLDER] = image  # let strict _substitute fill the image too
+                docs.append(self._render_yaml(template_text, subs))
+            return docs
 
         text = self._read_manifest_file(phase["manifest"])
         try:
-            return [doc for doc in yaml.safe_load_all(text) if doc]
+            docs = [doc for doc in yaml.safe_load_all(text) if doc]
         except yaml.YAMLError as e:
             raise OrchestratorError(f"{phase['manifest']} is not valid YAML: {e}") from e
+        # Static manifests aren't run through the strict template substitution
+        # (they carry runtime ${RESTORE_JOBS}/$(SNAPSHOT_ID) that must survive);
+        # fill only the image placeholder here.
+        return [self._substitute_image(doc) for doc in docs]
 
     # ---------------------------------------------------------------- apply
 

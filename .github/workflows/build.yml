@@ -1,0 +1,133 @@
+name: Build
+
+# Builds the single migration image (pgcopydb + kubectl + pg_cyan CLI) that
+# backs every deploy/k8s/ pod (issue #39), and publishes it to the ACR tagged by
+# the COMMIT SHORT SHA -- the one identifier that ties an image back to its exact
+# source. No `latest`, no version tag: integration-tests.yml picks the image up
+# by that same short SHA, and the k8s manifests carry an `image: "${PGCYAN_IMAGE}"`
+# placeholder filled at apply time (never a concrete digest committed to git).
+#
+#   build-verify : builds the image and runs the issue-#39 acceptance commands
+#                  (`pgcopydb --version`, `python -m pg_cyan.cli --help`,
+#                  `kubectl version --client`). Runs on every push/PR -- no Azure
+#                  needed. Proof the image actually runs.
+#   publish      : pushes `pgcyan:<short-sha>` to the ACR via passwordless OIDC.
+#                  Runs on push to main + manual dispatch, only if the Azure
+#                  secrets are configured. No deploy step -- applying anything to
+#                  a cluster is integration-tests.yml's / a human's job.
+#
+# The Azure identity `publish` logs in as is provisioned by terraform/aks (a
+# UAMI + federated credential whose subject is the fixed
+# `repo:<org>/<repo>:environment:azure` -- hence `environment: azure` below).
+# `terraform apply` grants it Contributor scoped to the ACR (needed for
+# `az acr build`'s server-side ACR Tasks run -- the built-in AcrPush role does
+# NOT cover Microsoft.ContainerRegistry/registries/scheduleRun/action). After
+# `terraform apply`, set repo secrets AZURE_CLIENT_ID / AZURE_TENANT_ID /
+# AZURE_SUBSCRIPTION_ID and repo variable ACR_NAME (if it differs from the
+# default `pgcyanacr`) -- see terraform/aks/README.md step 6.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "requirements.txt"
+      - "pg_cyan/**"
+      - ".github/workflows/build.yml"
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # OIDC token for azure/login (publish job)
+  contents: read
+
+jobs:
+  build-verify:
+    name: Build image and run acceptance checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load into local Docker)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: pgcyan:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Issue #39 acceptance criteria, executed against the built image.
+      - name: Acceptance -- pgcopydb --version
+        run: docker run --rm pgcyan:ci pgcopydb --version
+
+      - name: Acceptance -- pg_cyan CLI help
+        run: docker run --rm pgcyan:ci python -m pg_cyan.cli --help
+
+      - name: Acceptance -- kubectl present (planner publishes the plan CM)
+        run: docker run --rm pgcyan:ci kubectl version --client
+
+  publish:
+    name: Publish to ACR (tagged by short SHA)
+    runs-on: ubuntu-latest
+    needs: build-verify
+    # Only when we actually intend to publish and the Azure identity is wired up.
+    if: >-
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    # `environment:` sets the OIDC subject to the fixed `environment:azure` the
+    # federated credential trusts (Azure requires an EXACT subject match).
+    environment: azure
+    env:
+      ACR_NAME: ${{ vars.ACR_NAME || 'pgcyanacr' }}
+      IMAGE_REPO: pgcyan
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag (commit short SHA)
+        id: tag
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Guard -- require Azure identity secrets
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        run: |
+          if [ -z "${AZURE_CLIENT_ID}" ]; then
+            echo "::error::AZURE_CLIENT_ID not set -- configure the OIDC/ACR secrets before publishing (see workflow header)."
+            exit 1
+          fi
+
+      - name: Azure login (OIDC, passwordless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push image (ACR Tasks), tagged by short SHA only
+        run: |
+          az acr build \
+            --registry "${ACR_NAME}" \
+            --image "${IMAGE_REPO}:${{ steps.tag.outputs.short_sha }}" \
+            --file Dockerfile \
+            .
+
+      - name: Report pushed image
+        run: |
+          login_server="$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)"
+          digest="$(az acr repository show --name "${ACR_NAME}" \
+            --image "${IMAGE_REPO}:${{ steps.tag.outputs.short_sha }}" --query digest -o tsv)"
+          {
+            echo "### pgcyan image published"
+            echo
+            echo "- tag: \`${login_server}/${IMAGE_REPO}:${{ steps.tag.outputs.short_sha }}\`"
+            echo "- digest: \`${login_server}/${IMAGE_REPO}@${digest}\`"
+            echo
+            echo "Dispatch **Integration tests** for this same commit to exercise it on the cluster."
+          } >> "$GITHUB_STEP_SUMMARY"

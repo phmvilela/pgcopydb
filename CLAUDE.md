@@ -174,12 +174,12 @@ terminate pgcopydb so the replication connection closes -- a graceful pod exit
 leaves **no stale source connection**, per the ticket's PS). This is the node in
 `deploy/k8s/50-deployment-snapshot-holder.yaml`; its readiness probe gates on
 `source-pg-slot.json`, so a ready replica means the snapshot is fully
-established. Because it is a Deployment (not a Job), its integration test is a
-`workflow_dispatch` workflow (`.github/workflows/run-snapshot-holder.yml`,
-modelled on `run-planner.yml`) that applies the holder, waits for the pod to be
-Ready, asserts the outputs are visible on `/work`, then tears it down gracefully
-and checks the clean-shutdown log line -- rather than a `tests/integration`
-pytest.
+established. Because it is a Deployment (not a Job), its integration test is the
+`snapshot-holder` job of the manual `workflow_dispatch` workflow
+(`.github/workflows/integration-tests.yml`) that applies the holder, waits for
+the pod to be Ready, asserts the outputs are visible on `/work`, then tears it
+down gracefully and checks the clean-shutdown log line -- rather than a
+`tests/integration` pytest.
 
 `orchestrate` (`pg_cyan/orchestrator.py`, `PgCyanOrchestrator`) is the
 **migration DAG orchestrator** (issue #40) -- the `deploy/k8s/` manifests are
@@ -231,17 +231,36 @@ the input-collector phase -2 (`25-job-collect-inputs.yaml`).
   orchestrator against a live server (connection settings from `PG_SOURCE_*`
   env vars, same as `collect_metrics_from_env` /
   `export_parameters_from_env`) and asserts only the *shape* of the output --
-  every documented field is present -- never specific values. It's driven
-  manually via the `workflow_dispatch`-only
-  `.github/workflows/integration-pre-migration.yml`, which reads connection
-  details configured on GitHub -- credentials (`PG_SOURCE_USER`/
-  `PG_SOURCE_PASSWORD`) as repo Secrets, everything else (`PG_SOURCE_HOST`/
-  `PG_SOURCE_PORT`/`PG_SOURCE_DATABASE`) as plain repo Variables -- and
-  uploads the produced JSON files as a build artifact for a human to
-  eyeball. Follow this pattern (single integration test file per stage
-  addition, env-var config, secrets only for credentials,
-  field-presence-only assertions, `workflow_dispatch` + artifact upload) for
-  future stages.
+  every documented field is present -- never specific values. **No workflow
+  currently drives this pytest file** (the old `integration-pre-migration.yml`
+  was retired when the workflows were consolidated); run it manually with
+  `PG_SOURCE_*` set, or rely on the cluster-side phase -2 collector Job that
+  `.github/workflows/integration-tests.yml` exercises for CI coverage of a real
+  source DB. Keep the file's conventions (env-var config, secrets only for
+  credentials, field-presence-only assertions) for future stages.
+
+## CI / workflows
+
+Exactly **four** GitHub workflows, each with one clear job (issue #50 cleanup):
+
+- `.github/workflows/unit-tests.yml` -- the DB-free pytest suite, on push/PR.
+- `.github/workflows/build.yml` -- builds the image and (on push to main /
+  manual dispatch) publishes it to the ACR tagged by the **commit short SHA**
+  only (no `latest`, no version tag). No deploy step.
+- `.github/workflows/integration-tests.yml` -- manual (`workflow_dispatch`)
+  cluster-backed tests: a `planner` job (phase -2 -> -1) and a
+  `snapshot-holder` job (phase 1). Add later phases here as they land.
+- `.github/workflows/terraform-aks.yml` -- `terraform fmt`/`validate` for the
+  AKS module.
+
+**Image reference convention:** the `deploy/k8s` manifests carry
+`image: "${PGCYAN_IMAGE}"`, NOT a concrete image. It is filled at apply time:
+`integration-tests.yml` substitutes `<acr>.azurecr.io/pgcyan:<short-sha>` with
+`envsubst '${PGCYAN_IMAGE}'` (which leaves runtime `$(SNAPSHOT_ID)` /
+`${RESTORE_JOBS}` refs untouched), and the orchestrator substitutes its OWN
+running image (resolved from its pod spec via `_resolve_image`) so every phase
+Job/Deployment it launches shares its exact build. Never commit a concrete
+image or digest to the manifests or `kustomization.yaml`.
 
 ## Style
 

@@ -39,7 +39,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: pgcopydb-index
-          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
+          image: "${PGCYAN_IMAGE}"
           # Build secondary indexes (and the unique indexes backing PK/UK) for
           # this shard's tables. FKs are handled separately in 71 because they
           # cross shard boundaries.

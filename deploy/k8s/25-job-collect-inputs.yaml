@@ -44,7 +44,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: collector
-          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
+          image: "${PGCYAN_IMAGE}"
           # Collect metrics + large-object count into a scratch dir, then publish
           # the two required planner inputs into the pgcyan-planner-inputs
           # ConfigMap. If either collector fails it exits non-zero here and the

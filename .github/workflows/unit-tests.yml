@@ -1,4 +1,8 @@
-name: CI
+name: Unit tests
+
+# The fast, DB-free unit suite (pytest). `addopts` in pyproject.toml deselects
+# the `integration` marker, so nothing here touches a real database or cluster --
+# the live/k8s checks live in integration-tests.yml (manual only).
 
 on:
   pull_request:
@@ -8,8 +12,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
-    name: Test (Python 3.11)
+  unit-tests:
+    name: Unit tests (Python 3.11)
     runs-on: ubuntu-latest
 
     steps:
@@ -28,5 +32,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run test suite
+      - name: Run unit test suite
         run: python -m pytest

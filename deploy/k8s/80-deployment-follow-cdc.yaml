@@ -39,7 +39,7 @@ spec:
       serviceAccountName: pgcyan-worker
       containers:
         - name: pgcopydb-follow
-          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
+          image: "${PGCYAN_IMAGE}"
           # `follow` resumes from the slot; --resume lets a restarted pod pick up
           # where the previous one left off (slot LSN is server-side, durable).
           command: ["pgcopydb", "follow"]

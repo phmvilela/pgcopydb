@@ -44,9 +44,13 @@ spec:
       containers:
         - name: planner
           # Bundles the planner CLI + pgcopydb + kubectl (built by the repo
-          # Dockerfile, pushed to ACR -- see .github/workflows/publish-image.yml).
-          # Repoint to your ACR login server if acr_name differs from the default.
-          image: "pgcyanacr.azurecr.io/pgcyan:0.1.0@sha256:a348ba7ddb6eedf0658f4b9bee9312eee128085f9de7896da8a0b89835b2940a"
+          # Dockerfile, pushed to ACR -- see .github/workflows/build.yml).
+          # ${PGCYAN_IMAGE} is a placeholder filled at apply time: the
+          # integration-tests workflow substitutes the commit-short-SHA-tagged
+          # ACR image (envsubst), and the orchestrator substitutes its OWN
+          # running image so every phase pod matches it. Never commit a concrete
+          # value here.
+          image: "${PGCYAN_IMAGE}"
           # Run the planner into a scratch dir, then publish plan.json +
           # shard-<n>.filters into the pgcyan-plan ConfigMap. If the LOB abort
           # gate fires, `plan` exits non-zero here and the Job fails without

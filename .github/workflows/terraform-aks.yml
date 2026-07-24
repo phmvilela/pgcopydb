@@ -14,7 +14,7 @@ name: "Terraform: AKS cluster (validate)"
 # Contributor to CRUD every resource PLUS User Access Administrator to create the
 # role assignments (Microsoft.Authorization/roleAssignments/write), i.e.
 # effectively Owner at subscription scope. The federated CI identity is
-# deliberately narrow (ACR Contributor + AKS Cluster User, for publish-image.yml)
+# deliberately narrow (ACR Contributor + AKS Cluster User, for build.yml)
 # and must stay that way, so provisioning is NOT run from CI.
 #
 # Instead, apply is a deliberate human action from Azure Cloud Shell (or local),
@@ -25,8 +25,8 @@ name: "Terraform: AKS cluster (validate)"
 #     cd aks && terraform init -backend-config=backend.hcl && terraform apply
 #
 # then set the GitHub repo secrets/vars from its outputs (terraform/aks/README.md
-# step 6 + publish-image.yml's header) so the image publish/deploy workflows and
-# run-planner.yml can run. See terraform/aks/README.md for the full runbook.
+# step 6 + build.yml's header) so the image build/publish workflow and
+# integration-tests.yml can run. See terraform/aks/README.md for the full runbook.
 
 on:
   workflow_dispatch:
