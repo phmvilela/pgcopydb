@@ -28,8 +28,12 @@ _SLOT`` SQL: the slot + snapshot are created and held by ``pgcopydb snapshot
 writes the snapshot id to ``<work-dir>/snapshot`` on the shared RWX ``/work``
 volume (``20-pvc-workdir.yaml``) and closes the replication connection cleanly
 when signalled -- so a graceful pod exit leaves no stale connection behind.
-pgcopydb's ``snapshot`` path does **not** manage the publication, so the holder
-creates that itself (a single ``CREATE PUBLICATION``, not the discouraged
+the holder creates its own publication ``FOR ALL TABLES``. Separately, pgcopydb's
+``snapshot --follow --plugin pgoutput`` auto-manages a publication of its OWN,
+named after the slot (``snapshot`` has no ``--publication`` flag) and created
+with a non-idempotent ``CREATE PUBLICATION``; ``drop_stale_publication`` clears
+any leftover of that name from a prior partial run so pgcopydb can recreate it.
+The holder's own publication is a single ``CREATE PUBLICATION``, not the discouraged
 hand-rolled slot SQL) before starting the child.
 
 This node does NOT create or advance any replication origin -- that is the
@@ -369,9 +373,12 @@ class PgCyanSnapshot:
         """
         Create the publication ``FOR ALL TABLES`` (idempotent).
 
-        pgcopydb's ``snapshot`` path does not manage the publication, so the
-        holder owns it. Re-running against an existing publication of the same
-        name is a success (the migration is resumable). Identifiers are composed
+        This is the holder's own publication (``publication_name``); it is
+        distinct from the slot-named publication pgcopydb auto-manages for its
+        pgoutput slot (see ``drop_stale_publication`` /
+        ``build_pgcopydb_command``). Re-running against an existing publication of
+        the same name is a success (the migration is resumable).
+        Identifiers are composed
         with ``psycopg2.sql`` -- never f-stringed into SQL. Returns ``False`` on
         any DB error (a ``source-pg-publication-errors.json`` is written by the
         caller).
@@ -474,6 +481,47 @@ class PgCyanSnapshot:
             self.errors.append(f"Failed to drop stale slot: {str(e)}")
             return False
 
+    def drop_stale_publication(self) -> bool:
+        """
+        Drop pgcopydb's auto-managed, slot-named publication before pgcopydb runs.
+
+        With ``--plugin pgoutput`` and no ``--publication`` flag (``snapshot`` has
+        none), pgcopydb derives the publication name from the slot name and
+        creates it with a plain, **non-idempotent** ``CREATE PUBLICATION``
+        (pgcopydb ``cli_common.c`` / ``snapshot.c``). A leftover of that name from
+        a prior partial run makes pgcopydb abort with ``Failed to create
+        publication "<slot>"``. ``DROP PUBLICATION IF EXISTS`` clears it so the
+        auto-create succeeds on every run -- this drops the *slot-named*
+        publication, NOT the holder's own ``publication_name``. Never raises;
+        returns ``False`` only on a real DB error (a missing publication is the
+        happy path -- ``IF EXISTS`` makes it a no-op).
+        """
+        if not self.conn:
+            self.errors.append("Cannot drop the stale publication: no source connection")
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("DROP PUBLICATION IF EXISTS {}").format(
+                        sql.Identifier(self.slot_name)
+                    )
+                )
+            self._log_event(
+                "drop_stale_publication", "success",
+                f"Cleared any leftover pgcopydb-managed publication {self.slot_name}",
+                {"publication": self.slot_name},
+            )
+            return True
+        except PgError as e:
+            self._log_event(
+                "drop_stale_publication", "failure",
+                f"Failed to drop the stale publication {self.slot_name}",
+                {"publication": self.slot_name, "error": str(e),
+                 "remediation": "Drop it manually: DROP PUBLICATION IF EXISTS \"<slot>\";"},
+            )
+            self.errors.append(f"Failed to drop stale publication: {str(e)}")
+            return False
+
     # --------------------------------------------------------------- snapshot
 
     def build_pgcopydb_command(self) -> List[str]:
@@ -485,6 +533,15 @@ class PgCyanSnapshot:
         than a plain ``pg_export_snapshot()`` -- the WAL is reserved so the slot
         can decode from exactly the snapshot's point. It then holds the
         connection open until signalled.
+
+        NB: ``pgcopydb snapshot`` has **no** ``--publication`` option (only
+        ``clone``/``follow`` do). With ``--plugin pgoutput`` and no publication
+        given, pgcopydb auto-manages a publication whose name it derives from the
+        SLOT name (``cli_common.c``: ``publicationName = slotName``) and creates
+        it with a plain, non-idempotent ``CREATE PUBLICATION`` (``snapshot.c`` ->
+        ``pgsql_create_publication``). A leftover publication of that name from a
+        prior partial run makes that CREATE fail (``Failed to create publication
+        "<slot>"``); ``drop_stale_publication`` clears it first.
         """
         cmd = [
             self.pgcopydb_bin, "snapshot",
@@ -787,6 +844,17 @@ class PgCyanSnapshot:
                 summary["slot_error_file"] = self._write_json(
                     self.SLOT_ERROR_FILENAME,
                     self._build_error(f"Could not free the replication slot {self.slot_name}"),
+                )
+                return summary
+
+            # 2b) Free the slot-NAMED publication pgcopydb auto-creates. Its
+            # CREATE is non-idempotent, so a leftover from a prior partial run
+            # would make `pgcopydb snapshot --follow` abort ("Failed to create
+            # publication"). Distinct from the holder's own publication above.
+            if not self.drop_stale_publication():
+                summary["slot_error_file"] = self._write_json(
+                    self.SLOT_ERROR_FILENAME,
+                    self._build_error(f"Could not free the pgcopydb publication {self.slot_name}"),
                 )
                 return summary
 

@@ -9,6 +9,7 @@ and the graceful-shutdown / no-stale-child behaviour.
 """
 import json
 
+import psycopg2
 import pytest
 
 from pg_cyan import snapshot as snapshot_module
@@ -29,8 +30,13 @@ class _FakeCursor:
         return False
 
     def execute(self, query, params=None):
-        text = query if isinstance(query, str) else ""
-        self.conn.executed.append(text or "CREATE PUBLICATION")
+        # psycopg2.sql.Composed (CREATE/DROP PUBLICATION) isn't a str; repr keeps
+        # the literal SQL text ("CREATE PUBLICATION ...", "DROP PUBLICATION ...")
+        # so tests can substring-match what was issued.
+        text = query if isinstance(query, str) else repr(query)
+        if self.conn.raise_on_drop_pub and "DROP PUBLICATION" in text:
+            raise psycopg2.Error("boom dropping publication")
+        self.conn.executed.append(text)
         if "pg_publication" in text:
             self._result = (1,) if self.conn.pub_exists else None
         elif "restart_lsn" in text:
@@ -52,11 +58,14 @@ class _FakeCursor:
 
 class _FakeConn:
     def __init__(self, pub_exists=False, restart_lsn="0/16B3760",
-                 slot_exists=False, slot_active=False, active_pid=4321):
+                 slot_exists=False, slot_active=False, active_pid=4321,
+                 raise_on_drop_pub=False):
         self.autocommit = False
         self.closed = False
         self.executed = []
         self.pub_exists = pub_exists
+        # drop_stale_publication() error injection.
+        self.raise_on_drop_pub = raise_on_drop_pub
         self.restart_lsn = restart_lsn
         # Stale-slot state used by drop_stale_slot().
         self.slot_exists = slot_exists
@@ -149,12 +158,16 @@ def test_load_plan_overrides_missing_file_keeps_defaults(tmp_path):
 # ------------------------------------------------------------ command building
 
 def test_build_pgcopydb_command_has_follow_plugin_slot_dir(tmp_path):
-    holder = _make_holder(tmp_path, slot_name="s", plugin="pgoutput")
+    holder = _make_holder(tmp_path, slot_name="s", plugin="pgoutput", publication_name="p")
     cmd = holder.build_pgcopydb_command()
     assert cmd[:2] == ["pgcopydb", "snapshot"]
     assert "--follow" in cmd
     assert cmd[cmd.index("--plugin") + 1] == "pgoutput"
     assert cmd[cmd.index("--slot-name") + 1] == "s"
+    # `pgcopydb snapshot` has NO --publication option (only clone/follow do);
+    # passing it makes pgcopydb print usage and exit. drop_stale_publication
+    # handles the slot-named publication pgcopydb auto-creates instead.
+    assert "--publication" not in cmd
     assert cmd[cmd.index("--dir") + 1] == str(tmp_path)
     assert cmd[cmd.index("--source") + 1] == "postgres://u@h:5432/db"
 
@@ -274,6 +287,30 @@ def test_drop_stale_slot_refuses_active_slot(tmp_path):
     assert holder.drop_stale_slot() is False
     assert conn.dropped_slots == []  # an active slot must NOT be dropped
     assert any("active" in e for e in holder.errors)
+
+
+# ------------------------------------------------------- stale pgcopydb pub
+
+def test_drop_stale_publication_drops_slot_named_pub(tmp_path):
+    # pgcopydb auto-creates a publication named after the SLOT; we clear it (via
+    # DROP ... IF EXISTS) so pgcopydb's non-idempotent CREATE succeeds. It must
+    # target the slot name, NOT the holder's own publication_name.
+    conn = _FakeConn()
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot", publication_name="pgcyan_pub")
+    holder.conn = conn
+    assert holder.drop_stale_publication() is True
+    dropped = [e for e in conn.executed if "DROP PUBLICATION" in e]
+    assert len(dropped) == 1
+    assert "pgcyan_slot" in dropped[0]      # the slot-named pub...
+    assert "pgcyan_pub" not in dropped[0]   # ...not the holder's own
+
+
+def test_drop_stale_publication_reports_db_error(tmp_path):
+    conn = _FakeConn(raise_on_drop_pub=True)
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot")
+    holder.conn = conn
+    assert holder.drop_stale_publication() is False
+    assert any("publication" in e for e in holder.errors)
 
 
 # ------------------------------------------------------------------ establish
