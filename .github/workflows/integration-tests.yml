@@ -8,15 +8,24 @@ name: Integration tests
 # `envsubst '${PGCYAN_IMAGE}'` substitutes ONLY that variable, leaving the
 # manifests' runtime `$(SNAPSHOT_ID)` / `${RESTORE_JOBS}` refs intact.
 #
-# Two jobs, each an independent integration test that moves NO data:
+# Three jobs. `planner` is independent; `pre-data` runs AFTER `snapshot-holder`
+# (needs:) -- both use the singleton holder Deployment + pgcyan-snapshot
+# ConfigMap, so they must never run at the same time.
 #   planner         : phase -2 collector Job -> phase -1 planner Job, with a
-#                     barrier between them; uploads plan.json + logs.
+#                     barrier between them; uploads plan.json + logs. Moves NO
+#                     data.
 #   snapshot-holder : applies the phase-1 holder Deployment, waits for it to
 #                     establish (publication + slot + consistent snapshot), asserts
 #                     the /work outputs, then tears it down GRACEFULLY and checks
-#                     the clean-shutdown log line.
+#                     the clean-shutdown log line. Moves NO data.
+#   pre-data        : (needs snapshot-holder) stands up the phase-1 holder, then
+#                     runs the phase-0 pre-data Job (`restore-predata`, issue #24)
+#                     against a REAL TARGET pinned to the holder's snapshot.
+#                     Asserts target-pg-schema-log.json reports success and that
+#                     the target ends up with tables but NO secondary indexes /
+#                     FKs / triggers. Transfers SCHEMA only, no table data.
 #
-# TODO (as phases 0/2/3/4 are wired up): fold them in here too -- ideally by
+# TODO (as phases 2/3/4 are wired up): fold them in here too -- ideally by
 # running the full `python -m pg_cyan.cli orchestrate` path end-to-end and
 # asserting the DAG completes, replacing these piecemeal per-phase jobs.
 #
@@ -32,10 +41,16 @@ name: Integration tests
 #   * GitHub config:
 #       secrets:  AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
 #                 PG_SOURCE_USER / PG_SOURCE_PASSWORD
+#                 PG_TARGET_USER / PG_TARGET_PASSWORD   (pre-data job only)
 #       variables: AKS_RESOURCE_GROUP / AKS_CLUSTER_NAME
 #                  PG_SOURCE_HOST / PG_SOURCE_PORT / PG_SOURCE_DATABASE
+#                  PG_TARGET_HOST / PG_TARGET_PORT / PG_TARGET_DATABASE  (pre-data job)
 #                  ACR_NAME (optional; defaults to pgcyanacr)
 #     (Credentials are secrets; non-sensitive host/port/db are plain variables.)
+#   * The pre-data job needs a REAL TARGET Postgres it can write schema to, with
+#     the target roles pre-created (so `--no-owner` applies -- issue #24) and the
+#     login role allowed to CREATE tables/sequences. It also stands up the phase-1
+#     holder, so all the snapshot-holder prerequisites apply to it too.
 #
 # SECRETS POLICY: source-DB credentials live ONLY as GitHub secrets and are
 # materialized into an in-cluster Secret at apply time -- no vault, nothing in
@@ -396,5 +411,248 @@ jobs:
         with:
           name: pgcyan-snapshot-holder-${{ github.run_id }}
           path: snapshot-output/*
+          if-no-files-found: warn
+          retention-days: 30
+
+  pre-data:
+    name: Transfer pre-data schema to the target, then verify (phase 0)
+    runs-on: ubuntu-latest
+    environment: azure
+    # MUST run after snapshot-holder, never alongside it: both jobs stand up the
+    # SINGLETON pgcyan-snapshot-holder Deployment and publish the SAME
+    # pgcyan-snapshot ConfigMap in the SAME namespace. Run concurrently, the two
+    # holders race and one job's ConfigMap write lands under the other's pod
+    # (mismatched snapshot ids). Serializing them keeps each job's holder alone.
+    needs: snapshot-holder
+    env:
+      DEPLOY: pgcyan-snapshot-holder
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Pre-data touches BOTH the source (schema dump, pinned to the holder's
+      # snapshot) and a real TARGET (schema restore), so it needs both sets of
+      # DB config plus the Azure/AKS config.
+      - name: Guard -- require Azure + AKS + source + target DB config
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          PG_SOURCE_USER: ${{ secrets.PG_SOURCE_USER }}
+          PG_SOURCE_PASSWORD: ${{ secrets.PG_SOURCE_PASSWORD }}
+          PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
+          PG_SOURCE_DATABASE: ${{ vars.PG_SOURCE_DATABASE }}
+          PG_TARGET_USER: ${{ secrets.PG_TARGET_USER }}
+          PG_TARGET_PASSWORD: ${{ secrets.PG_TARGET_PASSWORD }}
+          PG_TARGET_HOST: ${{ vars.PG_TARGET_HOST }}
+          PG_TARGET_DATABASE: ${{ vars.PG_TARGET_DATABASE }}
+        run: |
+          missing=()
+          [ -z "${AZURE_CLIENT_ID}" ]     && missing+=("AZURE_CLIENT_ID secret")
+          [ -z "${AKS_RESOURCE_GROUP}" ]  && missing+=("AKS_RESOURCE_GROUP variable")
+          [ -z "${AKS_CLUSTER_NAME}" ]    && missing+=("AKS_CLUSTER_NAME variable")
+          [ -z "${PG_SOURCE_USER}" ]      && missing+=("PG_SOURCE_USER secret")
+          [ -z "${PG_SOURCE_PASSWORD}" ]  && missing+=("PG_SOURCE_PASSWORD secret")
+          [ -z "${PG_SOURCE_HOST}" ]      && missing+=("PG_SOURCE_HOST variable")
+          [ -z "${PG_SOURCE_DATABASE}" ]  && missing+=("PG_SOURCE_DATABASE variable")
+          [ -z "${PG_TARGET_USER}" ]      && missing+=("PG_TARGET_USER secret")
+          [ -z "${PG_TARGET_PASSWORD}" ]  && missing+=("PG_TARGET_PASSWORD secret")
+          [ -z "${PG_TARGET_HOST}" ]      && missing+=("PG_TARGET_HOST variable")
+          [ -z "${PG_TARGET_DATABASE}" ]  && missing+=("PG_TARGET_DATABASE variable")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::%s not set -- configure it before running (see workflow header).\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Resolve the pgcyan image (commit short SHA)
+        run: |
+          echo "PGCYAN_IMAGE=${ACR_NAME}.azurecr.io/pgcyan:$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Azure login (OIDC, passwordless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      # 01-rbac.yaml defines both the pgcyan-orchestrator SA (holder) and the
+      # pgcyan-worker SA (the pre-data Job). 20-pvc-workdir.yaml supplies the
+      # pgcyan-workdir-predata RWO disk the pre-data Job mounts as --dir.
+      - name: Ensure namespace + RBAC + work-dir PVC
+        run: |
+          kubectl apply -f deploy/k8s/00-namespace.yaml
+          kubectl apply -f deploy/k8s/01-rbac.yaml
+          kubectl apply -f deploy/k8s/20-pvc-workdir.yaml
+
+      # Build the pgcyan-db-uris Secret with BOTH source (for the holder + the
+      # schema dump) and target (for the schema restore) URIs. Azure Postgres
+      # requires TLS -> sslmode=require. Never in git.
+      - name: Create/refresh DB Secret (SOURCE + TARGET PGURIs)
+        env:
+          PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
+          PG_SOURCE_PORT: ${{ vars.PG_SOURCE_PORT }}
+          PG_SOURCE_USER: ${{ secrets.PG_SOURCE_USER }}
+          PG_SOURCE_PASSWORD: ${{ secrets.PG_SOURCE_PASSWORD }}
+          PG_SOURCE_DATABASE: ${{ vars.PG_SOURCE_DATABASE }}
+          PG_TARGET_HOST: ${{ vars.PG_TARGET_HOST }}
+          PG_TARGET_PORT: ${{ vars.PG_TARGET_PORT }}
+          PG_TARGET_USER: ${{ secrets.PG_TARGET_USER }}
+          PG_TARGET_PASSWORD: ${{ secrets.PG_TARGET_PASSWORD }}
+          PG_TARGET_DATABASE: ${{ vars.PG_TARGET_DATABASE }}
+        run: |
+          enc() { python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+          sport="${PG_SOURCE_PORT:-5432}"; tport="${PG_TARGET_PORT:-5432}"
+          su="$(enc "$PG_SOURCE_USER")"; sp="$(enc "$PG_SOURCE_PASSWORD")"
+          tu="$(enc "$PG_TARGET_USER")"; tp="$(enc "$PG_TARGET_PASSWORD")"
+          source_uri="postgres://${su}:${sp}@${PG_SOURCE_HOST}:${sport}/${PG_SOURCE_DATABASE}?sslmode=require"
+          target_uri="postgres://${tu}:${tp}@${PG_TARGET_HOST}:${tport}/${PG_TARGET_DATABASE}?sslmode=require"
+          kubectl create secret generic pgcyan-db-uris -n "$NS" \
+            --from-literal=PGCOPYDB_SOURCE_PGURI="$source_uri" \
+            --from-literal=PGCOPYDB_TARGET_PGURI="$target_uri" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Start clean: drop any leftover holder, pre-data Job, snapshot ConfigMap
+      # and check Job from a prior run.
+      - name: Clear prior holder + pre-data Job
+        run: |
+          envsubst '${PGCYAN_IMAGE}' < deploy/k8s/50-deployment-snapshot-holder.yaml \
+            | kubectl delete -f - -n "$NS" --ignore-not-found --wait=true
+          kubectl delete job pgcyan-phase0-predata pgcyan-target-check \
+            -n "$NS" --ignore-not-found --wait=true
+          kubectl delete configmap/pgcyan-snapshot -n "$NS" --ignore-not-found
+
+      # The pre-data schema dump pins to the holder's snapshot, so the holder
+      # must be Ready (snapshot exported + published to the ConfigMap) first.
+      - name: Apply the snapshot holder and wait until Ready
+        run: |
+          set -euo pipefail
+          envsubst '${PGCYAN_IMAGE}' < deploy/k8s/50-deployment-snapshot-holder.yaml | kubectl apply -f -
+          echo "waiting for the holder to establish + publish the snapshot ConfigMap ..."
+          kubectl wait --for=condition=Ready pod \
+            -l pgcyan.dev/phase=snapshot-holder -n "$NS" --timeout=300s
+          kubectl rollout status deploy/"$DEPLOY" -n "$NS" --timeout=300s
+          # The pre-data Job reads SNAPSHOT_ID via configMapKeyRef -- fail early
+          # (with a clear message) if the holder did not publish it.
+          test -n "$(kubectl get configmap pgcyan-snapshot -n "$NS" -o jsonpath='{.data.snapshot}')" \
+            || { echo "::error::pgcyan-snapshot ConfigMap has no 'snapshot' key"; exit 1; }
+
+      # Phase-0 barrier: apply the pre-data Job and wait for the terminal
+      # Complete/Failed condition (respects backoffLimit, like the planner jobs).
+      - name: Phase 0 -- pre-data (barrier)
+        run: |
+          set -euo pipefail
+          wait_job() {
+            local job="$1" timeout="${2:-900}" elapsed=0 done_s fail_s
+            echo "waiting for job/$job (timeout ${timeout}s) ..."
+            while true; do
+              done_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+              fail_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+              [ "$done_s" = "True" ] && { echo "job/$job Complete"; return 0; }
+              [ "$fail_s" = "True" ] && { echo "::error::job/$job Failed"; return 1; }
+              [ "$elapsed" -ge "$timeout" ] && { echo "::error::job/$job timed out after ${timeout}s"; return 1; }
+              sleep 10; elapsed=$((elapsed + 10))
+            done
+          }
+          envsubst '${PGCYAN_IMAGE}' < deploy/k8s/40-job-phase0-predata.yaml | kubectl apply -f -
+          wait_job pgcyan-phase0-predata 900
+
+      # Acceptance: the wrapper reported success (target-pg-schema-log.json), i.e.
+      # the phase-0 pod's stdout carries the success summary.
+      - name: Assert the pre-data wrapper reported success
+        run: |
+          set -euo pipefail
+          kubectl logs -l pgcyan.dev/phase=pre-data -n "$NS" --tail=-1 | tee /tmp/predata.log
+          # Match the wrapper's FINAL run event (emitted only on full success),
+          # not a per-step success event that also fires on a failed overall run.
+          grep -q 'Pre-data schema transfer complete' /tmp/predata.log \
+            || { echo "::error::pre-data did not report overall success"; exit 1; }
+
+      # Acceptance: the TARGET now has tables but NO secondary indexes, foreign
+      # keys, or triggers (pre-data section only -- PK/unique + secondary indexes
+      # + FKs are the post-data phase, #28). Run the check IN-CLUSTER (the target
+      # is typically not reachable from the runner) via a throwaway Job on the
+      # same image (psql ships in it) using the target URI from the Secret.
+      - name: Verify target schema shape (tables, no indexes/FK/triggers)
+        run: |
+          set -euo pipefail
+          kubectl delete job pgcyan-target-check -n "$NS" --ignore-not-found --wait=true
+          cat <<'EOF' | envsubst '${PGCYAN_IMAGE}' | kubectl apply -n "$NS" -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: pgcyan-target-check
+            labels: { pgcyan.dev/phase: "pre-data-check" }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              metadata:
+                labels: { pgcyan.dev/phase: "pre-data-check" }
+              spec:
+                serviceAccountName: pgcyan-worker
+                restartPolicy: Never
+                containers:
+                  - name: check
+                    image: "${PGCYAN_IMAGE}"
+                    envFrom:
+                      - secretRef: { name: pgcyan-db-uris }
+                    command: ["sh", "-c"]
+                    args:
+                      - |
+                        psql "$PGCOPYDB_TARGET_PGURI" -tA -v ON_ERROR_STOP=1 -c "SELECT 'RESULT'||' tables='||(SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema'))||' indexes='||(SELECT count(*) FROM pg_indexes WHERE schemaname NOT IN ('pg_catalog','information_schema'))||' fks='||(SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE c.contype='f' AND n.nspname NOT IN ('pg_catalog','information_schema'))||' triggers='||(SELECT count(*) FROM pg_trigger t JOIN pg_class cl ON cl.oid=t.tgrelid JOIN pg_namespace n ON n.oid=cl.relnamespace WHERE NOT t.tgisinternal AND n.nspname NOT IN ('pg_catalog','information_schema'))"
+          EOF
+          kubectl wait --for=condition=complete job/pgcyan-target-check -n "$NS" --timeout=120s \
+            || { kubectl logs job/pgcyan-target-check -n "$NS" || true; echo "::error::target check Job did not complete"; exit 1; }
+          line="$(kubectl logs job/pgcyan-target-check -n "$NS" --tail=-1 | grep -o 'RESULT tables=[0-9]* indexes=[0-9]* fks=[0-9]* triggers=[0-9]*' | tail -1)"
+          echo "target schema counts: [$line]"
+          [ -n "$line" ] || { echo "::error::could not read target schema counts"; exit 1; }
+          tables=$(echo "$line" | sed -E 's/.*tables=([0-9]+).*/\1/')
+          indexes=$(echo "$line" | sed -E 's/.*indexes=([0-9]+).*/\1/')
+          fks=$(echo "$line" | sed -E 's/.*fks=([0-9]+).*/\1/')
+          triggers=$(echo "$line" | sed -E 's/.*triggers=([0-9]+).*/\1/')
+          fail=0
+          [ "$tables" -gt 0 ]    || { echo "::error::expected tables > 0 on the target, got $tables"; fail=1; }
+          [ "$indexes" -eq 0 ]   || { echo "::error::expected 0 secondary indexes/PK on the target, got $indexes"; fail=1; }
+          [ "$fks" -eq 0 ]       || { echo "::error::expected 0 foreign keys on the target, got $fks"; fail=1; }
+          [ "$triggers" -eq 0 ]  || { echo "::error::expected 0 triggers on the target, got $triggers"; fail=1; }
+          [ "$fail" -eq 0 ] || exit 1
+          echo "target schema shape OK: $tables tables, no secondary indexes / FKs / triggers"
+
+      - name: Collect pre-data logs
+        if: always()
+        run: |
+          mkdir -p predata-output
+          kubectl logs -l pgcyan.dev/phase=pre-data -n "$NS" --tail=-1 \
+            > predata-output/predata.log 2>&1 || true
+          kubectl logs job/pgcyan-target-check -n "$NS" --tail=-1 \
+            > predata-output/target-check.log 2>&1 || true
+          kubectl logs -l pgcyan.dev/phase=snapshot-holder -n "$NS" --tail=-1 \
+            > predata-output/holder.log 2>&1 || true
+          ls -la predata-output
+
+      # Tear everything down: the pre-data/check Jobs and the holder (gracefully,
+      # so no stale source connection is left behind).
+      - name: Teardown
+        if: always()
+        run: |
+          kubectl delete job pgcyan-phase0-predata pgcyan-target-check \
+            -n "$NS" --ignore-not-found --wait=false || true
+          kubectl delete deploy/"$DEPLOY" -n "$NS" \
+            --cascade=foreground --wait=true --timeout=120s || true
+          kubectl delete pdb/pgcyan-snapshot-holder -n "$NS" --ignore-not-found || true
+          kubectl delete configmap/pgcyan-snapshot -n "$NS" --ignore-not-found || true
+
+      - name: Upload pre-data logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgcyan-pre-data-${{ github.run_id }}
+          path: predata-output/*
           if-no-files-found: warn
           retention-days: 30

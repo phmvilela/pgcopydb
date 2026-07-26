@@ -30,8 +30,11 @@ Workflows.** Rationale:
 Implements the phase walk from ``deploy/k8s/README.md`` /
 ``notes/k8s-sharded-migration-topology.md``::
 
-    planner(-1) -> pre-data(0) -> snapshot-holder(1) -> data shards(2, xN)
+    planner(-1) -> snapshot-holder(1) -> pre-data(0) -> data shards(2, xN)
     -> index(3a, xM) -> FK(3b) -> follow-CDC(4)
+
+(The holder runs before pre-data: pre-data pins its schema dump to the
+snapshot the holder exports -- issue #24.)
 
 Each phase is applied from the ``deploy/k8s/`` manifests -- templated phases
 (data shards, index shards) are stamped out once per ``plan.json`` entry,
@@ -133,10 +136,16 @@ class PgCyanOrchestrator:
     #: The DAG, in apply order. Static phases carry "manifest"; templated
     #: phases (stamped out once per plan.json entry) carry "template" +
     #: "plan_key" + "substitutions".
+    #: NOTE on order: the snapshot HOLDER (1) is applied BEFORE pre-data (0),
+    #: even though pre-data is "phase 0" by name. Pre-data pins its schema dump
+    #: to the snapshot the holder exports (published in the pgcyan-snapshot
+    #: ConfigMap, read via configMapKeyRef -- issue #24/#58), so the holder must
+    #: be Ready first. The holder is a Deployment that then stays up through the
+    #: whole initial copy (phases 0-2).
     PHASES: List[Dict] = [
         {"id": "-1", "name": "planner", "manifest": "30-job-planner.yaml"},
-        {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"},
         {"id": "1", "name": "snapshot-holder", "manifest": "50-deployment-snapshot-holder.yaml"},
+        {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"},
         {
             "id": "2", "name": "data-shards", "template": "60-job-phase2-datashard.template.yaml",
             "plan_key": "data_shards", "needs_plan": True, "substitutions": _data_shard_substitutions,

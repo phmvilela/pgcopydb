@@ -271,7 +271,9 @@ def test_static_manifest_image_placeholder_filled_runtime_vars_preserved():
         {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"}, plan=None
     )[0]
     assert _container_image(predata) == TEST_IMAGE
-    assert "$(SNAPSHOT_ID)" in yaml.safe_dump(predata)  # k8s env ref preserved
+    # the snapshot id is sourced from the holder's ConfigMap via configMapKeyRef
+    # (issue #24) -- image-only substitution must leave that ref intact
+    assert "pgcyan-snapshot" in yaml.safe_dump(predata)
 
 
 def test_templated_manifest_image_placeholder_filled():
@@ -452,7 +454,8 @@ def test_run_happy_path_applies_all_seven_phases_in_order():
 
     assert summary["status"] == "success"
     assert summary["run_id"] == "pgcyan-test-run"
-    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "1", "2", "3a", "3b", "4"]
+    # holder (1) runs BEFORE pre-data (0): pre-data pins to the holder's snapshot
+    assert [p["phase"] for p in summary["phases"]] == ["-1", "1", "0", "2", "3a", "3b", "4"]
     assert all(p["success"] for p in summary["phases"])
     # each data + index shard got its own RWO work-dir PVC stamped (issue #58)
     assert {n for _, n, _ in core_api.created_pvcs} == {
@@ -481,11 +484,14 @@ def test_run_fails_fast_and_stops_the_dag():
     summary = orch.run()
 
     assert summary["status"] == "failure"
-    # planner (-1) ran, pre-data (0) failed, nothing after it was even attempted
-    assert [p["phase"] for p in summary["phases"]] == ["-1", "0"]
-    assert summary["phases"][0]["success"] is True
-    assert summary["phases"][1]["success"] is False
-    assert "snapshot-holder" not in {n for _, n, _ in apps_api.created}
+    # planner (-1) + holder (1) ran, pre-data (0) failed, nothing after attempted
+    assert [p["phase"] for p in summary["phases"]] == ["-1", "1", "0"]
+    assert summary["phases"][0]["success"] is True   # planner
+    assert summary["phases"][1]["success"] is True   # snapshot-holder
+    assert summary["phases"][2]["success"] is False  # pre-data
+    # the failing pre-data phase halts the DAG: no data shards, no follow-cdc
+    assert "pgcyan-datashard-shard-0" not in {n for _, n, _ in batch_api.created}
+    assert "pgcyan-follow-cdc" not in {n for _, n, _ in apps_api.created}
 
 
 def test_run_stops_before_reading_plan_if_earlier_phase_fails():
@@ -515,7 +521,7 @@ def test_run_fails_fast_when_one_of_two_data_shards_fails():
     summary = orch.run()
 
     assert summary["status"] == "failure"
-    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "1", "2"]
+    assert [p["phase"] for p in summary["phases"]] == ["-1", "1", "0", "2"]
     data_phase = summary["phases"][-1]
     assert data_phase["success"] is False
     targets_by_name = {t["name"]: t for t in data_phase["targets"]}

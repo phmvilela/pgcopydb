@@ -12,7 +12,8 @@ Terraform (Azure provisioning). See `README.md` for the user-facing view.
 
 Current state: the **pre-migration** stages (`preflight`, `source-parameters`,
 `source-pg-metrics`, `source-largeobjects`, `plan`), the phase-1 **snapshot
-holder** (`snapshot-hold`), the **migration DAG orchestrator** (`orchestrate`,
+holder** (`snapshot-hold`), the phase-0 **pre-data schema transfer**
+(`restore-predata`), the **migration DAG orchestrator** (`orchestrate`,
 driving the `deploy/k8s/` sharded pgcopydb Jobs/Deployments), and the Terraform
 **worker VM** / **AKS cluster** modules exist. Post-migration is not built yet.
 
@@ -66,8 +67,8 @@ literals — never f-string user/config values into SQL.
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
 `preflight`, `source-parameters`, `source-pg-metrics`,
-`source-largeobjects`, `plan`, `snapshot-hold`, and `orchestrate` are
-implemented. Options default to `PG_SOURCE_*` env vars so the same invocation
+`source-largeobjects`, `plan`, `snapshot-hold`, `restore-predata`, and
+`orchestrate` are implemented. Options default to `PG_SOURCE_*` env vars so the same invocation
 works locally and in the container. Exit codes: `0` ready/success, `1` not
 ready/failure, `2` interrupted — keep these stable.
 
@@ -186,6 +187,39 @@ scratch dir and that the `pgcyan-snapshot` ConfigMap carries it, then tears it
 down gracefully and checks the clean-shutdown log line -- rather than a
 `tests/integration` pytest.
 
+`restore-predata` (`pg_cyan/predata.py`, `PgCyanPreData`) is the phase `0`
+**pre-data schema transfer** (issue #24): it creates the *target* schema before
+any data shard runs, so every shard finds its tables already present. It is a
+thin wrapper over pgcopydb (like `snapshot-hold`), NOT a DB collector -- it opens
+no psycopg2 connection, only drives subprocesses. It transfers the **pre-data
+section only**: tables, sequences, functions, LOB metadata -- and deliberately
+NOT secondary indexes, **primary-key/unique constraints**, foreign keys, or
+triggers. This is a real pgcopydb/`pg_dump` fact worth remembering: PK and UNIQUE
+constraints are backed by indexes and live in the **post-data** section
+(`pgcopydb clone` builds them *after* the COPY, steps 6-10 of
+`pgcopydb_clone.rst`), so a pre-data restore yields tables with **no** PKs. All
+of those deferred objects are built by the post-data phase (#28), which is much
+faster than maintaining them during COPY. Because `pgcopydb restore pre-data`
+restores from a custom-format dump file in `--dir` and this pod's `--dir` starts
+empty, the wrapper runs **two** pgcopydb steps: `dump schema --snapshot=<id>`
+(pinned to the phase-1 holder's snapshot so the schema matches the instant the
+shards copy) then `restore pre-data --no-owner --drop-if-exists` (pre-data
+section only; `--no-owner` assumes target roles are pre-created by Terraform;
+`--drop-if-exists` keeps retries idempotent). The snapshot id comes from the
+`pgcyan-snapshot` ConfigMap the holder publishes, read via `configMapKeyRef` --
+so **the holder (phase 1) runs BEFORE pre-data (phase 0)** in the orchestrator
+DAG (the phase names keep their numbers; only the apply order changed). It still
+follows the orchestrator conventions (`_log_event`, graceful degradation --
+`run()` never raises) and the success-vs-error two-file shape:
+`target-pg-schema-log.json` on success (carrying a success message + the
+pgcopydb commands run), or `target-pg-schema-log-errors.json` on any failure.
+`--not-consistent` waives snapshot pinning (the dump takes its own snapshot) for
+a frozen/read-only source. This is the node in
+`deploy/k8s/40-job-phase0-predata.yaml`; its integration test is the `pre-data`
+job of `.github/workflows/integration-tests.yml`, which stands up the holder,
+runs the phase-0 Job against a **real target**, and asserts the target ends up
+with tables but zero secondary indexes / FKs / triggers.
+
 `orchestrate` (`pg_cyan/orchestrator.py`, `PgCyanOrchestrator`) is the
 **migration DAG orchestrator** (issue #40) -- the `deploy/k8s/` manifests are
 the nodes, this is the edges. Design decision for the ticket's open question
@@ -194,7 +228,7 @@ the nodes, this is the edges. Design decision for the ticket's open question
 ServiceAccount for exactly this (Job/Deployment/ConfigMap verbs, no CRDs), and
 every other stage is already this same `PgCyan<Stage>` + `_log_event` pattern
 -- see the rationale in the module docstring for the full argument. It walks
-the phases in order -- planner(-1) → pre-data(0) → snapshot-holder(1) → data
+the phases in order -- planner(-1) → snapshot-holder(1) → pre-data(0) → data
 shards(2, ×N) → index(3a, ×M) → FK(3b) → follow-CDC(4) -- applying each
 phase's manifest(s) (substituting the `${...}` placeholders in the
 `*.template.yaml` files once per `plan.json` entry for the templated phases)
@@ -253,8 +287,10 @@ Exactly **four** GitHub workflows, each with one clear job (issue #50 cleanup):
   manual dispatch) publishes it to the ACR tagged by the **commit short SHA**
   only (no `latest`, no version tag). No deploy step.
 - `.github/workflows/integration-tests.yml` -- manual (`workflow_dispatch`)
-  cluster-backed tests: a `planner` job (phase -2 -> -1) and a
-  `snapshot-holder` job (phase 1). Add later phases here as they land.
+  cluster-backed tests: a `planner` job (phase -2 -> -1), a
+  `snapshot-holder` job (phase 1), and a `pre-data` job (phase 0, which stands
+  up the holder then transfers schema to a real target -- needs `PG_TARGET_*`
+  secrets/variables). Add later phases here as they land.
 - `.github/workflows/terraform-aks.yml` -- `terraform fmt`/`validate` for the
   AKS module.
 
@@ -300,6 +336,18 @@ in each module. This is what keeps an ephemeral dev container from orphaning
 Azure resources by losing local state. Keep state/secrets out of the repo
 (`*.tfstate`, `*.tfvars`, `backend.hcl` are gitignored; commit only the
 `*.example` files).
+
+## Before wiring up a new migration phase (#25–#29)
+
+Read **`notes/migration-phases-lessons-learned.md`** first. It captures the
+non-obvious failures hit getting phase 0 (`restore-predata`, #24) green on
+AKS + Azure Postgres — non-root pod + managed-disk PVC permissions
+(`fsGroup`), Azure extension allow-listing (`--skip-extensions`), the
+image-pinned-by-commit-SHA CI flow (build then test, or retag), the
+manifest-applied-live vs image-baked deploy layers, shared pgcopydb `--dir`
+snapshot consistency, the `clone`-does-schema data-only check for #25, and
+holder/ConfigMap CI-job serialization. Most of these recur verbatim in the
+data-shard (#25), CDC (#26), and post-data (#28) phases.
 
 ## Known gaps / cleanups worth doing
 

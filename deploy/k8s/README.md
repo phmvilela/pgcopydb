@@ -23,7 +23,7 @@ phase −2 input collector are assumed already applied).
 | `20-pvc-workdir.yaml` | — | PVC (RWO ×3) | per-workload pgcopydb `--dir` disks (pre-data/FK/CDC); shards get one each, stamped by the templates — issue #58 |
 | `25-job-collect-inputs.yaml` | −2 | Job | collectors hit the source DB → write the inputs ConfigMap |
 | `30-job-planner.yaml` | −1 | Job | runs the planner (`pg_cyan.cli plan`) |
-| `40-job-phase0-predata.yaml` | 0 | Job | schema without secondary idx/FK |
+| `40-job-phase0-predata.yaml` | 0 | Job | `pg_cyan.cli restore-predata`: pre-data schema only (tables/sequences) — NO secondary indexes, PK/unique, FK, or triggers (those are post-data, #28); pins the dump to the holder's snapshot, so it runs AFTER phase 1 |
 | `50-deployment-snapshot-holder.yaml` | 1 | Deployment(1)+PDB | `pg_cyan.cli snapshot-hold`: creates publication + pgoutput slot, exports & HOLDS the consistent snapshot, publishes the id to the `pgcyan-snapshot` ConfigMap |
 | `60-job-phase2-datashard.template.yaml` | 2 | PVC+Job × N | concurrent HEAP-only COPY shards, each on its own RWO work disk |
 | `70-job-phase3-index.template.yaml` | 3a | PVC+Job × M | secondary index builds (shardable), each on its own RWO work disk |
@@ -82,7 +82,10 @@ GitHub secrets, fills `${PGCYAN_IMAGE}` with the commit-short-SHA image, applies
 jobs `25` then `30` with a completion barrier between them, and uploads
 `plan.json` + both Jobs' logs as a build artifact. A source with any large
 object correctly fails the planner (LOB abort gate) with no plan written. That
-same workflow's `snapshot-holder` job exercises phase 1. The cluster itself is
+same workflow's `snapshot-holder` job exercises phase 1, and its `pre-data` job
+exercises phase 0 (stands up the holder, transfers the pre-data schema to a real
+target, and asserts the target has tables but no secondary indexes/FK/triggers —
+needs `PG_TARGET_*` secrets/variables). The cluster itself is
 provisioned from `terraform/aks` by a human running `terraform apply` (Azure
 Cloud Shell or local — it needs Owner-level rights, so it is not a CI action;
 the companion `.github/workflows/terraform-aks.yml` only `fmt`/`validate`s the

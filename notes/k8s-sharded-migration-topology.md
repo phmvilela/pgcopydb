@@ -112,8 +112,10 @@ change.
   in `table_totals`, so phase 2 (COPY, heap) and phase 3 (index build) can be
   sized independently.
 - ~~**Orchestrator app doesn't exist**~~ — done (issue #40): `pg_cyan.cli
-  orchestrate` (`pg_cyan/orchestrator.py`) walks planner(-1) → pre-data(0) →
-  snapshot-holder(1) → data shards(2) → index(3a) → FK(3b) → follow-CDC(4),
+  orchestrate` (`pg_cyan/orchestrator.py`) walks planner(-1) →
+  snapshot-holder(1) → pre-data(0) → data shards(2) → index(3a) → FK(3b) →
+  follow-CDC(4) — the holder runs before pre-data so pre-data can pin its
+  schema dump to the holder's snapshot (issue #24) —
   substituting the `${...}` template placeholders from `plan.json` and
   blocking on each phase's barrier (Job completion, or Deployment readiness
   for the two long-lived phases) before applying the next; fails fast on the

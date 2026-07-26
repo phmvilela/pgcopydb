@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from pg_cyan import cli as cli_module
 from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
+from pg_cyan.predata import PgCyanPreData as RealPreData
 from pg_cyan.snapshot import PgCyanSnapshot as RealSnapshot
 
 
@@ -146,6 +147,28 @@ class _StubSnapshot(RealSnapshot):
         pass
 
 
+class _StubPreData(RealPreData):
+    """Records constructor kwargs and a canned run() result.
+
+    Subclasses the real wrapper (like ``_StubSnapshot``) so the CLI's option
+    defaults, which read ``PgCyanPreData.DEFAULT_*``, still resolve after
+    monkeypatching. Never launches pgcopydb.
+    """
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubPreData.last_kwargs = kwargs
+        self.snapshot_id = kwargs.get("snapshot_id")
+        # Success unless the caller passes the sentinel "bad" target.
+        self._ok = kwargs.get("target_pguri") != "postgres://bad/db"
+
+    def run(self):
+        status = "success" if self._ok else "failure"
+        return {"status": status, "log_file": None, "log_error_file": None,
+                "snapshot": self.snapshot_id, "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
@@ -155,6 +178,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPlanner", _StubPlanner)
     monkeypatch.setattr(cli_module, "PgCyanOrchestrator", _StubOrchestrator)
     monkeypatch.setattr(cli_module, "PgCyanSnapshot", _StubSnapshot)
+    monkeypatch.setattr(cli_module, "PgCyanPreData", _StubPreData)
     return CliRunner()
 
 
@@ -274,6 +298,47 @@ def test_snapshot_hold_options_fall_back_to_env(runner, monkeypatch):
     assert _StubSnapshot.last_kwargs["slot_name"] == "ok_slot"
     assert _StubSnapshot.last_kwargs["snapshot_mode"] == "frozen-source"
     assert _StubSnapshot.last_kwargs["source_pguri"] == "postgres://h/db"
+
+
+def test_restore_predata_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, [
+        "restore-predata", "--target-pguri", "postgres://good/db",
+        "--snapshot", "0000000A-1",
+    ])
+    assert result.exit_code == 0
+    assert _StubPreData.last_kwargs["target_pguri"] == "postgres://good/db"
+    assert _StubPreData.last_kwargs["snapshot_id"] == "0000000A-1"
+    # target roles assumed pre-created -> --no-owner default is on
+    assert _StubPreData.last_kwargs["no_owner"] is True
+
+
+def test_restore_predata_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, [
+        "restore-predata", "--target-pguri", "postgres://bad/db",
+        "--snapshot", "0000000A-1",
+    ])
+    assert result.exit_code == 1
+
+
+def test_restore_predata_options_fall_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PGCOPYDB_SOURCE_PGURI", "postgres://src/db")
+    monkeypatch.setenv("PGCOPYDB_TARGET_PGURI", "postgres://tgt/db")
+    monkeypatch.setenv("SNAPSHOT_ID", "0000000B-2")
+    monkeypatch.setenv("PGCYAN_WORK_DIR", "/mywork")
+    runner.invoke(cli_module.cli, ["restore-predata"])
+    assert _StubPreData.last_kwargs["source_pguri"] == "postgres://src/db"
+    assert _StubPreData.last_kwargs["target_pguri"] == "postgres://tgt/db"
+    assert _StubPreData.last_kwargs["snapshot_id"] == "0000000B-2"
+    assert _StubPreData.last_kwargs["work_dir"] == "/mywork"
+
+
+def test_restore_predata_owner_flag_overrides_default(runner):
+    runner.invoke(cli_module.cli, [
+        "restore-predata", "--target-pguri", "postgres://good/db",
+        "--snapshot", "x", "--owner", "--not-consistent",
+    ])
+    assert _StubPreData.last_kwargs["no_owner"] is False
+    assert _StubPreData.last_kwargs["not_consistent"] is True
 
 
 def test_orchestrate_exit_zero_on_success(runner):

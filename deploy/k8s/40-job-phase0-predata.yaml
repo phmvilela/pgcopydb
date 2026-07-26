@@ -2,20 +2,28 @@
 # ---------------------------------------------------------------------------
 # PHASE 0: pre-data (schema WITHOUT secondary indexes / constraints).
 #
-# A single coordinator Job. It creates the target schema -- tables, types,
-# owners, sequences, primary-key-backing objects deferred -- but deliberately
-# NOT secondary indexes or foreign keys (those are phase 3, built after the data
-# lands, which is dramatically faster than maintaining them during COPY).
+# A single coordinator Job. It creates the target schema -- tables, sequences,
+# functions, LOB metadata -- but deliberately NOT secondary indexes, PRIMARY
+# KEY / UNIQUE constraints, foreign keys, or triggers. In Postgres' dump model
+# all of those live in the POST-DATA section (a primary key is backed by an
+# index, built after the data lands), which is dramatically faster than
+# maintaining them during COPY. They are built by the post-data phase (#28).
 #
 # This runs BEFORE any data shard so every shard finds its target tables already
 # present. It is a hard barrier: no shard may start until this succeeds.
 #
-# ASSUMPTION: `pgcopydb restore pre-data` (equivalently the pre-data section of
-# `pgcopydb clone`) is the mechanism. It uses the same snapshot as the shards;
-# since the snapshot holder (phase 1) owns the snapshot, this job either shares
-# --dir with it or takes the snapshot id the same way the shards do. Modelled
-# here as: snapshot holder starts first, writes the id, THEN this job runs.
-# (Ordering is enforced by the orchestrator, not by YAML.)
+# MECHANISM: a thin wrapper (`pg_cyan.cli restore-predata`, issue #24) over
+# pgcopydb. `pgcopydb restore pre-data` restores from a custom-format dump file
+# in `--dir`, and this pod's `--dir` starts empty, so the wrapper runs two
+# steps: `pgcopydb dump schema --snapshot=<id>` (pinned to the phase-1 holder's
+# snapshot so the schema matches the instant the shards copy) then
+# `pgcopydb restore pre-data --no-owner` (pre-data section only).
+#
+# ORDERING: this phase depends on the snapshot the phase-1 HOLDER exports, so
+# the holder runs FIRST and publishes the id into the `pgcyan-snapshot`
+# ConfigMap; this Job reads it via configMapKeyRef, exactly like the data shards
+# (issue #58). The orchestrator DAG enforces snapshot-holder(1) -> pre-data(0)
+# (see orchestrator.py PHASES).
 # ---------------------------------------------------------------------------
 apiVersion: batch/v1
 kind: Job
@@ -23,7 +31,7 @@ metadata:
   name: pgcyan-phase0-predata
   namespace: pgcyan-migration
 spec:
-  backoffLimit: 3           # pre-data is cheap to retry; it is idempotent-ish
+  backoffLimit: 3           # pre-data is cheap to retry; the wrapper is idempotent
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
@@ -31,27 +39,47 @@ spec:
         pgcyan.dev/phase: "pre-data"
     spec:
       serviceAccountName: pgcyan-worker
+      # The image runs as non-root uid 1000 ('migration', Dockerfile: useradd
+      # -u 1000). A freshly-provisioned Azure managed disk mounts root:root 0755,
+      # which uid 1000 cannot write (pgcopydb: "Failed to create directory
+      # /work/schema: Permission denied"). fsGroup group-owns the work disk to
+      # gid 1000 so the process can write; OnRootMismatch skips re-chowning the
+      # catalog on every resume/restart.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000       # 'migration' from the image
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       restartPolicy: Never
       containers:
         - name: pgcopydb-predata
           image: "${PGCYAN_IMAGE}"
-          command: ["pgcopydb", "restore", "pre-data"]
-          args:
-            - "--dir=/work"
-            - "--resume"
-            - "--no-owner"          # ASSUMPTION: target roles pre-created by Terraform; drop if not
-            - "--snapshot=$(SNAPSHOT_ID)"
+          # Thin wrapper: dump schema (pinned to the snapshot) + restore pre-data.
+          # It writes target-pg-schema-log.json to $PG_OUTPUT_DIR on success.
+          #
+          # --skip-extensions: on Azure Database for PostgreSQL, platform-managed
+          # extensions (`azure`, `pgaadauth`) are NOT allow-listed for the
+          # azure_pg_admin role, so pg_restore's CREATE/DROP EXTENSION for them
+          # fails and aborts the whole pre-data restore. Extensions on Azure must
+          # be pre-provisioned via the `azure.extensions` server parameter, not
+          # carried in a schema dump -- so pre-data skips them by design.
+          command: ["python", "-m", "pg_cyan.cli", "restore-predata", "--skip-extensions"]
           env:
+            # The exported snapshot id, published by the phase-1 holder into the
+            # pgcyan-snapshot ConfigMap. The wrapper pins `dump schema` to it so
+            # the schema matches the instant the shards copy (issue #23/#58).
+            # The holder runs BEFORE this phase, so the ConfigMap exists here.
             - name: SNAPSHOT_ID
-              # TODO: source this from the `pgcyan-snapshot` ConfigMap the phase-1
-              # holder publishes (issue #58), the same way the data shards do:
-              #   valueFrom: { configMapKeyRef: { name: pgcyan-snapshot, key: snapshot } }
-              # NOTE: the current DAG applies pre-data (phase 0) BEFORE the holder
-              # (phase 1), so that ConfigMap does not exist yet here -- wiring it
-              # via configMapKeyRef would wedge this pod in
-              # CreateContainerConfigError. Resolving pre-data's snapshot ordering
-              # is a separate follow-up; left as a placeholder for now.
-              value: "REPLACE_VIA_CONFIGMAP"
+              valueFrom:
+                configMapKeyRef:
+                  name: pgcyan-snapshot
+                  key: snapshot
+            # pgcopydb --dir (dump lands here) AND the log output dir.
+            - name: PGCYAN_WORK_DIR
+              value: "/work"
+            - name: PG_OUTPUT_DIR
+              value: "/work"
           envFrom:
             - secretRef:
                 name: pgcyan-db-uris   # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI

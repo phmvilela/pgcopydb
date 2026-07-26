@@ -23,6 +23,7 @@ from pg_cyan.metrics import PgCyanMetrics
 from pg_cyan.orchestrator import PgCyanOrchestrator
 from pg_cyan.parameters import PgCyanParameters
 from pg_cyan.planner import PgCyanPlanner
+from pg_cyan.predata import PgCyanPreData
 from pg_cyan.preflight import PgCyanPreflight
 from pg_cyan.snapshot import PgCyanSnapshot
 
@@ -258,7 +259,7 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
                  poll_interval: int, job_timeout: int, in_cluster: bool) -> None:
     """Walk the migration DAG: apply each phase in order and block on its barrier.
 
-    Applies planner(-1) -> pre-data(0) -> snapshot-holder(1) -> data shards(2)
+    Applies planner(-1) -> snapshot-holder(1) -> pre-data(0) -> data shards(2)
     -> index(3a) -> FK(3b) -> follow-CDC(4), stopping (without applying later
     phases) at the first phase whose Jobs/Deployments do not all succeed/become
     ready.
@@ -360,6 +361,68 @@ def snapshot_hold(source_pguri: str, host: str, port: int, user: str, password: 
         sys.exit(0 if holder.hold() == 0 else 1)
     except KeyboardInterrupt:
         holder.close()
+        sys.exit(2)
+
+
+@cli.command(name="restore-predata")
+@click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
+              show_default="$PGCOPYDB_SOURCE_PGURI",
+              help="Source libpq URI (pgcopydb-native); passed to the dump step.")
+@click.option("--target-pguri", default=lambda: os.getenv("PGCOPYDB_TARGET_PGURI"),
+              show_default="$PGCOPYDB_TARGET_PGURI",
+              help="Target libpq URI (pgcopydb-native); passed to the restore step.")
+@click.option("--snapshot", "snapshot_id", default=lambda: os.getenv("SNAPSHOT_ID"),
+              show_default="$SNAPSHOT_ID",
+              help="Exported snapshot id from the phase-1 holder to pin the dump to.")
+@click.option("--work-dir",
+              default=lambda: os.getenv("PGCYAN_WORK_DIR", PgCyanPreData.DEFAULT_WORK_DIR),
+              show_default="$PGCYAN_WORK_DIR", help="pgcopydb --dir; the schema dump lands here.")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
+              show_default="$PG_OUTPUT_DIR (defaults to --work-dir)",
+              help="Directory for target-pg-schema-log[-errors].json.")
+@click.option("--no-owner/--owner", default=True,
+              help="Pass --no-owner to the restore (target roles pre-created by Terraform).")
+@click.option("--drop-if-exists/--no-drop-if-exists", default=True,
+              help="Pass --drop-if-exists so retries over a half-restored target are idempotent.")
+@click.option("--skip-extensions", is_flag=True, default=False,
+              help="Skip extensions in both the dump and the restore.")
+@click.option("--not-consistent", is_flag=True, default=False,
+              help="Do not pin to the holder's snapshot; let the dump take its own.")
+@click.option("--restore-jobs", type=int,
+              default=lambda: int(os.getenv("PGCYAN_RESTORE_JOBS", str(PgCyanPreData.DEFAULT_RESTORE_JOBS))),
+              show_default="$PGCYAN_RESTORE_JOBS", help="pg_restore parallelism for the pre-data section.")
+@click.option("--pgcopydb-bin",
+              default=lambda: os.getenv("PGCOPYDB_BIN", PgCyanPreData.DEFAULT_PGCOPYDB_BIN),
+              show_default="$PGCOPYDB_BIN", help="pgcopydb executable name/path.")
+def restore_predata(source_pguri: str, target_pguri: str, snapshot_id: str,
+                    work_dir: str, output_dir: str, no_owner: bool,
+                    drop_if_exists: bool, skip_extensions: bool, not_consistent: bool,
+                    restore_jobs: int, pgcopydb_bin: str) -> None:
+    """Transfer the source's pre-data schema (tables only) to the target.
+
+    A thin wrapper that dumps the source schema pinned to the phase-1 holder's
+    snapshot (``pgcopydb dump schema --snapshot``) and restores ONLY the
+    pre-data section to the target (``pgcopydb restore pre-data``) -- tables,
+    sequences and functions, but deliberately NOT secondary indexes,
+    primary-key/unique constraints, foreign keys, or triggers (those are the
+    post-data phase, #28, so the initial COPY is not slowed by index
+    maintenance). Writes ``target-pg-schema-log.json`` on success, or
+    ``target-pg-schema-log-errors.json`` on failure.
+    """
+    worker = PgCyanPreData(
+        source_pguri=source_pguri or None,
+        target_pguri=target_pguri or None,
+        snapshot_id=snapshot_id or None,
+        work_dir=work_dir, output_dir=output_dir or None,
+        no_owner=no_owner, drop_if_exists=drop_if_exists,
+        skip_extensions=skip_extensions, not_consistent=not_consistent,
+        restore_jobs=restore_jobs, pgcopydb_bin=pgcopydb_bin,
+    )
+    try:
+        summary = worker.run()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
         sys.exit(2)
 
 

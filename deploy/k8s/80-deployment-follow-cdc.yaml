@@ -37,6 +37,18 @@ spec:
         pgcyan.dev/phase: "cdc"
     spec:
       serviceAccountName: pgcyan-worker
+      # The image runs as non-root uid 1000 ('migration', Dockerfile: useradd
+      # -u 1000). A freshly-provisioned Azure managed disk mounts root:root 0755,
+      # which uid 1000 cannot write (pgcopydb: "Failed to create directory
+      # /work/schema: Permission denied"). fsGroup group-owns the work disk to
+      # gid 1000 so the process can write; OnRootMismatch skips re-chowning the
+      # catalog on every resume/restart.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000       # 'migration' from the image
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: pgcopydb-follow
           image: "${PGCYAN_IMAGE}"
