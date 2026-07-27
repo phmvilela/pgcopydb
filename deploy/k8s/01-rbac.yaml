@@ -1,6 +1,6 @@
 # 01-rbac.yaml
 # ---------------------------------------------------------------------------
-# Two identities:
+# Three identities:
 #
 #   1. pgcyan-orchestrator -- the control plane. It (and only it) is allowed to
 #      create/patch/delete the per-phase Jobs and to read their status so it can
@@ -13,6 +13,10 @@
 #      Kubernetes API access at all -- they only talk to Postgres. They get a
 #      near-empty ServiceAccount purely so we can bind Azure Workload Identity
 #      (federated) credentials to it instead of shipping static DB passwords.
+#
+#   3. pgcyan-viewer -- a read-only *observer* identity. It runs no workload; it
+#      exists so an out-of-cluster operator can watch the migration -- pods, logs,
+#      jobs, the plan/snapshot ConfigMaps. It does so *without* cluster-admin reach
 #
 # ASSUMPTION: cluster is AKS with OIDC + Workload Identity enabled, so DB auth
 # can be Entra-token based. If that is not available, fall back to the Secret in
@@ -86,4 +90,59 @@ subjects:
 roleRef:
   kind: Role
   name: pgcyan-orchestrator
+  apiGroup: rbac.authorization.k8s.io
+---
+# --- pgcyan-viewer: read-only observer (see header, identity 3) --------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgcyan-viewer
+  namespace: pgcyan-migration
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcyan-viewer
+  namespace: pgcyan-migration
+rules:
+  # Observe the migration DAG: pods (+ their logs), the jobs and the
+  # snapshot-holder / follow-cdc Deployments and the ReplicaSets they own.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  # Read the plan / snapshot / inputs ConfigMaps and the work-dir PVCs the
+  # phases stamp, plus the events that explain scheduling / image-pull failures.
+  - apiGroups: [""]
+    resources: ["configmaps", "persistentvolumeclaims", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  # NOTE (deliberate exclusions, least privilege):
+  #   * NO "secrets"          -- the viewer must never read pgcyan-db-uris etc.
+  #   * NO "pods/exec", "pods/portforward" -- observe only, no shell into pods.
+  #   * NO create/patch/update/delete anywhere -- read-only.
+  # To grant exec/port-forward for live debugging, add a rule:
+  #   - apiGroups: [""]
+  #     resources: ["pods/exec", "pods/portforward"]
+  #     verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcyan-viewer
+  namespace: pgcyan-migration
+subjects:
+  - kind: ServiceAccount
+    name: pgcyan-viewer
+    namespace: pgcyan-migration
+roleRef:
+  kind: Role
+  name: pgcyan-viewer
   apiGroup: rbac.authorization.k8s.io
