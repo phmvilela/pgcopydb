@@ -19,6 +19,12 @@
 # CONSISTENCY: `--snapshot ${SNAPSHOT_ID}` ties this shard to the holder's
 # snapshot (phase 1) so all shards copy the same instant.
 #
+# DATA ONLY: the pod runs `pg_cyan.cli copy-shard`, which drives `pgcopydb copy
+# table-data` -- NOT `pgcopydb clone`. Phase 0 (#24) already restored the schema
+# and phase 3 (#28) builds the indexes/constraints, so this phase copies the HEAP
+# and nothing else. `clone` would re-run both schema sections and collide with
+# phases 0/3 (see notes/migration-phases-lessons-learned.md item 6).
+#
 # INTRA-TABLE SPLIT: `--split-tables-larger-than` lets a single shard further
 # parallelise a giant table across `--table-jobs` processes via integer-range or
 # CTID split. For a table too big for even one shard, the planner instead emits
@@ -27,16 +33,27 @@
 # a planner responsibility -- see note).
 #
 # RESUME: `--dir=/work` on this shard's OWN ReadWriteOnce managed disk
-# (pgcyan-workdir-${SHARD_NAME}, stamped from the PVC document below) + `--resume`.
-# A killed shard pod restarts, re-attaches the same disk, and continues at
-# per-table / per-part granularity, never redoing a completed table --
-# backoffLimit lets k8s do that restart automatically. The disk is RWO (one pod
-# at a time) and local ext4, so pgcopydb's SQLite/WAL catalog gets the file
+# (pgcyan-workdir-${SHARD_NAME}, stamped from the PVC document below) + `--resume
+# --restart=false`. A killed shard pod restarts, re-attaches the same disk, and
+# continues at per-table / per-part granularity, never redoing a completed table
+# -- backoffLimit lets k8s do that restart automatically. The disk is RWO (one
+# pod at a time) and local ext4, so pgcopydb's SQLite/WAL catalog gets the file
 # locking Azure Files (SMB) cannot provide (issue #58).
 #
 # SNAPSHOT: `--snapshot="${SNAPSHOT_ID}"` where SNAPSHOT_ID comes from the
 # `pgcyan-snapshot` ConfigMap the holder publishes (phase 1) -- no shared volume,
 # no initContainer. All shards read the same key, so they copy the same instant.
+# (SEAM: issue #70 folds the holder into the orchestrator and injects SNAPSHOT_ID
+# directly into this env instead of via the ConfigMap -- this configMapKeyRef
+# goes away then.)
+#
+# OUTPUT: the wrapper writes migration-copy-log.json (slot/publication/snapshot +
+# per-table row counts landed on the target) to /work AND publishes it to a
+# per-shard `pgcyan-copylog-${SHARD_NAME}` ConfigMap. The orchestrator (#40) lists
+# those by label and merges them into the combined migration-copy-log.json. The
+# work dir is a private RWO disk the orchestrator cannot mount, so the ConfigMap
+# is the durable handoff -- the shard's SA has a narrow configmaps grant for it
+# (01-rbac.yaml).
 # ---------------------------------------------------------------------------
 # The per-shard work disk. The orchestrator stamps one of these per
 # plan.json > data_shards entry (same ${SHARD_NAME} substitution as the Job).
@@ -94,30 +111,28 @@ spec:
       containers:
         - name: pgcopydb-copy
           image: "${PGCYAN_IMAGE}"
-          # `clone --skip-extensions --no-acl ...` limited to this shard's tables.
-          # Using `copy-db`/`clone` restricted to the include-only filter set.
-          command: ["sh", "-c"]
-          args:
-            - >
-              pgcopydb clone
-              --dir=/work
-              --filters=/plan/${FILTER_FILE}
-              --snapshot="$(SNAPSHOT_ID)"
-              --table-jobs=${TABLE_JOBS}
-              --index-jobs=0
-              --split-tables-larger-than=${SPLIT_TABLES_LARGER_THAN}
-              --skip-vacuum
-              --no-owner
-              --resume
-              --restart=false
-          # NOTE: --index-jobs=0 and --skip-vacuum: phase 2 loads HEAP ONLY.
-          # Index builds, constraints and vacuum are deferred to phase 3 so the
-          # COPY is not slowed by index maintenance. This is the whole point of
-          # the pre-data / post-data split.
+          # The pg_cyan `copy-shard` wrapper (PgCyanDataShard, issue #25) drives
+          # `pgcopydb copy table-data` -- DATA ONLY, restricted to this shard's
+          # [include-only-table] filter set and pinned to the holder's snapshot --
+          # then counts the rows landed on the target, writes
+          # migration-copy-log.json to /work, and publishes it to the per-shard
+          # `pgcyan-copylog-${SHARD_NAME}` ConfigMap for the orchestrator to
+          # aggregate across shards.
+          #
+          # DATA ONLY on purpose: phase 0 (pre-data) created the schema and phase
+          # 3 (post-data) builds indexes/constraints -- so `copy table-data`
+          # copies the HEAP and nothing else. `pgcopydb clone` would re-run both
+          # schema sections and collide with phases 0/3 (re-tripping the Azure
+          # extension/ownership walls). --skip-vacuum + no index build fall out of
+          # `copy table-data`; the wrapper adds --resume --restart=false so a
+          # backed-off pod continues on its RWO disk. See
+          # notes/migration-phases-lessons-learned.md items 2 and 6.
+          command: ["python", "-m", "pg_cyan.cli", "copy-shard"]
           envFrom:
             - secretRef:
                 name: pgcyan-db-uris
-          # TODO(orchestrator): substitute these from plan.json > data_shards[i].
+          # TODO(orchestrator): substitute these from plan.json (top-level
+          # slot/publication) and plan.json > data_shards[i].
           env:
             # The exported snapshot id, published by the phase-1 holder into the
             # pgcyan-snapshot ConfigMap. Every shard reads the same key, so they
@@ -128,12 +143,32 @@ spec:
                 configMapKeyRef:
                   name: pgcyan-snapshot
                   key: snapshot
+            - name: SHARD_NAME
+              value: "${SHARD_NAME}"             # e.g. shard-0 (recorded in the log)
             - name: FILTER_FILE
               value: "${FILTER_FILE}"            # e.g. shard-0.filters
+            - name: SLOT_NAME
+              value: "${SLOT_NAME}"              # from plan.json > slot.name (for the log)
+            - name: PUBLICATION_NAME
+              value: "${PUBLICATION_NAME}"       # from plan.json > publication.name (for the log)
             - name: TABLE_JOBS
               value: "${TABLE_JOBS}"             # e.g. 4  (intra-shard COPY processes)
             - name: SPLIT_TABLES_LARGER_THAN
               value: "${SPLIT_TABLES_LARGER_THAN}"  # e.g. 50GB
+            # Filter files are mounted at /plan; the copy log lands next to the
+            # pgcopydb catalog on this shard's own RWO work disk.
+            - name: PGCYAN_PLAN_DIR
+              value: "/plan"
+            - name: PG_OUTPUT_DIR
+              value: "/work"
+            # The shard publishes its copy log to pgcyan-copylog-${SHARD_NAME}
+            # (derived from SHARD_NAME by the wrapper) in THIS pod's namespace, so
+            # the orchestrator can read it. The narrow configmaps grant is on the
+            # pgcyan-worker SA (01-rbac.yaml).
+            - name: PGCYAN_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           volumeMounts:
             - name: workdir
               mountPath: /work

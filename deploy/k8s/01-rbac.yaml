@@ -9,10 +9,15 @@
 #      express on its own.
 #
 #   2. pgcyan-worker -- the data-plane identity used by every pgcopydb Job/pod
-#      (pre-data, snapshot holder, data shards, index/FK, CDC). Workers need NO
-#      Kubernetes API access at all -- they only talk to Postgres. They get a
-#      near-empty ServiceAccount purely so we can bind Azure Workload Identity
-#      (federated) credentials to it instead of shipping static DB passwords.
+#      (pre-data, snapshot holder, data shards, index/FK, CDC). Workers mostly
+#      just talk to Postgres, and get a ServiceAccount primarily so we can bind
+#      Azure Workload Identity (federated) credentials to it instead of shipping
+#      static DB passwords. The ONE Kubernetes API grant they need is a narrow
+#      configmaps create/get/patch: a data shard (#25) writes its per-table copy
+#      log to a pgcyan-copylog-<shard> ConfigMap (its work dir is a private RWO
+#      disk the orchestrator cannot mount, so the ConfigMap is the durable handoff
+#      the orchestrator reads to aggregate the combined migration-copy-log.json).
+#      Nothing else -- no jobs/pods/secrets/deployments.
 #
 #   3. pgcyan-viewer -- a read-only *observer* identity. It runs no workload; it
 #      exists so an out-of-cluster operator can watch the migration -- pods, logs,
@@ -90,6 +95,37 @@ subjects:
 roleRef:
   kind: Role
   name: pgcyan-orchestrator
+  apiGroup: rbac.authorization.k8s.io
+---
+# --- pgcyan-worker: one narrow grant so a data shard can publish its copy log --
+# The data shards (#25) write their per-table copy log to a pgcyan-copylog-<shard>
+# ConfigMap, which the orchestrator reads to build the combined
+# migration-copy-log.json. That is the ONLY Kubernetes API a worker touches --
+# no jobs, pods, secrets, or deployments. (`create` cannot be scoped to a name in
+# RBAC, so it is namespace-wide for configmaps; get/patch keep a resumed shard's
+# re-publish idempotent.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcyan-worker
+  namespace: pgcyan-migration
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcyan-worker
+  namespace: pgcyan-migration
+subjects:
+  - kind: ServiceAccount
+    name: pgcyan-worker
+    namespace: pgcyan-migration
+roleRef:
+  kind: Role
+  name: pgcyan-worker
   apiGroup: rbac.authorization.k8s.io
 ---
 # --- pgcyan-viewer: read-only observer (see header, identity 3) --------------

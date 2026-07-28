@@ -25,7 +25,7 @@ phase −2 input collector are assumed already applied).
 | `30-job-planner.yaml` | −1 | Job | runs the planner (`pg_cyan.cli plan`) |
 | `40-job-phase0-predata.yaml` | 0 | Job | `pg_cyan.cli restore-predata`: pre-data schema only (tables/sequences) — NO secondary indexes, PK/unique, FK, or triggers (those are post-data, #28); pins the dump to the holder's snapshot, so it runs AFTER phase 1 |
 | `50-deployment-snapshot-holder.yaml` | 1 | Deployment(1)+PDB | `pg_cyan.cli snapshot-hold`: creates publication + pgoutput slot, exports & HOLDS the consistent snapshot, publishes the id to the `pgcyan-snapshot` ConfigMap |
-| `60-job-phase2-datashard.template.yaml` | 2 | PVC+Job × N | concurrent HEAP-only COPY shards, each on its own RWO work disk |
+| `60-job-phase2-datashard.template.yaml` | 2 | PVC+Job × N | `pg_cyan.cli copy-shard`: concurrent DATA-ONLY (`pgcopydb copy table-data`) COPY shards, each on its own RWO work disk; writes per-shard `migration-copy-log.json` and publishes it to its `pgcyan-copylog-<shard>` ConfigMap (slot/publication/snapshot + per-table row counts), which the orchestrator merges into the combined `pgcyan-copylog` ConfigMap |
 | `70-job-phase3-index.template.yaml` | 3a | PVC+Job × M | secondary index builds (shardable), each on its own RWO work disk |
 | `71-job-phase3-fk.yaml` | 3b | Job (single) | FK/constraint single coordinated pass |
 | `80-deployment-follow-cdc.yaml` | 4 | Deployment(1)+PDB | optional CDC catch-up → cutover |

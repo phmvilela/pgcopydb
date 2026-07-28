@@ -14,6 +14,7 @@ import pytest
 import yaml
 from kubernetes.client.rest import ApiException
 
+from pg_cyan.datashard import PgCyanDataShard
 from pg_cyan.orchestrator import OrchestratorError, PgCyanOrchestrator
 
 
@@ -104,7 +105,8 @@ def _pgcyan_image_env(monkeypatch):
 
 
 class FakeCoreApi:
-    def __init__(self, plan=None, missing=False, pod_containers=None, pvc_conflicts=None):
+    def __init__(self, plan=None, missing=False, pod_containers=None, pvc_conflicts=None,
+                 shard_copylogs=None, configmap_conflicts=None):
         self._plan = plan
         self._missing = missing
         #: list of (name, image) tuples for read_namespaced_pod, used by the
@@ -113,11 +115,26 @@ class FakeCoreApi:
         #: PVCs the orchestrator creates (issue #58 per-shard RWO work disks).
         self.created_pvcs = []
         self._pvc_conflicts = pvc_conflicts or set()
+        #: per-shard copy-log ConfigMaps the shards published: {shard_name: payload}.
+        #: Returned (labelled copylog=shard) by list_namespaced_config_map so the
+        #: orchestrator can aggregate them (issue #25).
+        self._shard_copylogs = shard_copylogs or {}
+        #: ConfigMaps the orchestrator create/replaces (name -> data dict).
+        self.configmaps = {}
+        self._configmap_conflicts = configmap_conflicts or set()
 
     def read_namespaced_config_map(self, name, namespace):
         if self._missing:
             raise ApiException(status=404, reason="NotFound")
         return _Obj(data={"plan.json": json.dumps(self._plan)})
+
+    def list_namespaced_config_map(self, namespace, label_selector=None):
+        items = [
+            _Obj(metadata=_Obj(name=f"pgcyan-copylog-{shard}"),
+                 data={PgCyanDataShard.COPY_LOG_CONFIGMAP_KEY: json.dumps(payload)})
+            for shard, payload in self._shard_copylogs.items()
+        ]
+        return _Obj(items=items)
 
     def read_namespaced_pod(self, name, namespace):
         containers = [_Obj(name=n, image=img) for n, img in self._pod_containers]
@@ -129,9 +146,20 @@ class FakeCoreApi:
             raise ApiException(status=409, reason="AlreadyExists")
         self.created_pvcs.append((namespace, name, body))
 
+    def create_namespaced_config_map(self, namespace, body):
+        name = body.metadata.name
+        if name in self._configmap_conflicts:
+            raise ApiException(status=409, reason="AlreadyExists")
+        self.configmaps[name] = body.data
+
+    def replace_namespaced_config_map(self, name, namespace, body):
+        self.configmaps[name] = body.data
+
 
 SAMPLE_PLAN = {
     "run_id": "pgcyan-test-run",
+    "slot": {"name": "pgcyan_slot"},
+    "publication": {"name": "pgcyan_pub"},
     "data_shards": [
         {
             "name": "shard-0", "filter_file": "shard-0.filters", "table_jobs": 4,
@@ -527,3 +555,124 @@ def test_run_fails_fast_when_one_of_two_data_shards_fails():
     targets_by_name = {t["name"]: t for t in data_phase["targets"]}
     assert targets_by_name["pgcyan-datashard-shard-0"]["success"] is True
     assert targets_by_name["pgcyan-datashard-shard-1"]["success"] is False
+
+
+# ------------------------------------------------ slot/publication in shard env
+
+def _shard_env(job_doc):
+    """Return the container env of a rendered data-shard Job as a name->value dict."""
+    container = job_doc["spec"]["template"]["spec"]["containers"][0]
+    return {e["name"]: e.get("value") for e in container["env"]}
+
+
+def test_data_shard_env_carries_plan_slot_and_publication():
+    orch = make_orchestrator()
+    phase = dict(PgCyanOrchestrator.PHASES[3])  # data-shards
+    docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
+    job = next(d for d in docs if d["kind"] == "Job")
+    env = _shard_env(job)
+    # slot/publication are plan-level and flow into the shard log via env.
+    assert env["SLOT_NAME"] == "pgcyan_slot"
+    assert env["PUBLICATION_NAME"] == "pgcyan_pub"
+    assert env["SHARD_NAME"] == "shard-0"
+    # the shard runs the Python wrapper, not a raw pgcopydb clone.
+    assert job["spec"]["template"]["spec"]["containers"][0]["command"] == [
+        "python", "-m", "pg_cyan.cli", "copy-shard",
+    ]
+
+
+# ----------------------------------------------------- copy-log aggregation
+
+def _shard_log(shard, tables, slot="pgcyan_slot", pub="pgcyan_pub", snap="0000000A-1"):
+    """Build a per-shard copy-log payload (as a shard would publish to its CM)."""
+    return {
+        "component": "data-shard", "status": "completed", "shard": shard,
+        "slot": slot, "publication": pub, "snapshot": snap, "tables": tables,
+    }
+
+
+def test_merge_copy_logs_unions_disjoint_tables_and_sums_rows():
+    orch = make_orchestrator()
+    logs = [
+        {"shard": "shard-0", "slot": "pgcyan_slot", "publication": "pgcyan_pub",
+         "snapshot": "0000000A-1", "tables": {"public.orders": 10, "public.customers": 20}},
+        {"shard": "shard-1", "slot": "pgcyan_slot", "publication": "pgcyan_pub",
+         "snapshot": "0000000A-1", "tables": {"shop.items": 30}},
+    ]
+    merged = orch._merge_copy_logs(logs)
+    assert merged["status"] == "completed"
+    assert merged["slot"] == "pgcyan_slot"
+    assert merged["publication"] == "pgcyan_pub"
+    assert merged["snapshot"] == "0000000A-1"
+    assert merged["shard_count"] == 2
+    assert merged["table_count"] == 3
+    assert merged["row_count_total"] == 60
+    assert merged["tables"]["shop.items"] == 30
+    assert merged["warnings"] == []
+
+
+def test_merge_copy_logs_flags_snapshot_disagreement():
+    orch = make_orchestrator()
+    logs = [
+        {"shard": "shard-0", "snapshot": "0000000A-1", "tables": {"a.b": 1}},
+        {"shard": "shard-1", "snapshot": "0000000B-2", "tables": {"c.d": 2}},
+    ]
+    merged = orch._merge_copy_logs(logs)
+    assert any("disagree on snapshot" in w for w in merged["warnings"])
+
+
+def test_aggregate_copy_logs_publishes_combined_configmap():
+    core = FakeCoreApi(
+        plan=SAMPLE_PLAN,
+        shard_copylogs={
+            "shard-0": _shard_log("shard-0", {"public.orders": 10, "public.customers": 20}),
+            "shard-1": _shard_log("shard-1", {"shop.items": 30}),
+        },
+    )
+    orch = make_orchestrator(core_api=core)
+    combined = orch._aggregate_copy_logs()
+
+    assert combined["row_count_total"] == 60
+    assert combined["table_count"] == 3
+    assert combined["published"] is True
+    # published into the pgcyan-copylog ConfigMap under the expected key
+    published = core.configmaps[PgCyanOrchestrator.COPY_LOG_CONFIGMAP]
+    payload = json.loads(published[PgCyanOrchestrator.COPY_LOG_KEY])
+    assert payload["row_count_total"] == 60
+    assert payload["tables"]["public.orders"] == 10
+
+
+def test_aggregate_copy_logs_empty_when_no_shard_logs():
+    core = FakeCoreApi(plan=SAMPLE_PLAN, shard_copylogs={})
+    orch = make_orchestrator(core_api=core)
+    combined = orch._aggregate_copy_logs()
+    assert combined["shard_count"] == 0
+    assert combined["row_count_total"] == 0
+    assert any("No shard copy logs" in w for w in combined["warnings"])
+
+
+def test_full_run_aggregates_copy_logs_on_phase_two_success():
+    batch_api = FakeBatchApi(job_outcomes={
+        "pgcyan-planner": ["complete"],
+        "pgcyan-phase0-predata": ["complete"],
+        "pgcyan-datashard-shard-0": ["complete"],
+        "pgcyan-datashard-shard-1": ["complete"],
+        "pgcyan-index-idx-0": ["complete"],
+        "pgcyan-index-idx-1": ["complete"],
+        "pgcyan-phase3-fk": ["complete"],
+    })
+    apps_api = _all_deployments_ready_apps_api()
+    core = FakeCoreApi(
+        plan=SAMPLE_PLAN,
+        shard_copylogs={
+            "shard-0": _shard_log("shard-0", {"public.orders": 10, "public.customers": 20}),
+            "shard-1": _shard_log("shard-1", {"shop.items": 30}),
+        },
+    )
+    orch = make_orchestrator(batch_api=batch_api, apps_api=apps_api, core_api=core)
+    summary = orch.run()
+
+    assert summary["status"] == "success"
+    data_phase = next(p for p in summary["phases"] if p["phase"] == "2")
+    assert data_phase["copy_log"]["row_count_total"] == 60
+    assert PgCyanOrchestrator.COPY_LOG_CONFIGMAP in core.configmaps

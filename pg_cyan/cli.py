@@ -18,6 +18,7 @@ import sys
 import click
 
 from pg_cyan import __version__
+from pg_cyan.datashard import PgCyanDataShard
 from pg_cyan.lobs import PgCyanLobs
 from pg_cyan.metrics import PgCyanMetrics
 from pg_cyan.orchestrator import PgCyanOrchestrator
@@ -417,6 +418,78 @@ def restore_predata(source_pguri: str, target_pguri: str, snapshot_id: str,
         no_owner=no_owner, drop_if_exists=drop_if_exists,
         skip_extensions=skip_extensions, not_consistent=not_consistent,
         restore_jobs=restore_jobs, pgcopydb_bin=pgcopydb_bin,
+    )
+    try:
+        summary = worker.run()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="copy-shard")
+@click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
+              show_default="$PGCOPYDB_SOURCE_PGURI",
+              help="Source libpq URI (pgcopydb-native); passed to the copy step.")
+@click.option("--target-pguri", default=lambda: os.getenv("PGCOPYDB_TARGET_PGURI"),
+              show_default="$PGCOPYDB_TARGET_PGURI",
+              help="Target libpq URI (pgcopydb-native); also used for the per-table count(*).")
+@click.option("--snapshot", "snapshot_id", default=lambda: os.getenv("SNAPSHOT_ID"),
+              show_default="$SNAPSHOT_ID",
+              help="Exported snapshot id from the phase-1 holder to pin the copy to.")
+@click.option("--filter-file", default=lambda: os.getenv("FILTER_FILE"),
+              show_default="$FILTER_FILE",
+              help="Shard filter file (e.g. shard-0.filters), resolved under $PGCYAN_PLAN_DIR.")
+@click.option("--shard-name", default=lambda: os.getenv("SHARD_NAME"),
+              show_default="$SHARD_NAME", help="This shard's name (e.g. shard-0), recorded in the log.")
+@click.option("--slot-name", default=lambda: os.getenv("SLOT_NAME") or os.getenv("PGCYAN_SLOT"),
+              show_default="$SLOT_NAME / $PGCYAN_SLOT", help="Replication slot name, recorded in the log.")
+@click.option("--publication-name",
+              default=lambda: os.getenv("PUBLICATION_NAME") or os.getenv("PGCYAN_PUBLICATION"),
+              show_default="$PUBLICATION_NAME / $PGCYAN_PUBLICATION", help="Publication name, recorded in the log.")
+@click.option("--table-jobs", type=int,
+              default=lambda: int(os.getenv("TABLE_JOBS", str(PgCyanDataShard.DEFAULT_TABLE_JOBS))),
+              show_default="$TABLE_JOBS", help="pgcopydb --table-jobs (intra-shard COPY parallelism).")
+@click.option("--split-tables-larger-than",
+              default=lambda: os.getenv("SPLIT_TABLES_LARGER_THAN", PgCyanDataShard.DEFAULT_SPLIT_THRESHOLD),
+              show_default="$SPLIT_TABLES_LARGER_THAN", help="pgcopydb --split-tables-larger-than threshold.")
+@click.option("--count-rows/--no-count-rows",
+              default=lambda: os.getenv("PGCYAN_COUNT_ROWS", "true").strip().lower() in ("1", "true", "yes", "on"),
+              help="Count rows on the target after the copy (verification; disable for very large tables).")
+def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_file: str,
+               shard_name: str, slot_name: str, publication_name: str,
+               table_jobs: int, split_tables_larger_than: str, count_rows: bool) -> None:
+    """Copy one disjoint shard's table DATA to the target, pinned to the snapshot.
+
+    A thin wrapper over ``pgcopydb copy table-data`` (DATA ONLY -- phase 0 already
+    created the schema, phase 3 builds the indexes/constraints), restricted to
+    this shard's ``[include-only-table]`` filter set and pinned to the phase-1
+    holder's ``--snapshot`` so every shard copies the same instant. Resumable on
+    its own RWO work disk (``--resume --restart=false``). After the copy it counts
+    the rows landed on the target per table and writes ``migration-copy-log.json``
+    (slot / publication / snapshot names + per-table row counts), or
+    ``migration-copy-log-errors.json`` on failure. The log is also published to a
+    per-shard ``pgcyan-copylog-<shard>`` ConfigMap for the orchestrator to
+    aggregate across shards. Paths/ConfigMap/namespace are env-driven
+    ($PGCYAN_PLAN_DIR, $PGCYAN_WORK_DIR, $PG_OUTPUT_DIR, $PGCYAN_COPYLOG_CONFIGMAP,
+    $PGCYAN_NAMESPACE) -- the manifest sets them.
+    """
+    worker = PgCyanDataShard(
+        source_pguri=source_pguri or None,
+        target_pguri=target_pguri or None,
+        snapshot_id=snapshot_id or None,
+        filter_file=filter_file or None,
+        plan_dir=os.getenv("PGCYAN_PLAN_DIR", PgCyanDataShard.DEFAULT_PLAN_DIR),
+        shard_name=shard_name or None,
+        slot_name=slot_name or None, publication_name=publication_name or None,
+        work_dir=os.getenv("PGCYAN_WORK_DIR", PgCyanDataShard.DEFAULT_WORK_DIR),
+        output_dir=os.getenv("PG_OUTPUT_DIR") or None,
+        table_jobs=table_jobs, split_tables_larger_than=split_tables_larger_than,
+        count_rows=count_rows,
+        # Env-driven (the manifest sets these); not CLI flags to keep the surface lean.
+        copylog_configmap=os.getenv("PGCYAN_COPYLOG_CONFIGMAP") or None,
+        namespace=os.getenv("PGCYAN_NAMESPACE") or None,
+        kubectl_bin=os.getenv("KUBECTL_BIN", PgCyanDataShard.DEFAULT_KUBECTL_BIN),
     )
     try:
         summary = worker.run()

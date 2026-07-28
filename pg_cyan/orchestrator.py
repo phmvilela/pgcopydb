@@ -74,6 +74,8 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
 
+from pg_cyan.datashard import PgCyanDataShard
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(message)s"
@@ -87,8 +89,13 @@ class OrchestratorError(Exception):
     """Raised for orchestrator-fatal problems (bad manifest, unreadable plan, ...)."""
 
 
-def _data_shard_substitutions(entry: Dict) -> Dict[str, str]:
-    """Map a ``plan.json > data_shards[i]`` entry onto 60-*.template.yaml placeholders."""
+def _data_shard_substitutions(entry: Dict, plan: Dict) -> Dict[str, str]:
+    """Map a ``plan.json > data_shards[i]`` entry onto 60-*.template.yaml placeholders.
+
+    Slot/publication names are plan-LEVEL (one snapshot/slot for the whole run),
+    so they come from ``plan`` rather than the per-shard entry; the shard records
+    them in its migration-copy-log.json.
+    """
     resources = entry.get("resources") or {}
     cpu = str(resources.get("cpu", "1"))
     memory = str(resources.get("memory", "1Gi"))
@@ -97,6 +104,8 @@ def _data_shard_substitutions(entry: Dict) -> Dict[str, str]:
         "FILTER_FILE": str(entry["filter_file"]),
         "TABLE_JOBS": str(entry["table_jobs"]),
         "SPLIT_TABLES_LARGER_THAN": str(entry["split_tables_larger_than"]),
+        "SLOT_NAME": str((plan.get("slot") or {}).get("name", "")),
+        "PUBLICATION_NAME": str((plan.get("publication") or {}).get("name", "")),
         "CPU_REQUEST": cpu,
         "MEM_REQUEST": memory,
         "CPU_LIMIT": cpu,
@@ -104,7 +113,7 @@ def _data_shard_substitutions(entry: Dict) -> Dict[str, str]:
     }
 
 
-def _index_shard_substitutions(entry: Dict) -> Dict[str, str]:
+def _index_shard_substitutions(entry: Dict, plan: Dict) -> Dict[str, str]:
     """Map a ``plan.json > index_shards[i]`` entry onto 70-*.template.yaml placeholders."""
     return {
         "INDEX_SHARD_NAME": str(entry["name"]),
@@ -123,6 +132,18 @@ class PgCyanOrchestrator:
     )
     DEFAULT_PLAN_CONFIGMAP = "pgcyan-plan"
     PLAN_KEY = "plan.json"
+    #: The combined per-table copy log the orchestrator aggregates from the
+    #: per-shard copy-log ConfigMaps and publishes for operators (mirrors
+    #: pgcyan-plan / pgcyan-snapshot). Its single key holds the merged
+    #: migration-copy-log.json; it is labelled ``copylog=combined`` so the
+    #: per-shard selector below never reads it back in.
+    COPY_LOG_CONFIGMAP = "pgcyan-copylog"
+    COPY_LOG_KEY = PgCyanDataShard.COPY_LOG_CONFIGMAP_KEY
+    #: Label selector for the per-shard copy-log ConfigMaps each data shard (#25)
+    #: publishes (pgcyan-copylog-<shard>). The orchestrator lists these and merges
+    #: them -- the shards run under an API-less-except-configmaps SA and write to
+    #: private RWO disks, so the ConfigMap is the durable handoff.
+    SHARD_COPYLOG_SELECTOR = PgCyanDataShard.COPY_LOG_LABEL + "=shard"
     DEFAULT_POLL_INTERVAL = 5
     DEFAULT_JOB_TIMEOUT = 3600
     #: Placeholder every manifest carries in place of a concrete image; the
@@ -149,6 +170,7 @@ class PgCyanOrchestrator:
         {
             "id": "2", "name": "data-shards", "template": "60-job-phase2-datashard.template.yaml",
             "plan_key": "data_shards", "needs_plan": True, "substitutions": _data_shard_substitutions,
+            "aggregate_copy_logs": True,
         },
         {
             "id": "3a", "name": "index", "template": "70-job-phase3-index.template.yaml",
@@ -344,7 +366,7 @@ class PgCyanOrchestrator:
             image = self._resolve_image()
             docs = []
             for entry in entries:
-                subs = dict(phase["substitutions"](entry))
+                subs = dict(phase["substitutions"](entry, plan or {}))
                 subs[self.IMAGE_PLACEHOLDER] = image  # strict _substitute fills the image too
                 # Templated phase files carry MORE than one document -- a per-shard
                 # RWO work-dir PVC precedes each Job (issue #58) -- so extend.
@@ -473,6 +495,169 @@ class PgCyanOrchestrator:
                 f"Plan ConfigMap {self.plan_configmap} '{self.PLAN_KEY}' is not valid JSON: {e}"
             ) from e
 
+    # ----------------------------------------------------- copy-log aggregation
+
+    def _read_shard_copy_logs(self) -> List[Dict]:
+        """
+        Read every per-shard copy-log ConfigMap and return the parsed dicts.
+
+        Each data shard (#25) publishes its ``migration-copy-log.json`` to a
+        labelled ``pgcyan-copylog-<shard>`` ConfigMap (the shard's work dir is a
+        private RWO disk the orchestrator cannot mount, so the ConfigMap is the
+        durable, structured handoff). We list them by label and parse the one key.
+        Dedups by shard name. Never raises -- an unreadable/garbage ConfigMap is
+        skipped with a warning.
+        """
+        try:
+            cms = self.core_api.list_namespaced_config_map(
+                namespace=self.namespace, label_selector=self.SHARD_COPYLOG_SELECTOR
+            )
+        except ApiException as e:
+            self._log_event(
+                "aggregate", "warning",
+                "Could not list per-shard copy-log ConfigMaps to aggregate",
+                {"error": e.reason or str(e)},
+            )
+            return []
+
+        by_shard: Dict[str, Dict] = {}
+        for cm in cms.items or []:
+            name = cm.metadata.name if cm.metadata else "<unknown>"
+            raw = (cm.data or {}).get(self.COPY_LOG_KEY)
+            if not raw:
+                self._log_event(
+                    "aggregate", "warning",
+                    f"Copy-log ConfigMap {name} has no '{self.COPY_LOG_KEY}' key",
+                    {"configmap": name},
+                )
+                continue
+            try:
+                block = json.loads(raw)
+            except ValueError as e:
+                self._log_event(
+                    "aggregate", "warning", f"Copy-log ConfigMap {name} is not valid JSON",
+                    {"configmap": name, "error": str(e)},
+                )
+                continue
+            if not isinstance(block, dict):
+                continue
+            shard_key = str(block.get("shard") or name)
+            by_shard[shard_key] = block
+        return list(by_shard.values())
+
+    def _merge_copy_logs(self, shard_logs: List[Dict]) -> Dict:
+        """
+        Merge the per-shard copy logs into one combined migration-copy-log.json.
+
+        Shard filter sets are disjoint by construction (planner #38), so the
+        combined ``tables`` map is their union; ``row_count_total`` sums the
+        counted rows. Slot/publication/snapshot are one-per-run, so a shard
+        disagreement is surfaced as a warning but does not fail aggregation.
+        """
+        tables: Dict[str, Optional[int]] = {}
+        warnings: List[str] = []
+        singletons: Dict[str, set] = {"slot": set(), "publication": set(), "snapshot": set()}
+        shard_names: List[str] = []
+
+        for log in shard_logs:
+            shard_names.append(str(log.get("shard")))
+            for field in singletons:
+                value = log.get(field)
+                if value:
+                    singletons[field].add(str(value))
+            for name, count in (log.get("tables") or {}).items():
+                if name in tables:
+                    warnings.append(f"Table {name} appeared in more than one shard log")
+                tables[name] = count
+
+        for field, values in singletons.items():
+            if len(values) > 1:
+                warnings.append(f"Shards disagree on {field}: {sorted(values)}")
+
+        counted = [v for v in tables.values() if isinstance(v, int)]
+        return {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "component": "orchestrator",
+            "status": "completed",
+            "slot": next(iter(singletons["slot"]), None),
+            "publication": next(iter(singletons["publication"]), None),
+            "snapshot": next(iter(singletons["snapshot"]), None),
+            "shard_count": len(shard_logs),
+            "shards": sorted(shard_names),
+            "table_count": len(tables),
+            "row_count_total": sum(counted) if counted else 0,
+            "tables": tables,
+            "warnings": warnings,
+        }
+
+    def _publish_copy_log_configmap(self, payload: Dict) -> bool:
+        """
+        Publish the combined copy log into the ``pgcyan-copylog`` ConfigMap.
+
+        Mirrors how the planner/holder publish their artifacts, so operators (and
+        the read-only viewer SA) can ``kubectl get configmap pgcyan-copylog``.
+        Create-or-replace so a re-run overwrites. Never raises.
+        """
+        body = k8s_client.V1ConfigMap(
+            metadata=k8s_client.V1ObjectMeta(
+                name=self.COPY_LOG_CONFIGMAP,
+                namespace=self.namespace,
+                # 'combined' (not 'shard') so SHARD_COPYLOG_SELECTOR never lists
+                # this aggregate back in as if it were a per-shard input.
+                labels={"pgcyan.dev/phase": "data",
+                        PgCyanDataShard.COPY_LOG_LABEL: "combined"},
+            ),
+            data={self.COPY_LOG_KEY: json.dumps(payload, indent=2, default=str) + "\n"},
+        )
+        try:
+            self.core_api.create_namespaced_config_map(namespace=self.namespace, body=body)
+        except ApiException as e:
+            if e.status == 409:
+                try:
+                    self.core_api.replace_namespaced_config_map(
+                        name=self.COPY_LOG_CONFIGMAP, namespace=self.namespace, body=body
+                    )
+                except ApiException as e2:
+                    self._log_event(
+                        "aggregate", "warning", "Could not replace the copy-log ConfigMap",
+                        {"configmap": self.COPY_LOG_CONFIGMAP, "error": e2.reason or str(e2)},
+                    )
+                    return False
+            else:
+                self._log_event(
+                    "aggregate", "warning", "Could not publish the copy-log ConfigMap",
+                    {"configmap": self.COPY_LOG_CONFIGMAP, "error": e.reason or str(e)},
+                )
+                return False
+        return True
+
+    def _aggregate_copy_logs(self) -> Dict:
+        """
+        Aggregate the phase-2 shard copy logs and publish the combined result.
+
+        Best-effort by design: the COPY barrier has already passed, so a failure
+        to aggregate the *reporting* artifact is a warning, not a migration
+        failure. Returns the combined payload (plus a ``published`` flag) so the
+        caller can attach it to the phase result and the run summary.
+        """
+        shard_logs = self._read_shard_copy_logs()
+        combined = self._merge_copy_logs(shard_logs)
+        if not shard_logs:
+            combined["warnings"].append(
+                "No shard copy logs found; the combined migration-copy-log.json is empty"
+            )
+        published = self._publish_copy_log_configmap(combined)
+        combined["published"] = published
+        self._log_event(
+            "aggregate",
+            "success" if shard_logs and published else "warning",
+            f"Aggregated {combined['shard_count']} shard copy log(s): "
+            f"{combined['table_count']} tables, {combined['row_count_total']} rows",
+            {"configmap": self.COPY_LOG_CONFIGMAP, "published": published,
+             "warnings": combined["warnings"]},
+        )
+        return combined
+
     # --------------------------------------------------------------- phases
 
     def _apply_phase(self, phase: Dict, plan: Optional[Dict]) -> Dict:
@@ -528,6 +713,18 @@ class PgCyanOrchestrator:
                     "phase": phase["id"], "name": phase["name"], "success": False,
                     "targets": [], "error": str(e),
                 }
+
+            # Once a phase whose shards emit copy logs has cleared its barrier,
+            # aggregate the per-shard logs into the combined migration-copy-log.json
+            # (issue #25). Best-effort: never flips a passed barrier to failure.
+            if result["success"] and phase.get("aggregate_copy_logs"):
+                try:
+                    result["copy_log"] = self._aggregate_copy_logs()
+                except Exception as e:  # noqa: BLE001 - reporting must not fail the DAG
+                    self._log_event(
+                        "aggregate", "warning", "Copy-log aggregation raised; continuing",
+                        {"error": str(e)},
+                    )
 
             self._log_event(
                 "phase",

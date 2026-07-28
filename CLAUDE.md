@@ -67,10 +67,10 @@ literals — never f-string user/config values into SQL.
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
 `preflight`, `source-parameters`, `source-pg-metrics`,
-`source-largeobjects`, `plan`, `snapshot-hold`, `restore-predata`, and
-`orchestrate` are implemented. Options default to `PG_SOURCE_*` env vars so the same invocation
-works locally and in the container. Exit codes: `0` ready/success, `1` not
-ready/failure, `2` interrupted — keep these stable.
+`source-largeobjects`, `plan`, `snapshot-hold`, `restore-predata`,
+`copy-shard`, and `orchestrate` are implemented. Options default to `PG_SOURCE_*`
+env vars so the same invocation works locally and in the container. Exit codes:
+`0` ready/success, `1` not ready/failure, `2` interrupted — keep these stable.
 
 `source-parameters` (`pg_cyan/parameters.py`, `PgCyanParameters`) is the second
 orchestrator and the template for **artifact-producing** stages: instead of a
@@ -220,6 +220,43 @@ job of `.github/workflows/integration-tests.yml`, which stands up the holder,
 runs the phase-0 Job against a **real target**, and asserts the target ends up
 with tables but zero secondary indexes / FKs / triggers.
 
+`copy-shard` (`pg_cyan/datashard.py`, `PgCyanDataShard`) is the phase `2`
+**sharded initial copy** (issue #25): one Job per copy shard (stamped from
+`deploy/k8s/60-job-phase2-datashard.template.yaml`), all concurrent, each copying
+its OWN disjoint set of tables (the planner's `shard-<n>.filters`
+`[include-only-table]` list — disjointness is the whole no-overlap guarantee) so
+no row is copied twice and none is missed. Like `restore-predata` it is a thin
+pgcopydb wrapper (no psycopg2 for the copy itself), NOT a DB collector. The
+central design fact (resolved in #25 against the ticket's literal wording, per
+`notes/migration-phases-lessons-learned.md` item 6): it drives **`pgcopydb copy
+table-data`, NOT `pgcopydb clone`**. `clone` runs pre-data *and* post-data DDL
+around the COPY; phase 0 (#24) already did pre-data and phase 3 (#28) does
+post-data, so the shards must be **DATA ONLY** — `copy table-data` copies the
+HEAP and nothing else (no schema, no indexes, no vacuum), sidestepping the Azure
+extension/ownership walls (item 2) and collisions with phases 0/3. Pinned to the
+holder's `--snapshot` (from `$SNAPSHOT_ID`, the `pgcyan-snapshot` ConfigMap) so
+every shard copies the same instant; resumable on its own RWO disk (`--resume
+--restart=false`), so — unlike the non-resumable pre-data pod — it does **not**
+reset its work dir. It follows the orchestrator conventions (`_log_event`,
+graceful degradation — `run()` never raises) and the success-vs-error two-file
+shape: `migration-copy-log.json` on success (a `completed` status, the slot /
+publication / snapshot names, and per-table row counts), or
+`migration-copy-log-errors.json` on failure. The **row counts are ground truth**:
+after the COPY it runs `SELECT count(*)` on the **target** per table in the shard's
+filter set (pgcopydb's progress JSON only exposes the *source* `reltuples`
+estimate), gated by `--count-rows` / `$PGCYAN_COUNT_ROWS` (default on; disable for
+very large tables where the seq-scan — indexes are phase 3 — is too costly).
+Because the shard's work dir is a private RWO disk the orchestrator cannot mount,
+it ALSO publishes the copy log to its OWN **`pgcyan-copylog-<shard>` ConfigMap**
+(via `kubectl`, mirroring the snapshot holder), labelled `pgcyan.dev/copylog=shard`
+— that durable, structured ConfigMap is how the per-table counts reach the
+orchestrator (see below). The shard runs under the **`pgcyan-worker`** SA, which
+for exactly this is granted a narrow `configmaps: [create, get, patch]` in
+`01-rbac.yaml` (its only Kubernetes API access). Slot/publication are plan-level
+(one per run), so the orchestrator passes them into the shard via
+`SLOT_NAME`/`PUBLICATION_NAME` env (from `plan.json`'s top-level
+`slot.name`/`publication.name`), NOT the per-shard entry.
+
 `orchestrate` (`pg_cyan/orchestrator.py`, `PgCyanOrchestrator`) is the
 **migration DAG orchestrator** (issue #40) -- the `deploy/k8s/` manifests are
 the nodes, this is the edges. Design decision for the ticket's open question
@@ -239,9 +276,19 @@ the desired ready-replica count, since those run forever by design.
 not resolve to success stops the walk; later phases are never applied.
 `plan.json` is read from the `pgcyan-plan` ConfigMap via the API right before
 phase 2 needs it (not mounted as a volume, since that ConfigMap does not exist
-until the phase-(-1) planner Job creates it). Out of scope for this ticket
-(assumed already applied): the namespace/RBAC/PVC/Secrets (00/01/10/20) and
-the input-collector phase -2 (`25-job-collect-inputs.yaml`).
+until the phase-(-1) planner Job creates it). After the **phase-2 barrier**
+clears, the orchestrator **aggregates the per-shard copy logs** (issue #25): it
+lists the `pgcyan-copylog-<shard>` ConfigMaps each shard published (by the
+`pgcyan.dev/copylog=shard` label), merges the disjoint per-table counts into one
+combined `migration-copy-log.json`, and publishes it to the **`pgcyan-copylog`**
+ConfigMap (labelled `copylog=combined` so it is not read back as a shard input).
+This is best-effort — a passed COPY barrier is never flipped to failure by an
+aggregation hiccup (the copy is the deliverable; the combined log is reporting).
+(Running `orchestrate` itself in-cluster, and a `--stop-after` checkpoint knob,
+are deferred to **#70**, which folds the snapshot holder into a StatefulSet
+orchestrator.) Out of scope for this
+ticket (assumed already applied): the namespace/RBAC/PVC/Secrets (00/01/10/20)
+and the input-collector phase -2 (`25-job-collect-inputs.yaml`).
 
 ## Configuration & secrets
 
@@ -290,7 +337,11 @@ Exactly **four** GitHub workflows, each with one clear job (issue #50 cleanup):
   cluster-backed tests: a `planner` job (phase -2 -> -1), a
   `snapshot-holder` job (phase 1), and a `pre-data` job (phase 0, which stands
   up the holder then transfers schema to a real target -- needs `PG_TARGET_*`
-  secrets/variables). Add later phases here as they land.
+  secrets/variables). The **phase-2 data-shards** integration job (#25) is
+  deferred to **#70**: it is best driven by the in-cluster orchestrator that #70
+  builds (run the real DAG end-to-end) rather than re-implementing per-phase
+  `kubectl` glue here. The phase-2 wrapper + ConfigMap aggregation are covered by
+  the DB-free `tests/test_datashard.py` / `tests/test_orchestrator.py` meanwhile.
 - `.github/workflows/terraform-aks.yml` -- `terraform fmt`/`validate` for the
   AKS module.
 

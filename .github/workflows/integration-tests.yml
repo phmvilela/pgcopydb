@@ -25,9 +25,11 @@ name: Integration tests
 #                     the target ends up with tables but NO secondary indexes /
 #                     FKs / triggers. Transfers SCHEMA only, no table data.
 #
-# TODO (as phases 2/3/4 are wired up): fold them in here too -- ideally by
-# running the full `python -m pg_cyan.cli orchestrate` path end-to-end and
-# asserting the DAG completes, replacing these piecemeal per-phase jobs.
+# TODO (as phases 2/3/4 are wired up): fold them in here too. The phase-2 data
+# shards (#25) are best driven by the in-cluster orchestrator, which is being
+# built in #70 (fold the holder into a StatefulSet orchestrator) -- the phase-2
+# integration job lands there, running the real DAG end-to-end, rather than
+# re-implementing per-phase kubectl glue here.
 #
 # ---------------------------------------------------------------------------
 # PREREQUISITES (all one-time, see issue #50):

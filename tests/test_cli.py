@@ -9,6 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from pg_cyan import cli as cli_module
+from pg_cyan.datashard import PgCyanDataShard as RealDataShard
 from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
 from pg_cyan.predata import PgCyanPreData as RealPreData
@@ -169,6 +170,29 @@ class _StubPreData(RealPreData):
                 "snapshot": self.snapshot_id, "errors": []}
 
 
+class _StubDataShard(RealDataShard):
+    """Records constructor kwargs and a canned run() result.
+
+    Subclasses the real wrapper (like ``_StubPreData``) so the CLI's option
+    defaults, which read ``PgCyanDataShard.DEFAULT_*``, still resolve after
+    monkeypatching. Never launches pgcopydb or opens a connection.
+    """
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubDataShard.last_kwargs = kwargs
+        self.snapshot_id = kwargs.get("snapshot_id")
+        # Success unless the caller passes the sentinel "bad" target.
+        self._ok = kwargs.get("target_pguri") != "postgres://bad/db"
+
+    def run(self):
+        status = "success" if self._ok else "failure"
+        return {"status": status, "log_file": None, "log_error_file": None,
+                "shard": self.snapshot_id, "snapshot": self.snapshot_id,
+                "row_count_total": 0, "table_count": 0, "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
@@ -179,6 +203,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanOrchestrator", _StubOrchestrator)
     monkeypatch.setattr(cli_module, "PgCyanSnapshot", _StubSnapshot)
     monkeypatch.setattr(cli_module, "PgCyanPreData", _StubPreData)
+    monkeypatch.setattr(cli_module, "PgCyanDataShard", _StubDataShard)
     return CliRunner()
 
 
@@ -339,6 +364,54 @@ def test_restore_predata_owner_flag_overrides_default(runner):
     ])
     assert _StubPreData.last_kwargs["no_owner"] is False
     assert _StubPreData.last_kwargs["not_consistent"] is True
+
+
+def test_copy_shard_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, [
+        "copy-shard", "--target-pguri", "postgres://good/db",
+        "--snapshot", "0000000A-1", "--filter-file", "shard-0.filters",
+        "--shard-name", "shard-0",
+    ])
+    assert result.exit_code == 0
+    assert _StubDataShard.last_kwargs["target_pguri"] == "postgres://good/db"
+    assert _StubDataShard.last_kwargs["snapshot_id"] == "0000000A-1"
+    assert _StubDataShard.last_kwargs["filter_file"] == "shard-0.filters"
+    assert _StubDataShard.last_kwargs["shard_name"] == "shard-0"
+    # counting the copied rows is the verification default
+    assert _StubDataShard.last_kwargs["count_rows"] is True
+
+
+def test_copy_shard_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, [
+        "copy-shard", "--target-pguri", "postgres://bad/db",
+        "--snapshot", "0000000A-1", "--filter-file", "shard-0.filters",
+    ])
+    assert result.exit_code == 1
+
+
+def test_copy_shard_options_fall_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PGCOPYDB_SOURCE_PGURI", "postgres://src/db")
+    monkeypatch.setenv("PGCOPYDB_TARGET_PGURI", "postgres://tgt/db")
+    monkeypatch.setenv("SNAPSHOT_ID", "0000000B-2")
+    monkeypatch.setenv("FILTER_FILE", "shard-1.filters")
+    monkeypatch.setenv("SHARD_NAME", "shard-1")
+    monkeypatch.setenv("SLOT_NAME", "pgcyan_slot")
+    monkeypatch.setenv("PUBLICATION_NAME", "pgcyan_pub")
+    runner.invoke(cli_module.cli, ["copy-shard"])
+    assert _StubDataShard.last_kwargs["source_pguri"] == "postgres://src/db"
+    assert _StubDataShard.last_kwargs["target_pguri"] == "postgres://tgt/db"
+    assert _StubDataShard.last_kwargs["snapshot_id"] == "0000000B-2"
+    assert _StubDataShard.last_kwargs["filter_file"] == "shard-1.filters"
+    assert _StubDataShard.last_kwargs["slot_name"] == "pgcyan_slot"
+    assert _StubDataShard.last_kwargs["publication_name"] == "pgcyan_pub"
+
+
+def test_copy_shard_no_count_rows_flag(runner):
+    runner.invoke(cli_module.cli, [
+        "copy-shard", "--target-pguri", "postgres://good/db",
+        "--snapshot", "x", "--filter-file", "shard-0.filters", "--no-count-rows",
+    ])
+    assert _StubDataShard.last_kwargs["count_rows"] is False
 
 
 def test_orchestrate_exit_zero_on_success(runner):

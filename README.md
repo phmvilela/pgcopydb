@@ -231,6 +231,11 @@ set, otherwise the discrete `PG_SOURCE_*` variables.
 | `PGCYAN_PLUGIN`              | `pgoutput`  | `snapshot-hold`: logical decoding output plugin |
 | `PGCYAN_WORK_DIR`            | `/work/coordinator` | `snapshot-hold`: pgcopydb `--dir`; snapshot id written here |
 | `PGCYAN_PLAN_FILE`           | *(unset)*   | `snapshot-hold`: optional `plan.json` to source names/mode |
+| `PGCOPYDB_TARGET_PGURI`      | *(unset)*   | `restore-predata` / `copy-shard`: target libpq URI |
+| `SNAPSHOT_ID`               | *(unset)*   | `restore-predata` / `copy-shard`: holder's snapshot to pin to (from the `pgcyan-snapshot` ConfigMap) |
+| `FILTER_FILE`               | *(unset)*   | `copy-shard`: this shard's `shard-<n>.filters` (under `$PGCYAN_PLAN_DIR`) |
+| `PGCYAN_COUNT_ROWS`         | `true`      | `copy-shard`: count copied rows on the target (disable for very large tables; see #69) |
+| `PGCYAN_COPYLOG_CONFIGMAP`  | *(derived)* | `copy-shard`: per-shard copy-log ConfigMap (defaults to `pgcyan-copylog-<shard>`) |
 | `LOG_LEVEL`                  | `INFO`      | Log verbosity                    |
 
 ## Docker
