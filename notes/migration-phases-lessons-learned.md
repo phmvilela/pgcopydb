@@ -169,6 +169,48 @@ target isn't reachable from the GitHub runner — only from inside the cluster).
 Secret (`PGCOPYDB_TARGET_PGURI`) and the same "verify from an in-cluster pod, not
 the runner" pattern. Target roles must be pre-created (we run `--no-owner`).
 
+## 9. Least-privilege SA + `*/status` subresources ⇒ barrier read Forbidden
+
+**What happened (bringing the folded controller #70 green):** the orchestrator
+polls each phase barrier with `read_namespaced_job_status` /
+`read_namespaced_deployment_status` — i.e. the **`jobs/status` and
+`deployments/status` subresources**. Kubernetes RBAC does **not** fold a status
+subresource into a grant on its parent: a Role that grants `jobs` (create/get/…)
+still gets `Forbidden` on `jobs/status`. So `create` worked (the planner Job ran
+and completed on its own) but the orchestrator's barrier read was denied, halting
+the DAG before pre-data.
+
+**Why it only surfaced now:** this is the least-privilege-SA fidelity gap. The old
+integration jobs drove the cluster with the *runner's* (near-admin) kubeconfig, so
+the orchestrator SA's own reads were never exercised until the controller ran
+in-pod under `pgcyan-orchestrator`. **Fix:** add `jobs/status` +
+`deployments/status` to the Role in `01-rbac.yaml` (a unit test,
+`test_orchestrator_rbac_grants_status_subresources`, locks it). **For #26/#28:**
+any new in-pod API read of a `*/status` (or a whole new resource kind) needs its
+own grant — a create grant is not enough.
+
+## 10. pgcopydb flags are NOT portable across sub-commands
+
+**What happened (first cluster run of phase 2):** every shard crash-looped with
+`table-data: option '--restart' doesn't allow an argument` (rc=1). The command
+built `pgcopydb copy table-data ... --resume --restart=false`. On `copy
+table-data`, `--restart` is a **boolean flag** — it takes no value. The
+`--restart=false` was carried over verbatim from the pre-#25 `pgcopydb clone`
+manifest (which was never run on a cluster). "Resume, don't wipe" is served by
+`--resume` alone (restart defaults off and, when set, WIPES temp files). **Lesson:
+verify every flag against `pgcopydb <subcommand> --help`** — options and their
+arg-shapes differ between `clone`, `copy table-data`, `snapshot`, `restore`.
+
+## 11. Under the fold, "done" is the run-state marker, not pod readiness
+
+**What happened:** the controller's readiness probe flips Ready as soon as the
+snapshot is *established* — well before the DAG walk finishes. Watching pod
+readiness to decide "migration complete" is wrong; the completion signal is the
+`pgcyan-migration-state` ConfigMap going `succeeded`/`failed`. Also: a leftover
+`pgcyan-migration-state` from a prior run makes a fresh controller **refuse to
+resume** (parks not-ready) — clear it (and the plan/copylog CMs) between runs. The
+`run-integration-test` skill (`.claude/skills/`) has the full watch/clear runbook.
+
 ---
 
 ## Quick pgcopydb exit-code cheat sheet (from this saga)

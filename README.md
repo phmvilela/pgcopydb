@@ -32,8 +32,11 @@ pg_cyan/
   metrics.py           PgCyanMetrics: collect source database metrics
   lobs.py              PgCyanLobs: count source large objects
   planner.py           PgCyanPlanner: bin-pack shards + emit the migration plan
-  snapshot.py          PgCyanSnapshot: establish + hold the consistent snapshot
+  snapshot.py          PgCyanSnapshot: establish + hold the consistent snapshot (in-pod sub-component)
+  predata.py           PgCyanPreData: pre-data schema to target (phase 0)
+  datashard.py         PgCyanDataShard: one disjoint shard's data-only copy (phase 2)
   orchestrator.py      PgCyanOrchestrator: walk the deploy/k8s migration DAG
+  controller.py        PgCyanController: folded controller — holds snapshot + walks DAG (#70)
   cloud/azure/         Azure SDK integrations (skeleton)
   postgres/            PostgreSQL connection/introspection utils (skeleton)
 terraform/             Azure worker-VM provisioning (VNet, NSG, VM, cloud-init)
@@ -177,68 +180,55 @@ deferred follow-ups.
 Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
 directory).
 
-### Hold the consistent snapshot
+### Running the migration (in-cluster)
+
+The migration itself runs on Kubernetes, not by hand. The **controller**
+(`run-migration`, a single-pod StatefulSet) holds the consistent snapshot in its
+own pod and walks the whole DAG — planner → pre-data → data shards → index → FK →
+CDC — injecting the snapshot into each phase and owning every workload it creates.
+The individual phase commands (`restore-predata`, `copy-shard`, `orchestrate`) are
+the nodes it drives; you normally don't invoke them directly.
 
 ```bash
-# Establish and HOLD the publication + slot + consistent snapshot on the source
-python -m pg_cyan.cli snapshot-hold --work-dir /work/coordinator
+# In-cluster (what the StatefulSet runs): hold the snapshot + walk the DAG,
+# optionally stopping after a phase id (e.g. through the data copy) then parking.
+python -m pg_cyan.cli run-migration --stop-after 2
 ```
 
-`snapshot-hold` is the phase `1` **snapshot holder** — the safety-critical node
-in `deploy/k8s/50-deployment-snapshot-holder.yaml`. In one coordinated step it
-creates the publication `FOR ALL TABLES`, drives `pgcopydb snapshot --follow`
-to create the `pgoutput` replication slot and export its **consistent
-snapshot**, writes the snapshot id to the shared `/work` volume, and then
-**holds the exporting connection open** so every pre-data (#24) and sharded-copy
-(#25) pod pins the same instant. A PostgreSQL snapshot is only valid while its
-transaction stays open, so this runs as a Deployment (replicas=1 + PDB): if it
-dies the in-flight copy must `--restart` from a new snapshot. It does **not**
-create or advance a replication origin.
-
-On `SIGTERM`/`SIGINT` it terminates `pgcopydb`, which closes the replication
-connection cleanly — a graceful exit leaves no stale source connection behind.
-
-| Outcome | File(s) written                                            | Exit |
-|---------|------------------------------------------------------------|------|
-| Success | `source-pg-slot.json` + `source-pg-publication.json`, then holds until signalled | 0 |
-| Failure | `source-pg-slot-errors.json` / `source-pg-publication-errors.json` | 1 |
-| Interrupted | *(partial; child torn down)*                           | 2    |
-
-Outputs land in `--output-dir` (default `$PG_OUTPUT_DIR`, else `--work-dir`), so
-on the holder pod they sit next to the snapshot id on the shared `/work` volume.
-The connection string comes from pgcopydb's native `PGCOPYDB_SOURCE_PGURI` when
-set, otherwise the discrete `PG_SOURCE_*` variables.
+See `deploy/k8s/` (the manifests are the nodes) and
+`notes/k8s-sharded-migration-topology.md` (the engine one-pager) for the full
+picture, and the `run-integration-test` skill to exercise it on a cluster.
 
 ### Configuration (environment variables)
 
+Every CLI option falls back to an env var. The common ones — the rest are in each
+stage's `--help` and module docstring.
+
+<details>
+<summary>Full env-var reference</summary>
+
 | Variable                     | Default     | Purpose                          |
 |------------------------------|-------------|----------------------------------|
-| `PG_SOURCE_HOST`             | `localhost` | Source host                      |
-| `PG_SOURCE_PORT`             | `5432`      | Source port                      |
-| `PG_SOURCE_USER`             | `postgres`  | Source user                      |
-| `PG_SOURCE_PASSWORD`         | *(empty)*   | Source password                  |
-| `PG_SOURCE_DATABASE`         | `postgres`  | Source database                  |
+| `PG_SOURCE_{HOST,PORT,USER,PASSWORD,DATABASE}` | `localhost`/`5432`/`postgres`/*(empty)*/`postgres` | Source connection (all collector stages) |
 | `PREFLIGHT_TIMEOUT_SECONDS`  | `30`        | Connection timeout               |
 | `PG_OUTPUT_DIR`              | `.`         | Output dir for generated JSON    |
 | `PG_INPUTS_DIR`              | `.`         | `plan`: dir holding source artifacts |
 | `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
 | `PGCYAN_SNAPSHOT_MODE`       | `coordinator-held` | `plan`: snapshot strategy |
-| `PGCYAN_PUBLICATION`         | `pgcyan_pub` | `plan` / `snapshot-hold`: publication name |
-| `PGCYAN_SLOT`                | `pgcyan_slot` | `plan` / `snapshot-hold`: replication slot name |
+| `PGCYAN_PUBLICATION` / `PGCYAN_SLOT` | `pgcyan_pub` / `pgcyan_slot` | publication + replication-slot names |
 | `PGCYAN_RUN_ID`              | *(clock)*   | `plan`: opaque run identifier    |
-| `PGCOPYDB_SOURCE_PGURI`      | *(unset)*   | `snapshot-hold`: source libpq URI (else `PG_SOURCE_*`) |
-| `PGCYAN_PLUGIN`              | `pgoutput`  | `snapshot-hold`: logical decoding output plugin |
-| `PGCYAN_WORK_DIR`            | `/work/coordinator` | `snapshot-hold`: pgcopydb `--dir`; snapshot id written here |
-| `PGCYAN_PLAN_FILE`           | *(unset)*   | `snapshot-hold`: optional `plan.json` to source names/mode |
-| `PGCOPYDB_TARGET_PGURI`      | *(unset)*   | `restore-predata` / `copy-shard`: target libpq URI |
-| `SNAPSHOT_ID`               | *(unset)*   | `restore-predata` / `copy-shard`: holder's snapshot to pin to (from the `pgcyan-snapshot` ConfigMap) |
+| `PGCOPYDB_SOURCE_PGURI` / `PGCOPYDB_TARGET_PGURI` | *(unset)* | pgcopydb-native source/target libpq URIs (else `PG_SOURCE_*`) |
+| `SNAPSHOT_ID`               | *(unset)*   | `restore-predata` / `copy-shard`: consistent snapshot to pin to (**injected by the controller** — #70) |
 | `FILTER_FILE`               | *(unset)*   | `copy-shard`: this shard's `shard-<n>.filters` (under `$PGCYAN_PLAN_DIR`) |
 | `PGCYAN_COUNT_ROWS`         | `true`      | `copy-shard`: count copied rows on the target (disable for very large tables; see #69) |
 | `PGCYAN_COPYLOG_CONFIGMAP`  | *(derived)* | `copy-shard`: per-shard copy-log ConfigMap (defaults to `pgcyan-copylog-<shard>`) |
-| `PGCYAN_STOP_AFTER`         | *(unset)*   | `run-migration` / `orchestrate`: bring the DAG up through this phase id (e.g. `2`), then park |
+| `PGCYAN_STOP_AFTER`         | *(unset)*   | `run-migration` / `orchestrate`: walk the DAG through this phase id (e.g. `2`), then park |
 | `PGCYAN_READY_FILE`         | `/pgcopydb/ready` | `run-migration`: readiness-probe file; present == Ready, removed when parked/failed |
+| `PGCYAN_WORK_DIR`           | `/work`     | pgcopydb `--dir` (per-pod work disk) |
 | `LOG_LEVEL`                  | `INFO`      | Log verbosity                    |
+
+</details>
 
 ## Docker
 
@@ -287,22 +277,16 @@ PG_SOURCE_HOST=... PG_SOURCE_USER=... PG_SOURCE_PASSWORD=... PG_SOURCE_DATABASE=
     python -m pytest tests/integration -m integration
 ```
 
-It also runs manually from GitHub Actions via the **"Integration:
-pre-migration artifacts"** workflow (`workflow_dispatch` only — it's never
-triggered by push/PR). Connection details come from GitHub, split by
-sensitivity: credentials are repo **Secrets**, everything else is a plain
-repo **Variable**:
+### Cluster integration test
 
-| Name                  | Kind      | Purpose                |
-|------------------------|-----------|-------------------------|
-| `PG_SOURCE_HOST`      | Variable  | Source host             |
-| `PG_SOURCE_PORT`      | Variable  | Source port             |
-| `PG_SOURCE_DATABASE`  | Variable  | Source database         |
-| `PG_SOURCE_USER`      | Secret    | Source user             |
-| `PG_SOURCE_PASSWORD`  | Secret    | Source password         |
-
-The resulting `source-pg-metrics.json` and `pg-source-parameters.json` are
-uploaded as a workflow artifact for human review.
+The end-to-end migration is exercised by `.github/workflows/integration-tests.yml`
+(`workflow_dispatch` only) — it stands up the folded controller on AKS and walks
+the whole implemented DAG against real source+target Postgres, asserting the
+combined copy log and the target schema shape. Connection details come from GitHub
+(credentials as **Secrets**, hosts/ports/dbs as **Variables** — `PG_SOURCE_*` and
+`PG_TARGET_*`). To run or debug it, use the **`run-integration-test`** skill
+(`.claude/skills/`), which has the dispatch/watch/artifact-log flow and the known
+failure modes.
 
 ## Development & work tracking
 
