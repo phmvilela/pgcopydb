@@ -1,0 +1,210 @@
+"""
+Unit tests for the folded migration controller (`pg_cyan.cli run-migration`, #70).
+
+Cluster-free and process-free: the snapshot sub-component and the orchestrator
+are both injected as fakes, so nothing spawns pgcopydb or touches a cluster.
+Tests exercise the compose wiring (establish -> resolve owner -> walk with the id
+injected + owned + health-checked), the always-release-the-snapshot teardown, and
+the graceful-degradation branches (establish failure, no StatefulSet owner).
+"""
+import pytest
+from kubernetes.client.rest import ApiException
+
+from pg_cyan.controller import PgCyanController
+
+
+# ------------------------------------------------------------------- fakes
+
+class _Obj:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FakeProc:
+    def __init__(self, alive=True):
+        self._alive = alive
+
+    def poll(self):
+        return None if self._alive else 0
+
+
+class _FakeHolder:
+    def __init__(self, status="success", snapshot="SNAP-1", proc_alive=True):
+        self._summary = {"status": status, "snapshot_name": snapshot,
+                         "slot": "pgcyan_slot", "publication": "pgcyan_pub"}
+        self.proc = _FakeProc(proc_alive)
+        self.established = False
+        self.closed = False
+
+    def establish(self):
+        self.established = True
+        return self._summary
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeOrchestrator:
+    def __init__(self, result=None, **kwargs):
+        self.kwargs = kwargs
+        self._result = result or {"status": "success",
+                                  "phases": [{"phase": "2", "success": True}], "errors": []}
+
+    def run(self):
+        return self._result
+
+
+class _FakeCore:
+    """Fake CoreV1Api: owner-ref resolution + the run-state ConfigMap (claim/patch)."""
+
+    def __init__(self, owner_kind="StatefulSet", state_exists=False, state_status="running"):
+        self._owner_kind = owner_kind
+        # The pgcyan-migration-state marker: seed it to simulate a prior run
+        # (restart) that the fresh pod must refuse to resume.
+        self.state = {"status": state_status} if state_exists else None
+
+    def read_namespaced_pod(self, name, namespace):
+        ref = _Obj(api_version="apps/v1", kind=self._owner_kind,
+                   name="pgcyan-controller", uid="u-1", controller=True)
+        return _Obj(metadata=_Obj(owner_references=[ref]))
+
+    def create_namespaced_config_map(self, namespace, body):
+        if self.state is not None:
+            raise ApiException(status=409, reason="AlreadyExists")   # already claimed
+        self.state = dict(body.data)
+
+    def read_namespaced_config_map(self, name, namespace):
+        if self.state is None:
+            raise ApiException(status=404, reason="NotFound")
+        return _Obj(data=self.state)
+
+    def patch_namespaced_config_map(self, name, namespace, body):
+        self.state = {**(self.state or {}), **body["data"]}
+
+
+def _make_controller(holder=None, core=None, orch_result=None, capture=None, ready_file=None):
+    holder = holder or _FakeHolder()
+
+    def factory(**kwargs):
+        orch = _FakeOrchestrator(result=orch_result, **kwargs)
+        if capture is not None:
+            capture["orch"] = orch
+        return orch
+
+    return PgCyanController(
+        holder=holder, namespace="pgcyan-migration", pod_name="pgcyan-controller-0",
+        core_api=core or _FakeCore(), orchestrator_factory=factory,
+        ready_file=ready_file or "/tmp/pgcyan-test-ready-unused",
+    )
+
+
+# --------------------------------------------------------------------- tests
+
+def test_run_happy_path_establishes_walks_and_releases(tmp_path):
+    holder = _FakeHolder()
+    capture = {}
+    core = _FakeCore()
+    ready = tmp_path / "ready"
+    ctl = _make_controller(holder=holder, core=core, capture=capture, ready_file=str(ready))
+    summary = ctl.run()
+
+    assert summary["status"] == "success"
+    assert summary["ready"] is True
+    assert summary["snapshot"] == "SNAP-1"
+    assert summary["owned"] is True
+    assert holder.established is True
+    assert holder.closed is True                      # released in finally
+    assert ready.exists()                             # readiness probe passes
+    assert core.state["status"] == "succeeded"        # run-state marker updated
+    # the orchestrator was built with the snapshot injected + owned + health-checked
+    kw = capture["orch"].kwargs
+    assert kw["snapshot_id"] == "SNAP-1"
+    assert kw["owner_reference"]["kind"] == "StatefulSet"
+    assert kw["owner_reference"]["uid"] == "u-1"
+    assert callable(kw["health_check"])
+
+
+def test_refuse_to_resume_when_state_marker_exists(tmp_path):
+    # A prior run already claimed the state ConfigMap -> a restart must NOT
+    # re-snapshot; it parks not-ready.
+    holder = _FakeHolder()
+    capture = {}
+    core = _FakeCore(state_exists=True, state_status="running")
+    ready = tmp_path / "ready"
+    ready.write_text("stale")                         # a leftover ready file...
+    ctl = _make_controller(holder=holder, core=core, capture=capture, ready_file=str(ready))
+    summary = ctl.run()
+
+    assert summary["status"] == "halted"
+    assert summary["ready"] is False
+    assert holder.established is False                 # never established a new snapshot
+    assert "orch" not in capture                       # never walked
+    assert not ready.exists()                          # ...removed -> not ready
+    assert any("Refused to resume" in e for e in summary["errors"])
+
+
+def test_walk_failure_clears_readiness(tmp_path):
+    core = _FakeCore()
+    ready = tmp_path / "ready"
+    ctl = _make_controller(core=core, ready_file=str(ready),
+                           orch_result={"status": "failure", "phases": [], "errors": ["boom"]})
+    summary = ctl.run()
+    assert summary["status"] == "failure"
+    assert summary["ready"] is False
+    assert not ready.exists()                          # failure -> not ready
+    assert core.state["status"] == "failed"
+
+
+def test_health_check_reflects_the_snapshot_child():
+    holder = _FakeHolder(proc_alive=True)
+    capture = {}
+    ctl = _make_controller(holder=holder, capture=capture)
+    ctl.run()
+    health = capture["orch"].kwargs["health_check"]
+    assert health() is True
+    holder.proc = _FakeProc(alive=False)              # child dies
+    assert health() is False
+
+
+def test_establish_failure_aborts_before_walking():
+    holder = _FakeHolder(status="failure")
+    capture = {}
+    ctl = _make_controller(holder=holder, capture=capture)
+    summary = ctl.run()
+    assert summary["status"] == "failure"
+    assert "orch" not in capture                      # orchestrator never built
+    assert holder.closed is True                      # child still released
+
+
+def test_no_statefulset_owner_runs_unowned():
+    ctl = _make_controller(core=_FakeCore(owner_kind="ReplicaSet"))
+    summary = ctl.run()
+    assert summary["owned"] is False
+    assert summary["status"] == "success"             # still runs, just no cascade
+
+
+def test_walk_failure_propagates_and_releases():
+    holder = _FakeHolder()
+    ctl = _make_controller(holder=holder,
+                           orch_result={"status": "failure", "phases": [], "errors": ["boom"]})
+    summary = ctl.run()
+    assert summary["status"] == "failure"
+    assert "boom" in summary["errors"]
+    assert holder.closed is True
+
+
+def test_stop_after_flows_to_orchestrator():
+    capture = {}
+    ctl = _make_controller(capture=capture)
+    ctl.stop_after = "2"
+    ctl.run()
+    assert capture["orch"].kwargs["stop_after"] == "2"
+
+
+def test_resolve_owner_reference_shape():
+    ctl = _make_controller()
+    ref = ctl.resolve_owner_reference()
+    assert ref == {
+        "apiVersion": "apps/v1", "kind": "StatefulSet", "name": "pgcyan-controller",
+        "uid": "u-1", "controller": True, "blockOwnerDeletion": True,
+    }

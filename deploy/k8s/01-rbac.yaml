@@ -54,12 +54,19 @@ metadata:
   name: pgcyan-orchestrator
   namespace: pgcyan-migration
 rules:
-  # Create and supervise the phase Jobs and the snapshot-holder Deployment.
+  # Create and supervise the phase Jobs and the follow-CDC Deployment. The
+  # `*/status` subresources are SEPARATE from the parent in RBAC: the orchestrator
+  # polls each phase's barrier via read_namespaced_job_status /
+  # read_namespaced_deployment_status (the `jobs/status` / `deployments/status`
+  # subresources), which a grant on `jobs`/`deployments` alone does NOT cover --
+  # without them the barrier read is Forbidden even though create/get succeed
+  # (issue #70: the folded controller is the first thing to run these reads under
+  # this SA rather than the runner's kubeconfig).
   - apiGroups: ["batch"]
-    resources: ["jobs"]
+    resources: ["jobs", "jobs/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "deployments/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
   # PodDisruptionBudgets ship alongside the snapshot-holder/follow-cdc
   # Deployments (50/80) -- the orchestrator applies whatever a phase manifest

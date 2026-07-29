@@ -140,7 +140,10 @@ def test_build_copy_command_is_data_only_table_data(tmp_path, filter_file):
     assert "--table-jobs" in cmd and "4" in cmd
     assert "--split-tables-larger-than" in cmd and "50GB" in cmd
     assert "--skip-vacuum" in joined
-    assert "--resume" in cmd and "--restart=false" in cmd
+    # --resume (continue on the RWO disk), and --restart deliberately absent:
+    # `copy table-data` rejects `--restart=false`, and restart WIPES temp files.
+    assert "--resume" in cmd
+    assert not any(a.startswith("--restart") for a in cmd)
     # phase 2 builds no indexes; that is inherent to table-data (no --index-jobs).
     assert "--index-jobs" not in joined
 

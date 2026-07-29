@@ -1,10 +1,12 @@
 """
 Snapshot holder for the sharded pgcopydb topology (issue #23).
 
-This is the phase ``1`` node in ``deploy/k8s/`` (``50-deployment-snapshot-
-holder.yaml``): the single most safety-critical object in the migration. It
-establishes -- and then **holds** -- the consistent logical-replication setup on
-the *source* database in one coordinated step, so every downstream copy phase
+The single most safety-critical piece of the migration. Since issue #70 this is
+the **snapshot sub-component of the folded controller** (``pg_cyan/controller.py``
+holds it in-pod) -- NOT a standalone Deployment anymore (the old
+``50-deployment-snapshot-holder.yaml`` + ``snapshot-hold`` command were retired).
+It establishes -- and then **holds** -- the consistent logical-replication setup
+on the *source* database in one coordinated step, so every downstream copy phase
 pins the exact same instant:
 
   1. create the publication ``FOR ALL TABLES`` (idempotent),

@@ -22,10 +22,12 @@ consistent point the phase-1 holder (#23) exported and published into the
 all shards copy the same instant.
 
 RESUME: each shard has its OWN ReadWriteOnce managed disk mounted at ``--dir``
-(``/work``); ``--resume --restart=false`` means a killed/backed-off shard pod
-re-attaches the same disk and continues at per-table / per-part granularity,
-never redoing a completed table. So -- unlike the (non-resumable) pre-data pod --
-this stage does **not** wipe its work dir on start.
+(``/work``); ``--resume`` means a killed/backed-off shard pod re-attaches the
+same disk and continues at per-table / per-part granularity, never redoing a
+completed table. So -- unlike the (non-resumable) pre-data pod -- this stage does
+**not** wipe its work dir on start. (``--restart`` is deliberately NOT passed: it
+is a boolean flag that WIPES prior temp files, and ``copy table-data`` rejects
+``--restart=false`` outright.)
 
 Output (written to ``--output-dir`` / ``$PG_OUTPUT_DIR``, defaulting to the work
 dir), following the same success-vs-error two-file shape as the other stages
@@ -258,8 +260,11 @@ class PgCyanDataShard:
         DATA ONLY: ``copy table-data`` copies the heap and nothing else -- no
         schema (phase 0), no indexes/constraints (phase 3), no vacuum. Restricted
         to the shard's disjoint tables via ``--filters`` and pinned to the
-        holder's snapshot via ``--snapshot``. ``--resume --restart=false`` makes a
-        restarted pod continue on its RWO disk rather than start over.
+        holder's snapshot via ``--snapshot``. ``--resume`` makes a restarted pod
+        continue on its RWO disk rather than start over; ``--restart`` is
+        deliberately OMITTED -- it is a boolean flag (``copy table-data`` rejects
+        ``--restart=false`` outright) that WIPES prior temp files, the opposite of
+        what a resumable shard wants, and it is off by default anyway.
         """
         cmd = [self.PGCOPYDB_BIN, "copy", "table-data", "--dir", self.work_dir]
         # pgcopydb reads PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI from the env; pass
@@ -276,7 +281,7 @@ class PgCyanDataShard:
         if self.split_tables_larger_than:
             cmd += ["--split-tables-larger-than", str(self.split_tables_larger_than)]
         cmd.append("--skip-vacuum")
-        cmd += ["--resume", "--restart=false"]
+        cmd.append("--resume")
         if self.snapshot_id:
             cmd += ["--snapshot", self.snapshot_id]
         return cmd

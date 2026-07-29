@@ -23,12 +23,14 @@ phase −2 input collector are assumed already applied).
 | `20-pvc-workdir.yaml` | — | PVC (RWO ×3) | per-workload pgcopydb `--dir` disks (pre-data/FK/CDC); shards get one each, stamped by the templates — issue #58 |
 | `25-job-collect-inputs.yaml` | −2 | Job | collectors hit the source DB → write the inputs ConfigMap |
 | `30-job-planner.yaml` | −1 | Job | runs the planner (`pg_cyan.cli plan`) |
-| `40-job-phase0-predata.yaml` | 0 | Job | `pg_cyan.cli restore-predata`: pre-data schema only (tables/sequences) — NO secondary indexes, PK/unique, FK, or triggers (those are post-data, #28); pins the dump to the holder's snapshot, so it runs AFTER phase 1 |
-| `50-deployment-snapshot-holder.yaml` | 1 | Deployment(1)+PDB | `pg_cyan.cli snapshot-hold`: creates publication + pgoutput slot, exports & HOLDS the consistent snapshot, publishes the id to the `pgcyan-snapshot` ConfigMap |
+| `35-statefulset-controller.yaml` | — (drives all) | StatefulSet(1)+Service+PDB | `pg_cyan.cli run-migration`: the folded snapshot-holder + DAG orchestrator (#70). HOLDS the consistent snapshot in-pod and walks planner→pre-data→shards→index→FK→CDC, injecting `SNAPSHOT_ID` into the pods and owning every workload (delete it → cascade) |
+| `40-job-phase0-predata.yaml` | 0 | Job | `pg_cyan.cli restore-predata`: pre-data schema only (tables/sequences) — NO secondary indexes, PK/unique, FK, or triggers (those are post-data, #28); the controller injects `SNAPSHOT_ID` so the dump pins to the same instant the shards copy |
+| `50-deployment-snapshot-holder.yaml` | *(superseded)* | Deployment(1)+PDB | **folded into `35-statefulset-controller.yaml`** (#70); kept on disk pending a follow-up (retire the standalone holder + re-point the integration tests) — do NOT apply alongside the controller |
 | `60-job-phase2-datashard.template.yaml` | 2 | PVC+Job × N | `pg_cyan.cli copy-shard`: concurrent DATA-ONLY (`pgcopydb copy table-data`) COPY shards, each on its own RWO work disk; writes per-shard `migration-copy-log.json` and publishes it to its `pgcyan-copylog-<shard>` ConfigMap (slot/publication/snapshot + per-table row counts), which the orchestrator merges into the combined `pgcyan-copylog` ConfigMap |
 | `70-job-phase3-index.template.yaml` | 3a | PVC+Job × M | secondary index builds (shardable), each on its own RWO work disk |
 | `71-job-phase3-fk.yaml` | 3b | Job (single) | FK/constraint single coordinated pass |
 | `80-deployment-follow-cdc.yaml` | 4 | Deployment(1)+PDB | optional CDC catch-up → cutover |
+| `90-cronjob-slot-reaper.example.yaml` | — | CronJob (suspended EXAMPLE) | specification (#70) for reaping the orphaned SOURCE replication slot — the one leaked resource owner-ref cascade can't reach; customize the guard before enabling |
 
 `.template.yaml` files contain `${...}` placeholders the orchestrator substitutes
 once per plan entry — they are **not** directly `kubectl apply`-able as-is.
@@ -82,10 +84,10 @@ GitHub secrets, fills `${PGCYAN_IMAGE}` with the commit-short-SHA image, applies
 jobs `25` then `30` with a completion barrier between them, and uploads
 `plan.json` + both Jobs' logs as a build artifact. A source with any large
 object correctly fails the planner (LOB abort gate) with no plan written. That
-same workflow's `snapshot-holder` job exercises phase 1, and its `pre-data` job
-exercises phase 0 (stands up the holder, transfers the pre-data schema to a real
-target, and asserts the target has tables but no secondary indexes/FK/triggers —
-needs `PG_TARGET_*` secrets/variables). The cluster itself is
+same workflow's `controller` job (#70) stands up the folded controller
+StatefulSet with `PGCYAN_STOP_AFTER=0` — it holds the snapshot in-pod and walks
+planner → pre-data, then asserts the real target has tables but no secondary
+indexes/FK/triggers (needs `PG_TARGET_*` secrets/variables). The cluster itself is
 provisioned from `terraform/aks` by a human running `terraform apply` (Azure
 Cloud Shell or local — it needs Owner-level rights, so it is not a CI action;
 the companion `.github/workflows/terraform-aks.yml` only `fmt`/`validate`s the

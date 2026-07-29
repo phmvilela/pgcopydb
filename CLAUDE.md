@@ -11,11 +11,13 @@ post-migration**. Deliverables are a mix of Python (checks/orchestration) and
 Terraform (Azure provisioning). See `README.md` for the user-facing view.
 
 Current state: the **pre-migration** stages (`preflight`, `source-parameters`,
-`source-pg-metrics`, `source-largeobjects`, `plan`), the phase-1 **snapshot
-holder** (`snapshot-hold`), the phase-0 **pre-data schema transfer**
-(`restore-predata`), the **migration DAG orchestrator** (`orchestrate`,
-driving the `deploy/k8s/` sharded pgcopydb Jobs/Deployments), and the Terraform
-**worker VM** / **AKS cluster** modules exist. Post-migration is not built yet.
+`source-pg-metrics`, `source-largeobjects`, `plan`), the phase-0 **pre-data
+schema transfer** (`restore-predata`), the phase-2 **sharded copy**
+(`copy-shard`), the **migration DAG orchestrator** (`orchestrate`), and the
+**folded controller** (`run-migration`, #70) that holds the consistent snapshot
+in-pod and drives the whole `deploy/k8s/` sharded pgcopydb DAG, plus the
+Terraform **worker VM** / **AKS cluster** modules exist. Post-migration is not
+built yet.
 
 ## Where work comes from
 
@@ -67,8 +69,9 @@ literals — never f-string user/config values into SQL.
 `pg_cyan/cli.py` is a thin **click** wrapper. `python -m pg_cyan.cli` is the
 entry point (also the Docker `ENTRYPOINT`). Each stage is a subcommand;
 `preflight`, `source-parameters`, `source-pg-metrics`,
-`source-largeobjects`, `plan`, `snapshot-hold`, `restore-predata`,
-`copy-shard`, and `orchestrate` are implemented. Options default to `PG_SOURCE_*`
+`source-largeobjects`, `plan`, `restore-predata`, `copy-shard`, `orchestrate`,
+and `run-migration` are implemented (the standalone `snapshot-hold` command was
+retired in #70 -- its `PgCyanSnapshot` is now driven in-pod by the controller). Options default to `PG_SOURCE_*`
 env vars so the same invocation works locally and in the container. Exit codes:
 `0` ready/success, `1` not ready/failure, `2` interrupted — keep these stable.
 
@@ -130,10 +133,12 @@ scope (both deferred to follow-ups, per the resolved sub-questions in #38).
 This is the phase `-1` node in `deploy/k8s/30-job-planner.yaml`; its output
 populates `12-configmap-plan.yaml`.
 
-`snapshot-hold` (`pg_cyan/snapshot.py`, `PgCyanSnapshot`) is the phase `1`
-**snapshot holder** (issue #23) and the first stage that both talks to the
-source **and** stays running -- it is a long-lived Deployment, not a one-shot
-collector. In one coordinated step it creates the publication `FOR ALL TABLES`,
+`PgCyanSnapshot` (`pg_cyan/snapshot.py`) is the **snapshot holder** (issue #23).
+Since #70 it is the snapshot **sub-component of the folded controller** (held
+in-pod by `run-migration`), not a standalone `snapshot-hold` command / phase-1
+Deployment (both retired). It still both talks to the source **and** stays
+running (the controller keeps its `pgcopydb snapshot --follow` child alive for
+the whole copy). In one coordinated step it creates the publication `FOR ALL TABLES`,
 then drives `pgcopydb snapshot --follow --plugin pgoutput --slot-name <slot>`
 (a thin wrapper -- **do not** hand-roll `CREATE_REPLICATION_SLOT` SQL) to create
 the slot, export its **consistent snapshot**, write the snapshot id to the
@@ -176,21 +181,18 @@ ReadWriteOnce managed disk** for `--dir` (real POSIX locking, and — unlike an
 into `establish()` (create + hold + write
 outputs; returns a summary) and `hold()` (block until SIGTERM/SIGINT, then
 terminate pgcopydb so the replication connection closes -- a graceful pod exit
-leaves **no stale source connection**, per the ticket's PS). This is the node in
-`deploy/k8s/50-deployment-snapshot-holder.yaml`; its readiness probe gates on
-`source-pg-slot.json`, so a ready replica means the snapshot is fully
-established. Because it is a Deployment (not a Job), its integration test is the
-`snapshot-holder` job of the manual `workflow_dispatch` workflow
-(`.github/workflows/integration-tests.yml`) that applies the holder, waits for
-the pod to be Ready, asserts the exported id is visible in the pod's node-local
-scratch dir and that the `pgcyan-snapshot` ConfigMap carries it, then tears it
-down gracefully and checks the clean-shutdown log line -- rather than a
-`tests/integration` pytest.
+leaves **no stale source connection**, per the ticket's PS). Since #70 this runs
+**in-pod inside the controller** (no `50-*` Deployment, no `pgcyan-snapshot`
+ConfigMap): the controller keeps the `pgcopydb snapshot --follow` child alive and
+injects the id into the phase pods directly. Its integration coverage is now the
+`controller` job of `.github/workflows/integration-tests.yml` (see the
+`run-migration` / `PgCyanController` entry), not a standalone `snapshot-holder`
+job.
 
 `restore-predata` (`pg_cyan/predata.py`, `PgCyanPreData`) is the phase `0`
 **pre-data schema transfer** (issue #24): it creates the *target* schema before
 any data shard runs, so every shard finds its tables already present. It is a
-thin wrapper over pgcopydb (like `snapshot-hold`), NOT a DB collector -- it opens
+thin wrapper over pgcopydb (like the snapshot holder), NOT a DB collector -- it opens
 no psycopg2 connection, only drives subprocesses. It transfers the **pre-data
 section only**: tables, sequences, functions, LOB metadata -- and deliberately
 NOT secondary indexes, **primary-key/unique constraints**, foreign keys, or
@@ -234,10 +236,11 @@ around the COPY; phase 0 (#24) already did pre-data and phase 3 (#28) does
 post-data, so the shards must be **DATA ONLY** — `copy table-data` copies the
 HEAP and nothing else (no schema, no indexes, no vacuum), sidestepping the Azure
 extension/ownership walls (item 2) and collisions with phases 0/3. Pinned to the
-holder's `--snapshot` (from `$SNAPSHOT_ID`, the `pgcyan-snapshot` ConfigMap) so
-every shard copies the same instant; resumable on its own RWO disk (`--resume
---restart=false`), so — unlike the non-resumable pre-data pod — it does **not**
-reset its work dir. It follows the orchestrator conventions (`_log_event`,
+holder's `--snapshot` (from `$SNAPSHOT_ID`, injected by the controller — #70) so
+every shard copies the same instant; resumable on its own RWO disk (`--resume`;
+`--restart` is deliberately not passed — it wipes temp files and `copy table-data`
+rejects `--restart=false`), so — unlike the non-resumable pre-data pod — it does
+**not** reset its work dir. It follows the orchestrator conventions (`_log_event`,
 graceful degradation — `run()` never raises) and the success-vs-error two-file
 shape: `migration-copy-log.json` on success (a `completed` status, the slot /
 publication / snapshot names, and per-table row counts), or
@@ -265,13 +268,21 @@ the nodes, this is the edges. Design decision for the ticket's open question
 ServiceAccount for exactly this (Job/Deployment/ConfigMap verbs, no CRDs), and
 every other stage is already this same `PgCyan<Stage>` + `_log_event` pattern
 -- see the rationale in the module docstring for the full argument. It walks
-the phases in order -- planner(-1) → snapshot-holder(1) → pre-data(0) → data
+the phases in order -- planner(-1) → pre-data(0) → data
 shards(2, ×N) → index(3a, ×M) → FK(3b) → follow-CDC(4) -- applying each
 phase's manifest(s) (substituting the `${...}` placeholders in the
 `*.template.yaml` files once per `plan.json` entry for the templated phases)
 and **blocking on that phase's barrier**: Job phases wait for every Job to
-report `Complete`, Deployment phases (snapshot-holder, follow-CDC) wait for
-the desired ready-replica count, since those run forever by design.
+report `Complete`, the follow-CDC Deployment waits for its ready-replica count
+since it runs forever by design. **There is no snapshot-holder phase** -- under
+the fold (#70) the `run-migration` controller holds the snapshot in-pod and
+passes it into the orchestrator as `snapshot_id` (injected as `SNAPSHOT_ID` into
+the `needs_snapshot` phases 0/2, replacing any manifest env), `owner_reference`
+(its StatefulSet, stamped on every created workload so a `kubectl delete
+statefulset` cascade-deletes the migration), and a `health_check` the barrier
+loop polls so a dropped snapshot aborts the walk instead of "succeeding" against
+a dead one. When those are unset (a standalone `orchestrate`), none of that
+happens.
 `run()` never raises and **fails fast** -- the first phase whose barrier does
 not resolve to success stops the walk; later phases are never applied.
 `plan.json` is read from the `pgcyan-plan` ConfigMap via the API right before
@@ -289,6 +300,55 @@ are deferred to **#70**, which folds the snapshot holder into a StatefulSet
 orchestrator.) Out of scope for this
 ticket (assumed already applied): the namespace/RBAC/PVC/Secrets (00/01/10/20)
 and the input-collector phase -2 (`25-job-collect-inputs.yaml`).
+
+`run-migration` (`pg_cyan/controller.py`, `PgCyanController`) is the **folded
+snapshot-holder + orchestrator** (issue #70), run as a **single-pod StatefulSet**
+(`deploy/k8s/35-statefulset-controller.yaml`, under the `pgcyan-orchestrator` SA).
+The old model had a *separate* snapshot-holder Deployment; a finite orchestrator
+could never own it (owner-refs would GC the holder mid-copy), so it leaked -- and
+a leaked holder is a **held replication slot = unbounded WAL growth on the
+source**. The fold resolves that: the controller **holds the consistent snapshot
+in its own process** and walks the DAG, so the snapshot's lifetime == the
+controller's, which makes owning the children (cascade-delete on death) correct
+rather than dangerous -- justified because **a lost snapshot is already fatal**
+(the in-flight copy was pinned to an instant that no longer exists → full
+re-copy). It **composes** rather than merges: it owns a `PgCyanSnapshot` (the
+snapshot sub-component -- a real `pgcopydb snapshot --follow` subprocess, so a
+bug in the walk can't drop the connection) and a `PgCyanOrchestrator` (the walk),
+both still separately unit-tested. Ordering: it establishes the snapshot **first**
+(planning is offline/fast, so holding from the start pins everything to one
+instant), then runs the full walk with the id injected + workloads owned + a
+`health_check` wired to the child's liveness. Why a **StatefulSet(1)**:
+*at-most-one* (a `Deployment(1)` can transiently run two during a rollout -- the
+two-holders race, #66) + stable identity; it is explicitly **not** reschedule
+protection (a node eviction still kills the pod and the snapshot with it -- fine,
+because that loss was always fatal). `run()` never raises and **always releases
+the snapshot child** (`finally`), so a graceful pod exit leaves no stale source
+connection. **REFUSE-TO-RESUME:** any restart loses the in-pod snapshot, so on
+boot the controller **atomically claims the run** by *creating* the
+`pgcyan-migration-state` ConfigMap; if it already exists (a prior process began
+the run) the controller **refuses** and **parks** -- flips its readiness probe to
+not-ready (it manages a `/pgcopydb/ready` file the probe `test -f`s), logs the
+halt, and blocks (never exits into a `restartPolicy: Always` crash-loop) until a
+human deletes the state ConfigMap + orphaned workloads. The same `park()` holds
+the pod in an observable terminal state (Ready iff the migration succeeded) after
+a run finishes. **`--stop-after <id>`** (env `PGCYAN_STOP_AFTER`) brings the
+pipeline up through a phase then parks Ready -- a checkpoint (e.g. `2` = through
+the data copy). The source-side replication-slot reaper (the one leaked resource
+owner-ref cascade can't reach -- it needs a source DB connection) is **specified**
+as `deploy/k8s/90-cronjob-slot-reaper.example.yaml` (suspended; relates to
+cutover #29). The standalone `snapshot-hold` command + `50-deployment-snapshot-
+holder.yaml` are **retired**, and the cluster integration test is a single
+`migration` job in `.github/workflows/integration-tests.yml` that runs
+`run-migration` with `PGCYAN_STOP_AFTER=2` -- the whole implemented DAG end-to-end
+via the folded controller -- and asserts both the combined `pgcyan-copylog`
+ConfigMap (#25's AC) and the data-only target schema shape. This has been **run
+green on the live AKS cluster** (7 tables / ~4.8M rows across 4 disjoint shards);
+getting there took three real fixups the DB-free tests structurally could not
+catch -- a job-collision race (fixed by the single job), missing `jobs/status` /
+`deployments/status` RBAC subresources (the least-privilege-SA gap), and an
+invalid `--restart=false` on `copy table-data`. Bump `PGCYAN_STOP_AFTER` as
+phases 3/4 land.
 
 ## Configuration & secrets
 
@@ -334,14 +394,15 @@ Exactly **four** GitHub workflows, each with one clear job (issue #50 cleanup):
   manual dispatch) publishes it to the ACR tagged by the **commit short SHA**
   only (no `latest`, no version tag). No deploy step.
 - `.github/workflows/integration-tests.yml` -- manual (`workflow_dispatch`)
-  cluster-backed tests: a `planner` job (phase -2 -> -1), a
-  `snapshot-holder` job (phase 1), and a `pre-data` job (phase 0, which stands
-  up the holder then transfers schema to a real target -- needs `PG_TARGET_*`
-  secrets/variables). The **phase-2 data-shards** integration job (#25) is
-  deferred to **#70**: it is best driven by the in-cluster orchestrator that #70
-  builds (run the real DAG end-to-end) rather than re-implementing per-phase
-  `kubectl` glue here. The phase-2 wrapper + ConfigMap aggregation are covered by
-  the DB-free `tests/test_datashard.py` / `tests/test_orchestrator.py` meanwhile.
+  cluster-backed tests: a `planner` job (phase -2 -> -1) and a `controller` job
+  (#70) that stands up the folded controller StatefulSet with
+  `PGCYAN_STOP_AFTER=0`, so it holds the snapshot in-pod and walks planner ->
+  pre-data (injecting the id, no `pgcyan-snapshot` ConfigMap), then asserts the
+  real target ends up with tables but no secondary indexes / FKs / triggers
+  (needs `PG_TARGET_*`). Teardown deletes the StatefulSet -> owner-ref cascade.
+  Bumping `PGCYAN_STOP_AFTER` to `2` (through the data copy, asserting
+  `pgcyan-copylog`) is the follow-up. The phase-2 wrapper + ConfigMap aggregation
+  stay covered by the DB-free `tests/test_datashard.py` / `test_orchestrator.py`.
 - `.github/workflows/terraform-aks.yml` -- `terraform fmt`/`validate` for the
   AKS module.
 

@@ -33,10 +33,10 @@
 # shard; the index/FK/CDC singletons run in their own phases). RWO -- attach to
 # one node at a time -- is all that is required.
 #
-# SNAPSHOT HANDOFF no longer rides a shared volume: the holder publishes the
-# exported snapshot id to the `pgcyan-snapshot` ConfigMap (see
-# 50-deployment-snapshot-holder.yaml), which the data shards read via
-# `configMapKeyRef`. So there is NO shared RWX PVC any more.
+# SNAPSHOT HANDOFF no longer rides a shared volume: since #70 the controller
+# (35-statefulset-controller.yaml) holds the snapshot in-pod and INJECTS the id
+# into the phase pods directly (no shared file, no `pgcyan-snapshot` ConfigMap).
+# So there is NO shared RWX PVC any more.
 #
 # WHICH PVCs live where:
 #   * The SINGLETON phases -- pre-data (0), FK (3b), follow-CDC (4) -- each get

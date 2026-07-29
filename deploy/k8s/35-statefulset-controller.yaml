@@ -1,0 +1,165 @@
+# 35-statefulset-controller.yaml
+# ---------------------------------------------------------------------------
+# THE MIGRATION CONTROLLER (issue #70) -- the folded snapshot-holder + DAG
+# orchestrator, run as a SINGLE-POD StatefulSet. This one pod both HOLDS the
+# consistent snapshot in-process (`pgcopydb snapshot --follow`, node-local
+# scratch) and WALKS the migration DAG (planner -> pre-data -> data shards ->
+# index -> FK -> CDC), injecting the snapshot id straight into the phase pods and
+# owning every workload it creates.
+#
+# WHY A STATEFULSET (not a Deployment/Job):
+#   * AT-MOST-ONE. A StatefulSet(1) never runs two pods at once -- it won't start
+#     the replacement until the old pod is confirmed gone. Two controllers would
+#     mean two snapshots / a split brain; a `Deployment(1)` can transiently run
+#     two during a rollout (the two-holders race, lessons-learned #7 / #66).
+#   * It is NOT chosen for "reschedule protection" -- it has none. A node
+#     drain/eviction/preemption still kills the pod, and the in-pod snapshot dies
+#     with it. That is acceptable *because a lost snapshot is already fatal* (the
+#     in-flight copy was pinned to an instant that no longer exists -> full
+#     re-copy). See #70. Refuse-to-resume handling for that restart is PR-B.
+#
+# OWNERSHIP: the controller stamps THIS StatefulSet as the ownerReference on every
+# Job/Deployment/PVC it creates, so `kubectl delete statefulset pgcyan-controller`
+# cascade-deletes the whole migration. Correct now that the snapshot lives here.
+#
+# SNAPSHOT --dir ON emptyDir: pgcopydb keeps a SQLite catalog in WAL mode under
+# --dir, which needs locking/shared-memory Azure Files (SMB) does not provide
+# (issue #57). A node-local emptyDir gives real POSIX locking; the snapshot is
+# non-resumable anyway (a restart re-snapshots), so ephemeral scratch is fine.
+#
+# TODO(#70 PR-B): the refuse-to-resume readiness probe (park in a not-ready state
+# on a lost-snapshot restart, rather than crash-loop) and node-pool pinning
+# (non-spot, excluded from scale-down) land with the eviction-hardening work.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgcyan-controller
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/component: "controller"
+spec:
+  clusterIP: None            # headless -- StatefulSet governing Service
+  selector:
+    pgcyan.dev/component: "controller"
+  ports:
+    - name: placeholder
+      port: 9999
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pgcyan-controller
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/component: "controller"
+spec:
+  serviceName: pgcyan-controller
+  replicas: 1
+  # OrderedReady + a single replica => at-most-one: the replacement pod is not
+  # created until the prior one is fully terminated (no two controllers).
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      pgcyan.dev/component: "controller"
+  template:
+    metadata:
+      labels:
+        pgcyan.dev/component: "controller"
+    spec:
+      # The controller drives the Kubernetes API (create/watch the phase Jobs,
+      # stamp owner-refs) -- so it runs as the pgcyan-orchestrator SA, NOT the
+      # API-less worker SA. DB auth is the pgcyan-db-uris Secret (envFrom).
+      serviceAccountName: pgcyan-orchestrator
+      # The image runs as non-root uid 1000 ('migration'); the emptyDir scratch is
+      # writable by it without fsGroup.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      # A graceful stop must let the controller tear down its snapshot child
+      # (close the source connection) before SIGKILL.
+      terminationGracePeriodSeconds: 60
+      # EVICTION = FULL RESTART (issue #70): a lost pod loses the in-pod snapshot.
+      # Pin the controller to a STABLE node pool -- non-spot and excluded from
+      # cluster-autoscaler scale-down -- to minimize voluntary disruption. The PDB
+      # below covers voluntary evictions; this covers scheduling. Uncomment and set
+      # to your cluster's stable-pool label (AKS example shown):
+      # nodeSelector:
+      #   agentpool: system            # or a dedicated non-spot, no-scaledown pool
+      # (Add a matching toleration if the pool is tainted.)
+      containers:
+        - name: controller
+          image: "${PGCYAN_IMAGE}"
+          command: ["python", "-m", "pg_cyan.cli", "run-migration"]
+          env:
+            # pgcopydb's snapshot --dir on node-local scratch (WAL-on-SMB, #57).
+            - name: PGCYAN_WORK_DIR
+              value: "/pgcopydb"
+            - name: PG_OUTPUT_DIR
+              value: "/pgcopydb"
+            # Own namespace, for resolving the owning StatefulSet + applying the
+            # phase workloads into it.
+            - name: PGCYAN_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Publication/slot/mode -- defaults matching the planner (the shards
+            # and CDC read the same slot). No PGCYAN_SNAPSHOT_CONFIGMAP: the
+            # controller injects SNAPSHOT_ID into the pods, it does not publish it.
+            - name: PGCYAN_PUBLICATION
+              value: "pgcyan_pub"
+            - name: PGCYAN_SLOT
+              value: "pgcyan_slot"
+            - name: PGCYAN_SNAPSHOT_MODE
+              value: "coordinator-held"
+            # Checkpoint knob: bring the pipeline up through this phase id then
+            # park Ready (e.g. "2" = through the data copy). Filled by envsubst at
+            # apply time; EMPTY (the default) = run the whole DAG. Used by the
+            # integration test to stop before the unbuilt phases 3/4.
+            - name: PGCYAN_STOP_AFTER
+              value: "${PGCYAN_STOP_AFTER}"
+          envFrom:
+            - secretRef:
+                name: pgcyan-db-uris    # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI
+          volumeMounts:
+            - name: pgcopydb-scratch
+              mountPath: /pgcopydb
+          resources:
+            # Control-plane + a held libpq connection: light. The heavy COPY runs
+            # in the shard pods, not here.
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+          # Readiness reflects the controller's health: the app writes /pgcopydb/ready
+          # once the snapshot is established and the walk is underway, and REMOVES it
+          # when it fails or PARKS (refuse-to-resume, issue #70). So a restart that
+          # refuses to resume shows NotReady -- visibly halted, not silently redoing
+          # the copy. (No livenessProbe: a parked pod is intentionally alive; we do
+          # NOT want the kubelet to restart it into a crash-loop.)
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/pgcopydb/ready"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 2
+      volumes:
+        # Node-local scratch for pgcopydb's SQLite/WAL catalog (issue #57).
+        - name: pgcopydb-scratch
+          emptyDir: {}
+---
+# Resist VOLUNTARY disruption (node drain / autoscaler) of the singleton while a
+# migration is in flight -- an eviction loses the snapshot and forces a full
+# re-copy. (Involuntary disruption, e.g. node failure, is not covered by a PDB;
+# node-pool pinning for that is #70 PR-B.)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pgcyan-controller
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/component: "controller"
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      pgcyan.dev/component: "controller"

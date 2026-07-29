@@ -36,7 +36,10 @@ resources:
   - 20-pvc-workdir.yaml
   - 25-job-collect-inputs.yaml
   - 30-job-planner.yaml
+  # The migration controller (issue #70): folded snapshot-holder + DAG
+  # orchestrator, single-pod StatefulSet. It replaced the standalone snapshot
+  # holder (50-deployment-snapshot-holder.yaml, now removed).
+  - 35-statefulset-controller.yaml
   - 40-job-phase0-predata.yaml
-  - 50-deployment-snapshot-holder.yaml
   - 71-job-phase3-fk.yaml
   - 80-deployment-follow-cdc.yaml

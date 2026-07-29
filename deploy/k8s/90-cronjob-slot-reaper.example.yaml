@@ -1,0 +1,79 @@
+# 90-cronjob-slot-reaper.example.yaml
+# ---------------------------------------------------------------------------
+# SOURCE-SIDE REPLICATION-SLOT REAPER (issue #70) -- EXAMPLE / SPECIFICATION,
+# not applied by kustomize. This is the ONE leaked resource that Kubernetes
+# owner-ref cascade does NOT clean up: when the controller (and its snapshot)
+# dies, the `pgcopydb snapshot --follow` slot it created on the SOURCE server
+# persists, and an orphaned slot pins WAL -> unbounded disk growth on the source.
+# It is not a k8s object, so deleting the StatefulSet cannot remove it; it needs a
+# SOURCE DB connection with rights to drop the slot.
+#
+# WHY AN EXAMPLE, NOT WIRED IN: dropping a slot is destructive and easy to get
+# wrong. A slot can be *legitimately* inactive for a window (e.g. between the
+# initial copy finishing and CDC attaching in phase 4), so a naive "drop any
+# inactive pgcyan slot" cron would break a healthy migration. A correct reaper
+# must be sure the slot is BOTH inactive AND orphaned (no controller StatefulSet,
+# no follow-CDC Deployment referencing it). Encode that policy for YOUR
+# environment before enabling this -- hence example-only. See #29 (cutover) and
+# #66 (graceful teardown) for the surrounding lifecycle.
+#
+# The query below is deliberately CONSERVATIVE: it only drops the slot when it is
+# inactive AND older than a safety window, and it is intended to run under human
+# supervision (or gated by a check that the controller StatefulSet is gone).
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pgcyan-slot-reaper
+  namespace: pgcyan-migration
+  labels:
+    pgcyan.dev/component: "slot-reaper"
+spec:
+  # Disabled by default -- flip to a schedule (and review the guard below) only
+  # once you have confirmed the migration is truly done/abandoned.
+  suspend: true
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            pgcyan.dev/component: "slot-reaper"
+        spec:
+          serviceAccountName: pgcyan-worker   # DB-only; no k8s API needed
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          containers:
+            - name: reaper
+              image: "${PGCYAN_IMAGE}"        # ships psql
+              envFrom:
+                - secretRef:
+                    name: pgcyan-db-uris      # PGCOPYDB_SOURCE_PGURI
+              env:
+                - name: PGCYAN_SLOT
+                  value: "pgcyan_slot"
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  # GUARD (customize!): only reap when the migration controller is
+                  # gone. Without k8s API access here, gate this CronJob's `suspend`
+                  # externally, or add a pgcyan-orchestrator-SA preflight that
+                  # checks `kubectl get statefulset pgcyan-controller` returns none.
+                  #
+                  # Drop the slot ONLY if it is inactive AND has been idle past a
+                  # safety window (so we never race a healthy copy->CDC handoff).
+                  psql "$PGCOPYDB_SOURCE_PGURI" -v ON_ERROR_STOP=1 -tA -c "
+                    SELECT pg_drop_replication_slot(slot_name)
+                    FROM pg_replication_slots
+                    WHERE slot_name = '${PGCYAN_SLOT}'
+                      AND NOT active
+                      AND (now() - COALESCE(inactive_since, now())) > interval '1 hour';
+                  "
+                  echo 'slot-reaper: done (no-op if the slot was active/recent/absent)'

@@ -236,6 +236,8 @@ set, otherwise the discrete `PG_SOURCE_*` variables.
 | `FILTER_FILE`               | *(unset)*   | `copy-shard`: this shard's `shard-<n>.filters` (under `$PGCYAN_PLAN_DIR`) |
 | `PGCYAN_COUNT_ROWS`         | `true`      | `copy-shard`: count copied rows on the target (disable for very large tables; see #69) |
 | `PGCYAN_COPYLOG_CONFIGMAP`  | *(derived)* | `copy-shard`: per-shard copy-log ConfigMap (defaults to `pgcyan-copylog-<shard>`) |
+| `PGCYAN_STOP_AFTER`         | *(unset)*   | `run-migration` / `orchestrate`: bring the DAG up through this phase id (e.g. `2`), then park |
+| `PGCYAN_READY_FILE`         | `/pgcopydb/ready` | `run-migration`: readiness-probe file; present == Ready, removed when parked/failed |
 | `LOG_LEVEL`                  | `INFO`      | Log verbosity                    |
 
 ## Docker

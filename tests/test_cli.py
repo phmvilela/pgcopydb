@@ -13,7 +13,6 @@ from pg_cyan.datashard import PgCyanDataShard as RealDataShard
 from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
 from pg_cyan.predata import PgCyanPreData as RealPreData
-from pg_cyan.snapshot import PgCyanSnapshot as RealSnapshot
 
 
 class _StubChecker:
@@ -122,36 +121,10 @@ class _StubOrchestrator(RealOrchestrator):
         return {"status": status, "namespace": self.namespace, "phases": [], "errors": []}
 
 
-class _StubSnapshot(RealSnapshot):
-    """Records constructor kwargs and canned establish/hold results.
-
-    Subclasses the real holder (like ``_StubPlanner``) so the CLI's option
-    defaults, which read ``PgCyanSnapshot.DEFAULT_*``, still resolve after
-    monkeypatching. Never launches pgcopydb or opens a connection.
-    """
-
-    last_kwargs = None
-
-    def __init__(self, **kwargs):
-        _StubSnapshot.last_kwargs = kwargs
-        self._ok = kwargs["slot_name"] == "ok_slot"
-
-    def establish(self):
-        status = "success" if self._ok else "failure"
-        return {"status": status, "slot_file": None, "publication_file": None,
-                "snapshot_name": "0000000A-1" if self._ok else None, "errors": []}
-
-    def hold(self):
-        return 0
-
-    def close(self):
-        pass
-
-
 class _StubPreData(RealPreData):
     """Records constructor kwargs and a canned run() result.
 
-    Subclasses the real wrapper (like ``_StubSnapshot``) so the CLI's option
+    Subclasses the real wrapper (like ``_StubPlanner``) so the CLI's option
     defaults, which read ``PgCyanPreData.DEFAULT_*``, still resolve after
     monkeypatching. Never launches pgcopydb.
     """
@@ -193,6 +166,28 @@ class _StubDataShard(RealDataShard):
                 "row_count_total": 0, "table_count": 0, "errors": []}
 
 
+class _StubController:
+    """Records constructor kwargs and a canned run() result (issue #70).
+
+    Does NOT subclass the real controller -- building it would try to load kube
+    credentials -- so it stands in wholesale. Success unless namespace is 'bad_ns'.
+    """
+
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubController.last_kwargs = kwargs
+        self._ok = kwargs.get("namespace") != "bad_ns"
+
+    def run(self):
+        status = "success" if self._ok else "failure"
+        return {"status": status, "ready": self._ok, "snapshot": "0000000A-1",
+                "owned": True, "phases": [], "errors": []}
+
+    def park(self):
+        return None  # no-op: real controller blocks until SIGTERM
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
@@ -201,9 +196,9 @@ def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanLobs", _StubLobsCollector)
     monkeypatch.setattr(cli_module, "PgCyanPlanner", _StubPlanner)
     monkeypatch.setattr(cli_module, "PgCyanOrchestrator", _StubOrchestrator)
-    monkeypatch.setattr(cli_module, "PgCyanSnapshot", _StubSnapshot)
     monkeypatch.setattr(cli_module, "PgCyanPreData", _StubPreData)
     monkeypatch.setattr(cli_module, "PgCyanDataShard", _StubDataShard)
+    monkeypatch.setattr(cli_module, "PgCyanController", _StubController)
     return CliRunner()
 
 
@@ -300,29 +295,6 @@ def test_plan_options_fall_back_to_env(runner, monkeypatch):
     runner.invoke(cli_module.cli, ["plan", "--output-dir", "ok_dir"])
     assert _StubPlanner.last_kwargs["inputs_dir"] == "/inputs"
     assert _StubPlanner.last_kwargs["shards"] == 7
-
-
-def test_snapshot_hold_exit_zero_on_success(runner):
-    result = runner.invoke(cli_module.cli, ["snapshot-hold", "--slot-name", "ok_slot"])
-    assert result.exit_code == 0
-    assert _StubSnapshot.last_kwargs["slot_name"] == "ok_slot"
-
-
-def test_snapshot_hold_exit_one_when_not_established(runner):
-    result = runner.invoke(cli_module.cli, ["snapshot-hold", "--slot-name", "other"])
-    assert result.exit_code == 1
-
-
-def test_snapshot_hold_options_fall_back_to_env(runner, monkeypatch):
-    monkeypatch.setenv("PGCYAN_PUBLICATION", "env_pub")
-    monkeypatch.setenv("PGCYAN_SLOT", "ok_slot")
-    monkeypatch.setenv("PGCYAN_SNAPSHOT_MODE", "frozen-source")
-    monkeypatch.setenv("PGCOPYDB_SOURCE_PGURI", "postgres://h/db")
-    runner.invoke(cli_module.cli, ["snapshot-hold"])
-    assert _StubSnapshot.last_kwargs["publication_name"] == "env_pub"
-    assert _StubSnapshot.last_kwargs["slot_name"] == "ok_slot"
-    assert _StubSnapshot.last_kwargs["snapshot_mode"] == "frozen-source"
-    assert _StubSnapshot.last_kwargs["source_pguri"] == "postgres://h/db"
 
 
 def test_restore_predata_exit_zero_on_success(runner):
@@ -436,3 +408,30 @@ def test_orchestrate_options_fall_back_to_env(runner, monkeypatch):
 def test_orchestrate_kubeconfig_flag(runner):
     runner.invoke(cli_module.cli, ["orchestrate", "--namespace", "ok_ns", "--kubeconfig"])
     assert _StubOrchestrator.last_kwargs["in_cluster"] is False
+
+
+def test_run_migration_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns"])
+    assert result.exit_code == 0
+    assert _StubController.last_kwargs["namespace"] == "ok_ns"
+
+
+def test_run_migration_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "bad_ns"])
+    assert result.exit_code == 1
+
+
+def test_run_migration_kubeconfig_flag(runner):
+    runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--kubeconfig"])
+    assert _StubController.last_kwargs["in_cluster"] is False
+
+
+def test_run_migration_stop_after_flows_through(runner):
+    result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--stop-after", "2"])
+    assert result.exit_code == 0
+    assert _StubController.last_kwargs["stop_after"] == "2"
+
+
+def test_run_migration_stop_after_rejects_unknown_phase(runner):
+    result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--stop-after", "99"])
+    assert result.exit_code == 2   # click.Choice rejects at parse time

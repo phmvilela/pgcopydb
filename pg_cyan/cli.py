@@ -18,6 +18,7 @@ import sys
 import click
 
 from pg_cyan import __version__
+from pg_cyan.controller import PgCyanController
 from pg_cyan.datashard import PgCyanDataShard
 from pg_cyan.lobs import PgCyanLobs
 from pg_cyan.metrics import PgCyanMetrics
@@ -26,7 +27,6 @@ from pg_cyan.parameters import PgCyanParameters
 from pg_cyan.planner import PgCyanPlanner
 from pg_cyan.predata import PgCyanPreData
 from pg_cyan.preflight import PgCyanPreflight
-from pg_cyan.snapshot import PgCyanSnapshot
 
 
 @click.group()
@@ -260,10 +260,11 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
                  poll_interval: int, job_timeout: int, in_cluster: bool) -> None:
     """Walk the migration DAG: apply each phase in order and block on its barrier.
 
-    Applies planner(-1) -> snapshot-holder(1) -> pre-data(0) -> data shards(2)
-    -> index(3a) -> FK(3b) -> follow-CDC(4), stopping (without applying later
-    phases) at the first phase whose Jobs/Deployments do not all succeed/become
-    ready.
+    Applies planner(-1) -> pre-data(0) -> data shards(2) -> index(3a) -> FK(3b)
+    -> follow-CDC(4), stopping (without applying later phases) at the first phase
+    whose Jobs/Deployments do not all succeed/become ready. Standalone: the
+    snapshot is NOT held (that is what `run-migration` adds -- issue #70); pass
+    SNAPSHOT_ID some other way if a phase needs it.
     """
     orchestrator = PgCyanOrchestrator(
         namespace=namespace, manifests_dir=manifests_dir, plan_configmap=plan_configmap,
@@ -274,94 +275,6 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
         click.echo(json.dumps(summary, indent=2, default=str))
         sys.exit(0 if summary["status"] == "success" else 1)
     except KeyboardInterrupt:
-        sys.exit(2)
-
-
-@cli.command(name="snapshot-hold")
-@click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
-              show_default="$PGCOPYDB_SOURCE_PGURI",
-              help="Source libpq URI (pgcopydb-native); falls back to --host/--port/... if unset.")
-@click.option("--host", default=lambda: os.getenv("PG_SOURCE_HOST", "localhost"),
-              show_default="$PG_SOURCE_HOST", help="Source PostgreSQL host.")
-@click.option("--port", type=int, default=lambda: int(os.getenv("PG_SOURCE_PORT", "5432")),
-              show_default="$PG_SOURCE_PORT", help="Source PostgreSQL port.")
-@click.option("--user", default=lambda: os.getenv("PG_SOURCE_USER", "postgres"),
-              show_default="$PG_SOURCE_USER", help="Source database user.")
-@click.option("--password", default=lambda: os.getenv("PG_SOURCE_PASSWORD", ""),
-              help="Source database password (prefer $PG_SOURCE_PASSWORD).")
-@click.option("--database", default=lambda: os.getenv("PG_SOURCE_DATABASE", "postgres"),
-              show_default="$PG_SOURCE_DATABASE", help="Source database name.")
-@click.option("--timeout", type=int,
-              default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
-              show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Connection timeout (seconds).")
-@click.option("--publication-name",
-              default=lambda: os.getenv("PGCYAN_PUBLICATION", PgCyanSnapshot.DEFAULT_PUBLICATION),
-              show_default="$PGCYAN_PUBLICATION", help="Publication to create FOR ALL TABLES.")
-@click.option("--slot-name",
-              default=lambda: os.getenv("PGCYAN_SLOT", PgCyanSnapshot.DEFAULT_SLOT),
-              show_default="$PGCYAN_SLOT", help="Logical replication slot to create.")
-@click.option("--snapshot-mode",
-              default=lambda: os.getenv("PGCYAN_SNAPSHOT_MODE", PgCyanSnapshot.DEFAULT_SNAPSHOT_MODE),
-              show_default="$PGCYAN_SNAPSHOT_MODE", help="Recorded snapshot mode (held vs frozen-source).")
-@click.option("--plugin",
-              default=lambda: os.getenv("PGCYAN_PLUGIN", PgCyanSnapshot.DEFAULT_PLUGIN),
-              show_default="$PGCYAN_PLUGIN", help="Logical decoding output plugin.")
-@click.option("--work-dir",
-              default=lambda: os.getenv("PGCYAN_WORK_DIR", PgCyanSnapshot.DEFAULT_WORK_DIR),
-              show_default="$PGCYAN_WORK_DIR", help="pgcopydb --dir; the snapshot id is written here.")
-@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
-              show_default="$PG_OUTPUT_DIR (defaults to --work-dir)",
-              help="Directory for source-pg-slot.json / source-pg-publication.json.")
-@click.option("--plan-file", default=lambda: os.getenv("PGCYAN_PLAN_FILE"),
-              show_default="$PGCYAN_PLAN_FILE",
-              help="Optional plan.json to source publication/slot/mode from.")
-@click.option("--pgcopydb-bin",
-              default=lambda: os.getenv("PGCOPYDB_BIN", PgCyanSnapshot.DEFAULT_PGCOPYDB_BIN),
-              show_default="$PGCOPYDB_BIN", help="pgcopydb executable name/path.")
-@click.option("--snapshot-configmap", default=lambda: os.getenv("PGCYAN_SNAPSHOT_CONFIGMAP"),
-              show_default="$PGCYAN_SNAPSHOT_CONFIGMAP",
-              help="ConfigMap to publish the snapshot id into for the shards (blank = skip, local runs).")
-@click.option("--configmap-namespace", default=lambda: os.getenv("PGCYAN_NAMESPACE"),
-              show_default="$PGCYAN_NAMESPACE (else kubectl's namespace)",
-              help="Namespace for the snapshot ConfigMap.")
-@click.option("--kubectl-bin", default=lambda: os.getenv("KUBECTL_BIN", "kubectl"),
-              show_default="$KUBECTL_BIN", help="kubectl executable used to publish the snapshot id.")
-def snapshot_hold(source_pguri: str, host: str, port: int, user: str, password: str,
-                  database: str, timeout: int, publication_name: str, slot_name: str,
-                  snapshot_mode: str, plugin: str, work_dir: str, output_dir: str,
-                  plan_file: str, pgcopydb_bin: str, snapshot_configmap: str,
-                  configmap_namespace: str, kubectl_bin: str) -> None:
-    """Establish and HOLD the source's consistent publication + slot + snapshot.
-
-    Creates the publication FOR ALL TABLES, creates the pgoutput slot and exports
-    its consistent snapshot, publishes the id into the ``pgcyan-snapshot``
-    ConfigMap for the shards (issue #58), then blocks -- keeping the exporting
-    connection open -- until SIGTERM/SIGINT, at which point it terminates
-    pgcopydb so the source connection closes cleanly. Writes
-    ``source-pg-slot.json`` + ``source-pg-publication.json`` on success, or
-    matching ``*-errors.json`` on failure.
-    """
-    holder = PgCyanSnapshot(
-        source_pguri=source_pguri or None,
-        host=host, port=port, user=user, password=password,
-        database=database, timeout=timeout,
-        publication_name=publication_name, slot_name=slot_name,
-        snapshot_mode=snapshot_mode, plugin=plugin, work_dir=work_dir,
-        output_dir=output_dir or None, plan_file=plan_file or None,
-        pgcopydb_bin=pgcopydb_bin,
-        snapshot_configmap=snapshot_configmap or None,
-        configmap_namespace=configmap_namespace or None,
-        kubectl_bin=kubectl_bin,
-    )
-    try:
-        summary = holder.establish()
-        click.echo(json.dumps(summary, indent=2, default=str))
-        if summary["status"] != "success":
-            holder.close()
-            sys.exit(1)
-        sys.exit(0 if holder.hold() == 0 else 1)
-    except KeyboardInterrupt:
-        holder.close()
         sys.exit(2)
 
 
@@ -465,7 +378,7 @@ def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_fi
     created the schema, phase 3 builds the indexes/constraints), restricted to
     this shard's ``[include-only-table]`` filter set and pinned to the phase-1
     holder's ``--snapshot`` so every shard copies the same instant. Resumable on
-    its own RWO work disk (``--resume --restart=false``). After the copy it counts
+    its own RWO work disk (``--resume``). After the copy it counts
     the rows landed on the target per table and writes ``migration-copy-log.json``
     (slot / publication / snapshot names + per-table row counts), or
     ``migration-copy-log-errors.json`` on failure. The log is also published to a
@@ -494,6 +407,41 @@ def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_fi
     try:
         summary = worker.run()
         click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="run-migration")
+@click.option("--namespace",
+              default=lambda: os.getenv("PGCYAN_NAMESPACE", PgCyanOrchestrator.DEFAULT_NAMESPACE),
+              show_default="$PGCYAN_NAMESPACE", help="Namespace the migration workloads run in.")
+@click.option("--in-cluster/--kubeconfig", default=True,
+              help="Load in-cluster ServiceAccount credentials (default) or a local kubeconfig.")
+@click.option("--stop-after", default=lambda: os.getenv("PGCYAN_STOP_AFTER") or None,
+              type=click.Choice([p["id"] for p in PgCyanOrchestrator.PHASES]),
+              show_default="$PGCYAN_STOP_AFTER (empty/unset = the whole DAG)",
+              help="Bring the pipeline up through this phase id, then park Ready (e.g. 2 = through the data copy).")
+def run_migration(namespace: str, in_cluster: bool, stop_after: str) -> None:
+    """Hold the snapshot in-pod and walk the whole migration DAG (issue #70).
+
+    The folded controller: it establishes and HOLDS the consistent snapshot in
+    its own pod (no separate holder Deployment, no `pgcyan-snapshot` ConfigMap),
+    then walks planner -> pre-data -> data shards -> index -> FK -> CDC, injecting
+    the snapshot id straight into the pods and owning every workload it creates so
+    deleting the controller cascade-deletes the migration. Runs as a single-pod
+    StatefulSet; config is env-driven (the manifest sets it).
+    """
+    from pg_cyan.snapshot import _holder_from_env
+    holder = _holder_from_env()
+    controller = PgCyanController(holder=holder, namespace=namespace,
+                                  in_cluster=in_cluster, stop_after=stop_after or None)
+    try:
+        summary = controller.run()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        # Park in the terminal state (Ready iff succeeded) rather than exiting --
+        # a StatefulSet pod would otherwise be restarted and crash-loop (#70).
+        controller.park()
         sys.exit(0 if summary["status"] == "success" else 1)
     except KeyboardInterrupt:
         sys.exit(2)

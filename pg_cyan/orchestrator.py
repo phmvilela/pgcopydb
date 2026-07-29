@@ -30,11 +30,17 @@ Workflows.** Rationale:
 Implements the phase walk from ``deploy/k8s/README.md`` /
 ``notes/k8s-sharded-migration-topology.md``::
 
-    planner(-1) -> snapshot-holder(1) -> pre-data(0) -> data shards(2, xN)
+    planner(-1) -> pre-data(0) -> data shards(2, xN)
     -> index(3a, xM) -> FK(3b) -> follow-CDC(4)
 
-(The holder runs before pre-data: pre-data pins its schema dump to the
-snapshot the holder exports -- issue #24.)
+There is NO snapshot-holder phase: under the folded model (issue #70) the
+CONTROLLER that drives this orchestrator (``pg_cyan/controller.py``) holds the
+consistent snapshot in its OWN pod and passes the id in via ``snapshot_id``,
+which the orchestrator injects as ``SNAPSHOT_ID`` into the ``needs_snapshot``
+phases (pre-data pins its schema dump to it; the shards copy it). The controller
+also passes its StatefulSet as ``owner_reference``, stamped onto every workload
+so deleting the controller cascade-deletes the whole migration, and a
+``health_check`` the barrier loop polls so a dropped snapshot aborts the walk.
 
 Each phase is applied from the ``deploy/k8s/`` manifests -- templated phases
 (data shards, index shards) are stamped out once per ``plan.json`` entry,
@@ -43,9 +49,9 @@ that phase's barrier before moving on:
 
   * Job phases block until every Job in the phase reports ``Complete``
     (or ``Failed``/exceeded ``backoffLimit``).
-  * Deployment phases (snapshot-holder, follow-CDC) block until the
-    Deployment has its desired ready replica count -- they run forever by
-    design, so "barrier" means *ready*, not *completed*.
+  * Deployment phases (follow-CDC) block until the Deployment has its desired
+    ready replica count -- it runs forever by design, so "barrier" means
+    *ready*, not *completed*.
 
 Fails fast: the first phase whose barrier does not resolve to success stops
 the walk immediately (``run()`` returns without applying later phases).
@@ -157,20 +163,22 @@ class PgCyanOrchestrator:
     #: The DAG, in apply order. Static phases carry "manifest"; templated
     #: phases (stamped out once per plan.json entry) carry "template" +
     #: "plan_key" + "substitutions".
-    #: NOTE on order: the snapshot HOLDER (1) is applied BEFORE pre-data (0),
-    #: even though pre-data is "phase 0" by name. Pre-data pins its schema dump
-    #: to the snapshot the holder exports (published in the pgcyan-snapshot
-    #: ConfigMap, read via configMapKeyRef -- issue #24/#58), so the holder must
-    #: be Ready first. The holder is a Deployment that then stays up through the
-    #: whole initial copy (phases 0-2).
+    #: NOTE: there is NO snapshot-holder phase here anymore. Under the folded
+    #: model (issue #70) the CONTROLLER that runs this orchestrator holds the
+    #: consistent snapshot in its OWN pod and passes the id in via ``snapshot_id``;
+    #: the orchestrator injects it as ``SNAPSHOT_ID`` into the phases flagged
+    #: ``needs_snapshot`` (pre-data pins its schema dump to it; the data shards
+    #: copy it), so no separate holder Deployment and no ``pgcyan-snapshot``
+    #: ConfigMap handoff. When ``snapshot_id`` is unset (standalone runs), no
+    #: injection happens and the manifests' own env applies.
     PHASES: List[Dict] = [
         {"id": "-1", "name": "planner", "manifest": "30-job-planner.yaml"},
-        {"id": "1", "name": "snapshot-holder", "manifest": "50-deployment-snapshot-holder.yaml"},
-        {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"},
+        {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml",
+         "needs_snapshot": True},
         {
             "id": "2", "name": "data-shards", "template": "60-job-phase2-datashard.template.yaml",
             "plan_key": "data_shards", "needs_plan": True, "substitutions": _data_shard_substitutions,
-            "aggregate_copy_logs": True,
+            "aggregate_copy_logs": True, "needs_snapshot": True,
         },
         {
             "id": "3a", "name": "index", "template": "70-job-phase3-index.template.yaml",
@@ -188,6 +196,10 @@ class PgCyanOrchestrator:
         poll_interval: int = DEFAULT_POLL_INTERVAL,
         job_timeout: int = DEFAULT_JOB_TIMEOUT,
         in_cluster: bool = True,
+        snapshot_id: Optional[str] = None,
+        owner_reference: Optional[Dict] = None,
+        health_check=None,
+        stop_after: Optional[str] = None,
         batch_api=None,
         apps_api=None,
         policy_api=None,
@@ -203,6 +215,22 @@ class PgCyanOrchestrator:
             poll_interval: Seconds between Job/Deployment status polls.
             job_timeout: Seconds to wait for a phase barrier before failing it.
             in_cluster: Load in-cluster ServiceAccount credentials (else local kubeconfig).
+            snapshot_id: The consistent snapshot id the controller holds in-pod
+                (issue #70). When set, injected as ``SNAPSHOT_ID`` into every
+                ``needs_snapshot`` phase pod (replacing any manifest env of that
+                name). ``None`` -> no injection (standalone runs).
+            owner_reference: A ``V1OwnerReference``-shaped dict (the controller's
+                StatefulSet). When set, stamped onto every object this orchestrator
+                creates, so deleting the StatefulSet cascade-deletes the whole
+                migration (issue #70). ``None`` -> unowned (standalone runs).
+            health_check: Optional ``() -> bool`` the barrier loop calls each poll;
+                returning ``False`` (the controller's snapshot child died) aborts
+                the wait -- a lost snapshot invalidates the in-flight copy.
+            stop_after: Phase id (e.g. ``"2"``) to stop after -- the walk applies
+                phases through this one (inclusive) and returns success without
+                applying any later phase. ``None`` runs the whole DAG. Lets an
+                operator bring the pipeline up to a checkpoint (e.g. through the
+                data copy) and, under the controller, park Ready there.
             batch_api, apps_api, policy_api, core_api: Inject fake/mock Kubernetes API
                 clients for testing; when any is omitted, real clients are built from
                 the ambient (in-cluster or kubeconfig) credentials.
@@ -212,6 +240,10 @@ class PgCyanOrchestrator:
         self.plan_configmap = plan_configmap
         self.poll_interval = poll_interval
         self.job_timeout = job_timeout
+        self.snapshot_id = snapshot_id
+        self.owner_reference = owner_reference
+        self.health_check = health_check
+        self.stop_after = stop_after
         #: The image every phase Job/Deployment runs -- the orchestrator's OWN
         #: image, resolved lazily on first use (see _resolve_image).
         self._image: Optional[str] = None
@@ -393,6 +425,13 @@ class PgCyanOrchestrator:
         namespace = metadata["namespace"]
         name = metadata.get("name")
 
+        # Stamp the controller's StatefulSet as owner (issue #70) so that deleting
+        # the controller cascade-deletes every workload the migration created --
+        # correct semantics now that the snapshot lives in the controller (a lost
+        # controller == a lost snapshot == a run that must restart from scratch).
+        if self.owner_reference is not None:
+            metadata.setdefault("ownerReferences", []).append(self.owner_reference)
+
         try:
             if kind == "Job":
                 self.batch_api.create_namespaced_job(namespace=namespace, body=doc)
@@ -454,6 +493,15 @@ class PgCyanOrchestrator:
     def _wait_for(self, kind: str, name: str, timeout: int) -> "tuple[bool, Optional[str]]":
         start = time.monotonic()
         while True:
+            # Abort the wait if the controller's in-pod snapshot child has died
+            # (issue #70): the consistent point is gone, so anything copying
+            # against it is now invalid -- fail fast rather than let the barrier
+            # "succeed" against a dead snapshot.
+            if self.health_check is not None and not self.health_check():
+                return False, (
+                    "Snapshot holder died while waiting for "
+                    f"{kind}/{name}; the consistent snapshot is lost"
+                )
             try:
                 if kind == "Job":
                     obj = self.batch_api.read_namespaced_job_status(name=name, namespace=self.namespace)
@@ -660,11 +708,33 @@ class PgCyanOrchestrator:
 
     # --------------------------------------------------------------- phases
 
+    def _inject_snapshot_env(self, doc: Dict) -> None:
+        """
+        Set ``SNAPSHOT_ID`` on every container of ``doc``'s pod template.
+
+        The folded controller (issue #70) holds the snapshot in its own pod and
+        knows the id directly, so it injects it here instead of the shards reading
+        a ``pgcyan-snapshot`` ConfigMap. Any pre-existing ``SNAPSHOT_ID`` env entry
+        (e.g. a leftover ``configMapKeyRef``) is REPLACED, so there is never a
+        duplicate. No-op when ``snapshot_id`` is unset.
+        """
+        if not self.snapshot_id:
+            return
+        pod_spec = (
+            (doc.get("spec") or {}).get("template", {}).get("spec", {})
+        )
+        for container in pod_spec.get("containers") or []:
+            env = [e for e in (container.get("env") or []) if e.get("name") != "SNAPSHOT_ID"]
+            env.append({"name": "SNAPSHOT_ID", "value": self.snapshot_id})
+            container["env"] = env
+
     def _apply_phase(self, phase: Dict, plan: Optional[Dict]) -> Dict:
         docs = self._load_phase_manifests(phase, plan)
 
         targets = []
         for doc in docs:
+            if phase.get("needs_snapshot"):
+                self._inject_snapshot_env(doc)
             self._apply(doc)
             if doc.get("kind") in ("Job", "Deployment"):
                 targets.append((doc["kind"], doc["metadata"]["name"]))
@@ -682,13 +752,15 @@ class PgCyanOrchestrator:
         Apply every phase in order, blocking on each phase's barrier.
 
         Stops (and returns) at the first phase whose barrier does not resolve
-        to success -- later phases are never applied. Never raises.
+        to success -- later phases are never applied. If ``stop_after`` is set,
+        also stops -- successfully -- once that phase clears. Never raises.
 
         Returns:
             {
               "status": "success" | "failure",
               "namespace": <str>,
               "run_id": <plan run_id, once known> | None,
+              "stopped_after": <phase id> | None,
               "phases": [{"phase": id, "name": ..., "success": bool, "targets": [...]}],
               "errors": [...],
             }
@@ -697,9 +769,23 @@ class PgCyanOrchestrator:
             "status": "failure",
             "namespace": self.namespace,
             "run_id": None,
+            "stopped_after": None,
             "phases": [],
             "errors": [],
         }
+
+        # Guard a mistyped stop_after up front: silently running the whole DAG when
+        # the caller asked to stop early would be a surprising, costly no-op.
+        if self.stop_after is not None and self.stop_after not in {p["id"] for p in self.PHASES}:
+            self._log_event(
+                "run", "failure", f"Unknown stop_after phase id {self.stop_after!r}",
+                {"valid_phase_ids": [p["id"] for p in self.PHASES]},
+            )
+            summary["errors"].append(
+                f"Unknown stop_after phase id {self.stop_after!r}; "
+                f"valid ids: {[p['id'] for p in self.PHASES]}"
+            )
+            return summary
 
         plan: Optional[Dict] = None
         for phase in self.PHASES:
@@ -736,6 +822,16 @@ class PgCyanOrchestrator:
 
             if not result["success"]:
                 summary["errors"].append(f"Phase {phase['id']} ({phase['name']}) failed; DAG stopped")
+                return summary
+
+            if self.stop_after is not None and phase["id"] == self.stop_after:
+                self._log_event(
+                    "run", "success",
+                    f"Stopping after phase {phase['id']} ({phase['name']}) as requested",
+                    {"stop_after": self.stop_after},
+                )
+                summary["stopped_after"] = self.stop_after
+                summary["status"] = "success"
                 return summary
 
         summary["status"] = "success"

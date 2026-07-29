@@ -19,11 +19,10 @@
 # snapshot so the schema matches the instant the shards copy) then
 # `pgcopydb restore pre-data --no-owner` (pre-data section only).
 #
-# ORDERING: this phase depends on the snapshot the phase-1 HOLDER exports, so
-# the holder runs FIRST and publishes the id into the `pgcyan-snapshot`
-# ConfigMap; this Job reads it via configMapKeyRef, exactly like the data shards
-# (issue #58). The orchestrator DAG enforces snapshot-holder(1) -> pre-data(0)
-# (see orchestrator.py PHASES).
+# ORDERING: this phase depends on the consistent snapshot. Under issue #70 the
+# CONTROLLER holds that snapshot in its own pod and INJECTS `SNAPSHOT_ID` into
+# this Job's env at apply time (no `pgcyan-snapshot` ConfigMap). The wrapper pins
+# `dump schema` to it, exactly like the data shards.
 # ---------------------------------------------------------------------------
 apiVersion: batch/v1
 kind: Job
@@ -66,15 +65,11 @@ spec:
           # carried in a schema dump -- so pre-data skips them by design.
           command: ["python", "-m", "pg_cyan.cli", "restore-predata", "--skip-extensions"]
           env:
-            # The exported snapshot id, published by the phase-1 holder into the
-            # pgcyan-snapshot ConfigMap. The wrapper pins `dump schema` to it so
-            # the schema matches the instant the shards copy (issue #23/#58).
-            # The holder runs BEFORE this phase, so the ConfigMap exists here.
-            - name: SNAPSHOT_ID
-              valueFrom:
-                configMapKeyRef:
-                  name: pgcyan-snapshot
-                  key: snapshot
+            # SNAPSHOT_ID is injected at apply time by the controller (issue #70),
+            # which holds the consistent snapshot in-pod and knows the id directly
+            # -- no `pgcyan-snapshot` ConfigMap. The wrapper pins `dump schema` to
+            # it so the schema matches the instant the shards copy. (A standalone
+            # `kubectl apply` of this Job must set SNAPSHOT_ID in the env itself.)
             # pgcopydb --dir (dump lands here) AND the log output dir.
             - name: PGCYAN_WORK_DIR
               value: "/work"
