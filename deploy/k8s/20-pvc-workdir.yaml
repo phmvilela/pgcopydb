@@ -74,20 +74,8 @@ spec:
       storage: 10Gi
   storageClassName: managed-csi     # TODO: confirm the RWO class name on the target cluster
 ---
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: pgcyan-workdir-fk           # phase 3b (71-job-phase3-fk.yaml)
-  namespace: pgcyan-migration
-  labels:
-    pgcyan.dev/workdir: "fk"
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      storage: 10Gi
-  storageClassName: managed-csi
----
+# (No phase-3b FK disk: since #28 the FK pass is pure psycopg2 -- no pgcopydb
+# catalog to persist -- so 71-job-phase3-fk.yaml uses an emptyDir, not a PVC.)
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

@@ -261,15 +261,17 @@ def test_load_phase_manifests_templated_phase_renders_pvc_and_job_per_shard():
     assert "${" not in yaml.safe_dump(docs)
 
 
-def test_load_phase_manifests_index_template_renders_pvc_and_job_per_index_shard():
+def test_load_phase_manifests_index_template_renders_job_per_index_shard():
     orch = make_orchestrator()
     phase = dict(PgCyanOrchestrator.PHASES[3])  # index
     assert phase["id"] == "3a"
     docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
     jobs = [d["metadata"]["name"] for d in docs if d["kind"] == "Job"]
-    pvcs = [d["metadata"]["name"] for d in docs if d["kind"] == "PersistentVolumeClaim"]
+    # #28: phase 3a is pure psycopg2 (custom SQL) -- no pgcopydb catalog, so it uses
+    # emptyDir, NOT a per-shard RWO PVC (unlike the data shards).
+    pvcs = [d for d in docs if d["kind"] == "PersistentVolumeClaim"]
     assert jobs == ["pgcyan-index-idx-0", "pgcyan-index-idx-1"]
-    assert pvcs == ["pgcyan-workdir-idx-0", "pgcyan-workdir-idx-1"]
+    assert pvcs == []
 
 
 def test_load_phase_manifests_templated_phase_requires_plan_entries():
@@ -286,14 +288,18 @@ def _container_image(doc):
 
 
 def test_static_manifest_image_placeholder_filled_runtime_vars_preserved():
-    """${PGCYAN_IMAGE} is stamped with the resolved image; ${RESTORE_JOBS} and
-    $(SNAPSHOT_ID) -- runtime shell/env refs -- must survive untouched."""
+    """${PGCYAN_IMAGE} is stamped with the resolved image; other ${...} runtime
+    refs (e.g. ${PGCYAN_STOP_AFTER}, filled by envsubst at apply time) must
+    survive the image-only substitution untouched."""
     orch = make_orchestrator()
-    fk = orch._load_phase_manifests(
-        {"id": "3b", "name": "fk", "manifest": "71-job-phase3-fk.yaml"}, plan=None
-    )[0]
-    assert _container_image(fk) == TEST_IMAGE
-    assert "${RESTORE_JOBS}" in yaml.safe_dump(fk)  # runtime shell var preserved
+    # The controller StatefulSet carries both ${PGCYAN_IMAGE} and the runtime
+    # ${PGCYAN_STOP_AFTER}; image-only substitution fills the former, keeps latter.
+    docs = orch._load_phase_manifests(
+        {"id": "ctl", "name": "controller", "manifest": "35-statefulset-controller.yaml"}, plan=None
+    )
+    sts = next(d for d in docs if d["kind"] == "StatefulSet")
+    assert _container_image(sts) == TEST_IMAGE
+    assert "${PGCYAN_STOP_AFTER}" in yaml.safe_dump(sts)  # runtime var preserved
 
     predata = orch._load_phase_manifests(
         {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"}, plan=None
@@ -485,10 +491,10 @@ def test_run_happy_path_applies_all_six_phases_in_order():
     # NO snapshot-holder phase: the controller holds the snapshot in-pod (#70).
     assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "2", "3a", "3b", "4"]
     assert all(p["success"] for p in summary["phases"])
-    # each data + index shard got its own RWO work-dir PVC stamped (issue #58)
+    # each DATA shard got its own RWO work-dir PVC stamped (issue #58); the index
+    # shards are pure psycopg2 (#28) and use emptyDir, so they stamp no PVC.
     assert {n for _, n, _ in core_api.created_pvcs} == {
         "pgcyan-workdir-shard-0", "pgcyan-workdir-shard-1",
-        "pgcyan-workdir-idx-0", "pgcyan-workdir-idx-1",
     }
     # data + index shards + fk + pre-data + planner Jobs were all created
     created_job_names = {name for _, name, _ in batch_api.created}

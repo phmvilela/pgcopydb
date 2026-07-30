@@ -86,6 +86,8 @@ read the linked module before changing a stage.
 | `plan` | `planner.py` · `PgCyanPlanner` | −1 | Offline transform: LPT bin-pack tables into N disjoint copy shards + `shard-<n>.filters`; **LOB abort gate**. |
 | `restore-predata` | `predata.py` · `PgCyanPreData` | 0 | Pre-data schema to target (tables/sequences/functions — **no** indexes/PK/FK/triggers; those are post-data #28). |
 | `copy-shard` | `datashard.py` · `PgCyanDataShard` | 2 | One disjoint shard's **data-only** copy (`pgcopydb copy table-data`); per-table row counts → `pgcyan-copylog-<shard>` ConfigMap. |
+| `build-indexes` | `postindex.py` · `PgCyanPostIndex` | 3a | One shard's secondary indexes **+ PK/unique constraints** — **custom SQL** (`pg_get_indexdef`/`pg_get_constraintdef` → target DDL); PK/unique was #24's descope. |
+| `build-foreign-keys` | `postfk.py` · `PgCyanForeignKeys` | 3b | **Custom SQL** (not pgcopydb): source FKs → target `ADD … NOT VALID` then `VALIDATE`; single pass; writes `target-pg-postload-log.json`. |
 | `orchestrate` | `orchestrator.py` · `PgCyanOrchestrator` | — | Walks the DAG, applies each phase manifest, blocks on its barrier; aggregates the combined `pgcyan-copylog`. |
 | `run-migration` | `controller.py` · `PgCyanController` | — | **The folded controller (#70)**: holds the snapshot in-pod and drives the whole DAG. This is what runs in-cluster. |
 | *(no command)* | `snapshot.py` · `PgCyanSnapshot` | 1 | Snapshot sub-component — establishes + holds the consistent slot/snapshot; driven in-pod by the controller (standalone `snapshot-hold` retired in #70). |

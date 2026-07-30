@@ -5,18 +5,22 @@
 # WHY it is one job and NOT sharded like the indexes:
 #   A foreign key spans TWO tables that may live in DIFFERENT data shards. There
 #   is no clean way to partition FK creation across shared-nothing pods without
-#   them coordinating locks (ADD FOREIGN KEY takes SHARE ROW EXCLUSIVE on both
-#   referenced and referencing table). So FKs are applied in ONE coordinated
-#   pass, after ALL data (phase 2) AND all indexes (phase 3a) are in place.
-#   Within this one job pgcopydb can still parallelise non-conflicting FKs via
-#   --restore-jobs; "single pass" means one job, not one connection.
+#   them coordinating locks. So FKs are applied in ONE coordinated pass, after ALL
+#   data (phase 2) AND all indexes (phase 3a) are in place.
 #
-# WHY MORE KUBERNETES POWER HERE IS A CATEGORY ERROR (the question that started
-# this design): FK validation -- the scan proving existing rows satisfy the
-# constraint -- runs ON THE TARGET SERVER, like index builds. Fattening THIS pod
-# does not speed it up. The lever is again target-side: --restore-jobs (bounded
-# by target vCPU / max_connections) and the target's CPU/IOPS. So this pod, too,
-# is thin; if you want phase 3 to go faster, scale the TARGET, not the pod.
+# WHY CUSTOM SQL, NOT pgcopydb (#28): the wrapper (`build-foreign-keys`,
+# PgCyanForeignKeys) introspects the source's FK definitions and applies each to
+# the target as `ADD CONSTRAINT ... NOT VALID` (brief lock) then `VALIDATE
+# CONSTRAINT` (scans under a weak lock). `pgcopydb restore constraints` validates
+# FKs inline and cannot produce that split -- and the split is the whole point:
+# FK validation is the slow, un-parallelizable tail of a restore, so keeping the
+# exclusive-lock window tiny matters for a minimal-downtime cutover.
+#
+# WHY MORE KUBERNETES POWER HERE IS A CATEGORY ERROR: FK validation -- the scan
+# proving existing rows satisfy the constraint -- runs ON THE TARGET SERVER.
+# Fattening THIS pod does not speed it up; scale the TARGET, not the pod. This pod
+# is thin, talks only to Postgres (psycopg2, no pgcopydb, no --dir), and writes
+# the authoritative target-pg-postload-log.json.
 #
 # This is the last hard barrier before the source and target are schema- and
 # data-equivalent (modulo any CDC still catching up in phase 4).
@@ -37,41 +41,27 @@ spec:
         pgcyan.dev/phase: "post-data-fk"
     spec:
       serviceAccountName: pgcyan-worker
-      # The image runs as non-root uid 1000 ('migration', Dockerfile: useradd
-      # -u 1000). A freshly-provisioned Azure managed disk mounts root:root 0755,
-      # which uid 1000 cannot write (pgcopydb: "Failed to create directory
-      # /work/schema: Permission denied"). fsGroup group-owns the work disk to
-      # gid 1000 so the process can write; OnRootMismatch skips re-chowning the
-      # catalog on every resume/restart.
+      # Non-root uid 1000 ('migration'). No managed-disk PVC here -- this phase is
+      # pure psycopg2 (no pgcopydb catalog), so it only needs a scratch dir for
+      # the one small output JSON; an emptyDir suffices, so no fsGroup is needed.
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1000       # 'migration' from the image
+        runAsUser: 1000
         runAsGroup: 1000
-        fsGroup: 1000
-        fsGroupChangePolicy: OnRootMismatch
       restartPolicy: Never
       containers:
-        - name: pgcopydb-fk
+        - name: pgcyan-fk
           image: "${PGCYAN_IMAGE}"
-          # ASSUMPTION: `pgcopydb restore constraints` (post-data, no filter ->
-          # whole DB) applies FKs and any remaining table constraints in one
-          # coordinated pass. If a single global filter is not desired, run
-          # against the full plan (no --filters) so cross-shard FKs resolve.
-          command: ["sh", "-c"]
-          args:
-            - >
-              pgcopydb restore constraints
-              --dir=/work
-              --restore-jobs=${RESTORE_JOBS}
-              --resume
+          # The pg_cyan `build-foreign-keys` wrapper (PgCyanForeignKeys, #28):
+          # introspect the source's FKs, apply each to the target NOT VALID then
+          # VALIDATE CONSTRAINT, and write target-pg-postload-log.json. Idempotent.
+          command: ["python", "-m", "pg_cyan.cli", "build-foreign-keys"]
           envFrom:
             - secretRef:
-                name: pgcyan-db-uris
+                name: pgcyan-db-uris     # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI
           env:
-            - name: RESTORE_JOBS
-              # Concurrent FK/constraint builds on the target. Bound by target
-              # vCPU / max_connections. TODO(planner): set from constraints.json.
-              value: "8"
+            - name: PG_OUTPUT_DIR
+              value: "/work"
           volumeMounts:
             - name: workdir
               mountPath: /work
@@ -80,8 +70,6 @@ spec:
             requests: { cpu: "100m", memory: "128Mi" }
             limits:   { cpu: "500m", memory: "512Mi" }
       volumes:
-        # FK phase's own ReadWriteOnce work disk (SQLite/WAL off Azure Files --
-        # issue #58). Pre-applied from 20-pvc-workdir.yaml.
+        # Scratch for the output JSON only (no pgcopydb catalog to persist).
         - name: workdir
-          persistentVolumeClaim:
-            claimName: pgcyan-workdir-fk
+          emptyDir: {}

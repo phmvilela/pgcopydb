@@ -124,7 +124,6 @@ def _index_shard_substitutions(entry: Dict, plan: Dict) -> Dict[str, str]:
     return {
         "INDEX_SHARD_NAME": str(entry["name"]),
         "FILTER_FILE": str(entry["filter_file"]),
-        "INDEX_JOBS": str(entry["index_jobs"]),
     }
 
 
@@ -183,6 +182,9 @@ class PgCyanOrchestrator:
         {
             "id": "3a", "name": "index", "template": "70-job-phase3-index.template.yaml",
             "plan_key": "index_shards", "needs_plan": True, "substitutions": _index_shard_substitutions,
+            # Phases 3a (index/PK/unique) and 3b (FK) are both pure psycopg2 (#28):
+            # they read the source's DDL definitions directly, so -- like the other
+            # collectors -- they need no injected snapshot.
         },
         {"id": "3b", "name": "fk", "manifest": "71-job-phase3-fk.yaml"},
         {"id": "4", "name": "follow-cdc", "manifest": "80-deployment-follow-cdc.yaml"},
@@ -440,9 +442,10 @@ class PgCyanOrchestrator:
             elif kind == "PodDisruptionBudget":
                 self.policy_api.create_namespaced_pod_disruption_budget(namespace=namespace, body=doc)
             elif kind == "PersistentVolumeClaim":
-                # Per-shard RWO work-dir disks stamped alongside the data/index
-                # Jobs (issue #58). Applied, not awaited -- binding happens when
-                # the shard pod schedules.
+                # Per-shard RWO work-dir disks stamped alongside the data-shard
+                # Jobs (issue #58; the index/FK phases are pure psycopg2 and use
+                # emptyDir). Applied, not awaited -- binding happens when the shard
+                # pod schedules.
                 self.core_api.create_namespaced_persistent_volume_claim(namespace=namespace, body=doc)
             else:
                 raise OrchestratorError(f"Unsupported manifest kind for orchestrator apply: {kind}")

@@ -11,18 +11,19 @@ name: Integration tests
 # ONE job, `migration`, runs the whole implemented pipeline end-to-end via the
 # folded controller (#70) -- no per-phase jobs, no parallelism, no shared-object
 # race. It runs the phase -2 collector (barrier), then stands up the controller
-# StatefulSet with PGCYAN_STOP_AFTER=2: the controller holds the consistent
-# snapshot IN-POD and walks planner(-1) -> pre-data(0) -> data shards(2),
-# injecting the snapshot id into the phase pods (no pgcyan-snapshot ConfigMap) and
-# owning every workload (delete the StatefulSet -> owner-ref cascade). It waits on
-# the run-state marker, then asserts (a) the combined pgcyan-copylog ConfigMap --
-# a `completed` copy with the slot name + per-table row counts (#25 acceptance),
-# and (b) the target has tables (+ data) but still NO secondary indexes / FKs /
-# triggers (those are phase 3, not reached by --stop-after 2).
+# StatefulSet with PGCYAN_STOP_AFTER=3b: the controller holds the consistent
+# snapshot IN-POD and walks planner(-1) -> pre-data(0) -> data shards(2) ->
+# index(3a) -> FK(3b), injecting the snapshot id into the phase pods (no
+# pgcyan-snapshot ConfigMap) and owning every workload (delete the StatefulSet ->
+# owner-ref cascade). It waits on the run-state marker, then asserts (a) the
+# combined pgcyan-copylog ConfigMap -- a `completed` copy with per-table row
+# counts (#25), and (b) the target now has tables + data + secondary indexes +
+# PK/unique constraints (#24 descope) + ALL foreign keys validated (#28).
 #
-# Bump PGCYAN_STOP_AFTER as phases 3/4 land. Validated green on AKS (7 tables /
-# ~4.8M rows across 4 disjoint shards). NOTE: cluster-backed; the source DB must
-# contain tables for the copy to be meaningful.
+# Bump PGCYAN_STOP_AFTER as phase 4 (CDC) lands. The planner->pre-data->data-shard
+# path is validated green on AKS (7 tables / ~4.8M rows across 4 disjoint shards);
+# phase 3 (#28) is first exercised end-to-end here. NOTE: cluster-backed; the
+# source DB must contain tables (with FKs) for the copy + post-data to be meaningful.
 #
 # ---------------------------------------------------------------------------
 # PREREQUISITES (all one-time, see issue #50):
@@ -66,7 +67,7 @@ env:
 
 jobs:
   migration:
-    name: End-to-end migration via the folded controller, through phase 2 (#70/#25)
+    name: End-to-end migration via the folded controller, through phase 3 (#70/#25/#28)
     runs-on: ubuntu-latest
     environment: azure
     # ONE job, no parallelism -- the folded controller walks the WHOLE implemented
@@ -76,9 +77,10 @@ jobs:
     env:
       AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
       AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
-      # Walk through phase 2 (the data copy -- the last implemented phase, #25)
-      # then park Ready. Phases 3/4 are not built yet; bump this as they land.
-      PGCYAN_STOP_AFTER: "2"
+      # Walk through phase 3b (post-data: indexes #28 3a + FK constraints #28 3b --
+      # the last implemented phase) then park Ready. Phase 4 (CDC) is not built
+      # yet; bump this as it lands.
+      PGCYAN_STOP_AFTER: "3b"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -230,7 +232,7 @@ jobs:
       # PGCYAN_STOP_AFTER (=0) into the FIRST pod's env -- so it stops after
       # pre-data. (Setting the env post-apply would roll the pod and trip the
       # refuse-to-resume guard, hence baking it in at apply time.)
-      - name: Apply the migration controller (walk through phase 2)
+      - name: Apply the migration controller (walk through phase 3)
         run: |
           set -euo pipefail
           envsubst '${PGCYAN_IMAGE} ${PGCYAN_STOP_AFTER}' \
@@ -289,11 +291,11 @@ jobs:
                 f"{log['row_count_total']} rows, slot={log['slot']}")
           PY
 
-      # Also confirm the DATA-ONLY property held: after phase 2 the target has
-      # tables (+ now data) but STILL no secondary indexes / FKs / triggers --
-      # those are phase 3 (#28), which --stop-after 2 does not reach. Checked
-      # in-cluster (target unreachable from the runner) with the target URI.
-      - name: Verify target schema shape (tables, no indexes/FK/triggers)
+      # ACCEPTANCE (#28): after phase 3 the target has tables + data + secondary
+      # indexes + PK/unique constraints (the #24 descope, built by phase 3a
+      # build-indexes) + ALL foreign keys VALIDATED (NOT VALID then VALIDATE).
+      # Checked in-cluster (target unreachable from the runner) with the target URI.
+      - name: Verify target post-data shape (indexes + PK/unique + validated FKs)
         run: |
           set -euo pipefail
           kubectl delete job pgcyan-target-check -n "$NS" --ignore-not-found --wait=true
@@ -320,30 +322,32 @@ jobs:
                     command: ["sh", "-c"]
                     args:
                       - |
-                        psql "$PGCOPYDB_TARGET_PGURI" -tA -v ON_ERROR_STOP=1 -c "SELECT 'RESULT'||' tables='||(SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema'))||' indexes='||(SELECT count(*) FROM pg_indexes WHERE schemaname NOT IN ('pg_catalog','information_schema'))||' fks='||(SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE c.contype='f' AND n.nspname NOT IN ('pg_catalog','information_schema'))||' triggers='||(SELECT count(*) FROM pg_trigger t JOIN pg_class cl ON cl.oid=t.tgrelid JOIN pg_namespace n ON n.oid=cl.relnamespace WHERE NOT t.tgisinternal AND n.nspname NOT IN ('pg_catalog','information_schema'))"
+                        psql "$PGCOPYDB_TARGET_PGURI" -tA -v ON_ERROR_STOP=1 -c "SELECT 'RESULT'||' tables='||(SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema'))||' indexes='||(SELECT count(*) FROM pg_indexes WHERE schemaname NOT IN ('pg_catalog','information_schema'))||' pkuq='||(SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE c.contype IN ('p','u') AND n.nspname NOT IN ('pg_catalog','information_schema'))||' fks='||(SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE c.contype='f' AND n.nspname NOT IN ('pg_catalog','information_schema'))||' fksvalid='||(SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE c.contype='f' AND c.convalidated AND n.nspname NOT IN ('pg_catalog','information_schema'))"
           EOF
           kubectl wait --for=condition=complete job/pgcyan-target-check -n "$NS" --timeout=120s \
             || { kubectl logs job/pgcyan-target-check -n "$NS" || true; echo "::error::target check did not complete"; exit 1; }
-          line="$(kubectl logs job/pgcyan-target-check -n "$NS" --tail=-1 | grep -o 'RESULT tables=[0-9]* indexes=[0-9]* fks=[0-9]* triggers=[0-9]*' | tail -1)"
-          echo "target schema counts: [$line]"
+          line="$(kubectl logs job/pgcyan-target-check -n "$NS" --tail=-1 | grep -o 'RESULT tables=[0-9]* indexes=[0-9]* pkuq=[0-9]* fks=[0-9]* fksvalid=[0-9]*' | tail -1)"
+          echo "target post-data counts: [$line]"
           tables=$(echo "$line" | sed -E 's/.*tables=([0-9]+).*/\1/')
           indexes=$(echo "$line" | sed -E 's/.*indexes=([0-9]+).*/\1/')
-          fks=$(echo "$line" | sed -E 's/.*fks=([0-9]+).*/\1/')
-          triggers=$(echo "$line" | sed -E 's/.*triggers=([0-9]+).*/\1/')
+          pkuq=$(echo "$line" | sed -E 's/.*pkuq=([0-9]+).*/\1/')
+          fks=$(echo "$line" | sed -E 's/.* fks=([0-9]+).*/\1/')
+          fksvalid=$(echo "$line" | sed -E 's/.*fksvalid=([0-9]+).*/\1/')
           fail=0
-          [ "${tables:-0}" -gt 0 ]   || { echo "::error::expected tables > 0, got ${tables:-}"; fail=1; }
-          [ "${indexes:-1}" -eq 0 ]  || { echo "::error::expected 0 secondary indexes/PK, got ${indexes:-}"; fail=1; }
-          [ "${fks:-1}" -eq 0 ]      || { echo "::error::expected 0 FKs, got ${fks:-}"; fail=1; }
-          [ "${triggers:-1}" -eq 0 ] || { echo "::error::expected 0 triggers, got ${triggers:-}"; fail=1; }
+          [ "${tables:-0}" -gt 0 ]      || { echo "::error::expected tables > 0, got ${tables:-}"; fail=1; }
+          [ "${indexes:-0}" -gt 0 ]     || { echo "::error::expected secondary indexes > 0 (phase 3a), got ${indexes:-}"; fail=1; }
+          [ "${pkuq:-0}" -gt 0 ]        || { echo "::error::expected PK/unique constraints > 0 (phase 3a build-indexes; #24 descope), got ${pkuq:-}"; fail=1; }
+          [ "${fks:-0}" -gt 0 ]         || { echo "::error::expected FKs > 0 (phase 3b; source must have FKs), got ${fks:-}"; fail=1; }
+          [ "${fksvalid:-0}" = "${fks:-1}" ] || { echo "::error::expected ALL FKs validated, got ${fksvalid:-}/${fks:-}"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
-          echo "target schema shape OK: $tables tables, no secondary indexes / FKs / triggers"
+          echo "target post-data OK: $tables tables, $indexes indexes, $pkuq PK/unique, $fks FKs ($fksvalid validated)"
 
       - name: Collect controller + phase logs
         if: always()
         run: |
           mkdir -p migration-output
           kubectl logs -l pgcyan.dev/component=controller -n "$NS" --tail=-1 > migration-output/controller.log 2>&1 || true
-          for phase in collect-inputs planner pre-data data controller-check; do
+          for phase in collect-inputs planner pre-data data post-data-index post-data-fk controller-check; do
             kubectl logs -l pgcyan.dev/phase="$phase" -n "$NS" --tail=-1 --prefix > "migration-output/${phase}.log" 2>&1 || true
           done
           kubectl get configmap pgcyan-migration-state -n "$NS" -o yaml > migration-output/run-state.yaml 2>/dev/null || true

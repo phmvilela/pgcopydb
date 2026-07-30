@@ -1,50 +1,33 @@
 # 70-job-phase3-index.template.yaml
 # ---------------------------------------------------------------------------
-# PHASE 3a: SECONDARY INDEX builds. TEMPLATE -- one Job per plan.json >
+# PHASE 3a: SECONDARY INDEX + PK/UNIQUE builds. TEMPLATE -- one Job per plan.json >
 # index_shards entry. Runs only AFTER the phase-2 barrier (every data shard
 # succeeded), because an index over half-loaded data is worthless.
 #
 # CRITICAL RESOURCE INSIGHT (this drove the whole phase-3 design):
 #   The heavy compute of CREATE INDEX runs ON THE TARGET POSTGRES SERVER, not in
-#   this pod. This pod issues `CREATE INDEX` and then just holds a connection
-#   open and WAITS. Giving this pod more CPU/RAM does almost nothing. Therefore:
+#   this pod. This pod issues `CREATE INDEX` / `ADD CONSTRAINT` and then just holds
+#   a connection open and WAITS. Giving this pod more CPU/RAM does almost nothing.
+#   Therefore:
 #     * pods here are deliberately THIN (see resources below);
-#     * the real throughput levers are TARGET-SIDE: number of concurrent index
-#       connections (--index-jobs across these jobs), the target's
-#       maintenance_work_mem, max_parallel_maintenance_workers, CPU cores and
-#       IOPS. The planner should raise those for the index window (and consider
-#       temporarily scaling the target SKU UP, then back down).
+#     * the real throughput levers are TARGET-SIDE: the number of index shards
+#       (this template, one Job each), the target's maintenance_work_mem,
+#       max_parallel_maintenance_workers, CPU cores and IOPS. The planner should
+#       raise those for the index window (and consider temporarily scaling the
+#       target SKU UP, then back down).
 #   Sharding index builds across several Jobs helps ONLY up to the target's core
 #   count -- each CREATE INDEX pins ~1 target core; beyond ~target_vCPU total
 #   concurrent builds, extra jobs just queue on the server.
 #
-# STORAGE: like the data shards, each index Job gets its OWN ReadWriteOnce
-# managed disk for pgcopydb's `--dir` (SQLite/WAL needs the file locking Azure
-# Files/SMB cannot give -- issue #58). The disk below is stamped per plan.json >
-# index_shards entry. (A future optimisation could reuse the matching data
-# shard's disk so `restore indexes` reads the same catalog; kept separate here
-# to preserve the current per-index-shard --dir topology.)
+# STORAGE: none. Phase 3a is pure psycopg2 (custom SQL -- introspect the source's
+# index/constraint defs, apply to the target); it holds no pgcopydb catalog, so it
+# only needs a scratch dir for the one small output JSON. An emptyDir suffices --
+# no managed-disk PVC, no fsGroup (cf. #58, which only bit the pgcopydb phases).
 # ---------------------------------------------------------------------------
-# The per-index-shard work disk (one per plan.json > index_shards entry).
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: pgcyan-workdir-${INDEX_SHARD_NAME}
-  namespace: pgcyan-migration
-  labels:
-    pgcyan.dev/phase: "post-data-index"
-    pgcyan.dev/shard: "${INDEX_SHARD_NAME}"
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      storage: 10Gi
-  storageClassName: managed-csi   # TODO: confirm the RWO class name on the target cluster
----
 apiVersion: batch/v1
 kind: Job
 metadata:
-  # TODO(orchestrator): substitute ${INDEX_SHARD_NAME}, e.g. pgcyan-index-idx-0
+  # ${INDEX_SHARD_NAME} is substituted per plan.json > index_shards entry, e.g. idx-0
   name: pgcyan-index-${INDEX_SHARD_NAME}
   namespace: pgcyan-migration
   labels:
@@ -59,44 +42,35 @@ spec:
         pgcyan.dev/phase: "post-data-index"
     spec:
       serviceAccountName: pgcyan-worker
-      # The image runs as non-root uid 1000 ('migration', Dockerfile: useradd
-      # -u 1000). A freshly-provisioned Azure managed disk mounts root:root 0755,
-      # which uid 1000 cannot write (pgcopydb: "Failed to create directory
-      # /work/schema: Permission denied"). fsGroup group-owns the work disk to
-      # gid 1000 so the process can write; OnRootMismatch skips re-chowning the
-      # catalog on every resume/restart.
+      # Non-root uid 1000 ('migration'). No managed-disk PVC here (pure psycopg2),
+      # so no fsGroup is needed -- the emptyDir scratch is writable by the process.
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1000       # 'migration' from the image
+        runAsUser: 1000
         runAsGroup: 1000
-        fsGroup: 1000
-        fsGroupChangePolicy: OnRootMismatch
       restartPolicy: Never
       containers:
-        - name: pgcopydb-index
+        - name: pgcyan-index
           image: "${PGCYAN_IMAGE}"
-          # Build secondary indexes (and the unique indexes backing PK/UK) for
-          # this shard's tables. FKs are handled separately in 71 because they
-          # cross shard boundaries.
-          command: ["sh", "-c"]
-          args:
-            - >
-              pgcopydb restore indexes
-              --dir=/work
-              --filters=/plan/${FILTER_FILE}
-              --index-jobs=${INDEX_JOBS}
-              --resume
+          # The pg_cyan `build-indexes` wrapper (PgCyanPostIndex, #28) builds this
+          # shard's secondary indexes AND its PK/unique constraints via custom SQL:
+          # introspect the source's pg_get_indexdef / pg_get_constraintdef for this
+          # shard's --filters tables and apply CREATE INDEX + ADD CONSTRAINT on the
+          # target (the PK/unique piece is what #24 deferred to #28). Idempotent.
+          # FKs cross shard boundaries and are the separate single pass in 71.
+          command: ["python", "-m", "pg_cyan.cli", "build-indexes"]
           envFrom:
             - secretRef:
-                name: pgcyan-db-uris
+                name: pgcyan-db-uris     # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI
           env:
+            - name: SHARD_NAME
+              value: "${INDEX_SHARD_NAME}"       # e.g. idx-0 (recorded in the log)
             - name: FILTER_FILE
-              value: "${FILTER_FILE}"
-            - name: INDEX_JOBS
-              # Concurrent CREATE INDEX connections THIS job opens to the target.
-              # Sum of INDEX_JOBS across all index jobs should stay <= target
-              # vCPU (and within target max_connections). TODO(planner): enforce.
-              value: "${INDEX_JOBS}"
+              value: "${FILTER_FILE}"            # e.g. shard-0.filters (reused from the copy)
+            - name: PGCYAN_PLAN_DIR
+              value: "/plan"
+            - name: PG_OUTPUT_DIR
+              value: "/work"
           volumeMounts:
             - name: workdir
               mountPath: /work
@@ -109,8 +83,7 @@ spec:
             limits:   { cpu: "500m", memory: "512Mi" }
       volumes:
         - name: workdir
-          persistentVolumeClaim:
-            claimName: pgcyan-workdir-${INDEX_SHARD_NAME}
+          emptyDir: {}                   # scratch for the output JSON only
         - name: plan
           configMap:
             name: pgcyan-plan

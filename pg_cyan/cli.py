@@ -20,6 +20,8 @@ import click
 from pg_cyan import __version__
 from pg_cyan.controller import PgCyanController
 from pg_cyan.datashard import PgCyanDataShard
+from pg_cyan.postfk import PgCyanForeignKeys
+from pg_cyan.postindex import PgCyanPostIndex
 from pg_cyan.lobs import PgCyanLobs
 from pg_cyan.metrics import PgCyanMetrics
 from pg_cyan.orchestrator import PgCyanOrchestrator
@@ -403,6 +405,70 @@ def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_fi
         copylog_configmap=os.getenv("PGCYAN_COPYLOG_CONFIGMAP") or None,
         namespace=os.getenv("PGCYAN_NAMESPACE") or None,
         kubectl_bin=os.getenv("KUBECTL_BIN", PgCyanDataShard.DEFAULT_KUBECTL_BIN),
+    )
+    try:
+        summary = worker.run()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="build-indexes")
+@click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
+              show_default="$PGCOPYDB_SOURCE_PGURI", help="Source libpq URI (index/constraint defs read from here).")
+@click.option("--target-pguri", default=lambda: os.getenv("PGCOPYDB_TARGET_PGURI"),
+              show_default="$PGCOPYDB_TARGET_PGURI", help="Target libpq URI (DDL runs here).")
+@click.option("--filter-file", default=lambda: os.getenv("FILTER_FILE"),
+              show_default="$FILTER_FILE", help="This shard's filter file (under $PGCYAN_PLAN_DIR).")
+@click.option("--shard-name", default=lambda: os.getenv("SHARD_NAME"),
+              show_default="$SHARD_NAME", help="This index shard's name (e.g. idx-0), recorded in the log.")
+def build_indexes(source_pguri: str, target_pguri: str,
+                  filter_file: str, shard_name: str) -> None:
+    """Build one shard's indexes + PK/unique constraints on the target (phase 3a, #28).
+
+    Custom SQL (like build-foreign-keys, not pgcopydb): introspect this shard's
+    tables' secondary indexes (pg_get_indexdef) and PK/UNIQUE constraints
+    (pg_get_constraintdef) from the source and apply them to the target -- CREATE
+    INDEX then ADD CONSTRAINT. The PK/unique piece is what #24 deferred to #28.
+    Foreign keys are the separate single pass (``build-foreign-keys``). Writes
+    ``target-pg-index-log.json`` (per shard) or ``-errors.json``.
+    """
+    worker = PgCyanPostIndex(
+        source_pguri=source_pguri or None, target_pguri=target_pguri or None,
+        filter_file=filter_file or None,
+        plan_dir=os.getenv("PGCYAN_PLAN_DIR", PgCyanPostIndex.DEFAULT_PLAN_DIR),
+        shard_name=shard_name or None,
+        output_dir=os.getenv("PG_OUTPUT_DIR") or None,
+    )
+    try:
+        summary = worker.run()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="build-foreign-keys")
+@click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
+              show_default="$PGCOPYDB_SOURCE_PGURI", help="Source libpq URI (introspected for FK defs).")
+@click.option("--target-pguri", default=lambda: os.getenv("PGCOPYDB_TARGET_PGURI"),
+              show_default="$PGCOPYDB_TARGET_PGURI", help="Target libpq URI (FKs applied + verified here).")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
+              show_default="$PG_OUTPUT_DIR", help="Directory for target-pg-postload-log[-errors].json.")
+def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) -> None:
+    """Apply the source's foreign keys to the target (phase 3b, issue #28).
+
+    Custom SQL (not pgcopydb): introspect the source's FK definitions and apply
+    each to the target as ``ADD CONSTRAINT ... NOT VALID`` (brief lock) then
+    ``VALIDATE CONSTRAINT`` (scans under a weak lock) -- the minimal-downtime
+    pattern pgcopydb's inline-validating restore cannot produce. Runs as one
+    coordinated pass after every index shard, and writes the authoritative
+    ``target-pg-postload-log.json`` verifying the target's indexes + validated FKs.
+    """
+    worker = PgCyanForeignKeys(
+        source_pguri=source_pguri or None, target_pguri=target_pguri or None,
+        output_dir=output_dir or None,
     )
     try:
         summary = worker.run()

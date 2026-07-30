@@ -220,7 +220,7 @@ stage's `--help` and module docstring.
 | `PGCYAN_RUN_ID`              | *(clock)*   | `plan`: opaque run identifier    |
 | `PGCOPYDB_SOURCE_PGURI` / `PGCOPYDB_TARGET_PGURI` | *(unset)* | pgcopydb-native source/target libpq URIs (else `PG_SOURCE_*`) |
 | `SNAPSHOT_ID`               | *(unset)*   | `restore-predata` / `copy-shard`: consistent snapshot to pin to (**injected by the controller** — #70) |
-| `FILTER_FILE`               | *(unset)*   | `copy-shard`: this shard's `shard-<n>.filters` (under `$PGCYAN_PLAN_DIR`) |
+| `FILTER_FILE`               | *(unset)*   | `copy-shard` / `build-indexes`: this shard's `shard-<n>.filters` (under `$PGCYAN_PLAN_DIR`) |
 | `PGCYAN_COUNT_ROWS`         | `true`      | `copy-shard`: count copied rows on the target (disable for very large tables; see #69) |
 | `PGCYAN_COPYLOG_CONFIGMAP`  | *(derived)* | `copy-shard`: per-shard copy-log ConfigMap (defaults to `pgcyan-copylog-<shard>`) |
 | `PGCYAN_STOP_AFTER`         | *(unset)*   | `run-migration` / `orchestrate`: walk the DAG through this phase id (e.g. `2`), then park |

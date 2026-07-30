@@ -10,6 +10,8 @@ from click.testing import CliRunner
 
 from pg_cyan import cli as cli_module
 from pg_cyan.datashard import PgCyanDataShard as RealDataShard
+from pg_cyan.postfk import PgCyanForeignKeys as RealForeignKeys
+from pg_cyan.postindex import PgCyanPostIndex as RealPostIndex
 from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
 from pg_cyan.predata import PgCyanPreData as RealPreData
@@ -188,6 +190,36 @@ class _StubController:
         return None  # no-op: real controller blocks until SIGTERM
 
 
+class _StubPostIndex(RealPostIndex):
+    """Records kwargs; success unless target is the 'bad' sentinel (#28, 3a).
+
+    Subclasses the real class so the CLI's option defaults (which read
+    ``PgCyanPostIndex.DEFAULT_*``) still resolve after monkeypatching.
+    """
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubPostIndex.last_kwargs = kwargs
+        self._ok = kwargs.get("target_pguri") != "postgres://bad/db"
+
+    def run(self):
+        return {"status": "success" if self._ok else "failure",
+                "shard": self.last_kwargs.get("shard_name"), "errors": []}
+
+
+class _StubForeignKeys(RealForeignKeys):
+    """Records kwargs; success unless target is the 'bad' sentinel (#28, 3b)."""
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubForeignKeys.last_kwargs = kwargs
+        self._ok = kwargs.get("target_pguri") != "postgres://bad/db"
+
+    def run(self):
+        return {"status": "success" if self._ok else "failure",
+                "fk_total": 0, "fk_validated": 0, "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
@@ -199,6 +231,8 @@ def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreData", _StubPreData)
     monkeypatch.setattr(cli_module, "PgCyanDataShard", _StubDataShard)
     monkeypatch.setattr(cli_module, "PgCyanController", _StubController)
+    monkeypatch.setattr(cli_module, "PgCyanPostIndex", _StubPostIndex)
+    monkeypatch.setattr(cli_module, "PgCyanForeignKeys", _StubForeignKeys)
     return CliRunner()
 
 
@@ -408,6 +442,41 @@ def test_orchestrate_options_fall_back_to_env(runner, monkeypatch):
 def test_orchestrate_kubeconfig_flag(runner):
     runner.invoke(cli_module.cli, ["orchestrate", "--namespace", "ok_ns", "--kubeconfig"])
     assert _StubOrchestrator.last_kwargs["in_cluster"] is False
+
+
+def test_build_indexes_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, [
+        "build-indexes", "--source-pguri", "postgres://src/db",
+        "--target-pguri", "postgres://good/db",
+        "--filter-file", "shard-0.filters", "--shard-name", "idx-0",
+    ])
+    assert result.exit_code == 0
+    assert _StubPostIndex.last_kwargs["filter_file"] == "shard-0.filters"
+    assert _StubPostIndex.last_kwargs["shard_name"] == "idx-0"
+
+
+def test_build_indexes_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, [
+        "build-indexes", "--source-pguri", "postgres://src/db",
+        "--target-pguri", "postgres://bad/db", "--filter-file", "shard-0.filters",
+    ])
+    assert result.exit_code == 1
+
+
+def test_build_foreign_keys_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, [
+        "build-foreign-keys", "--source-pguri", "postgres://src/db",
+        "--target-pguri", "postgres://good/db",
+    ])
+    assert result.exit_code == 0
+    assert _StubForeignKeys.last_kwargs["source_pguri"] == "postgres://src/db"
+
+
+def test_build_foreign_keys_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, [
+        "build-foreign-keys", "--target-pguri", "postgres://bad/db",
+    ])
+    assert result.exit_code == 1
 
 
 def test_run_migration_exit_zero_on_success(runner):
