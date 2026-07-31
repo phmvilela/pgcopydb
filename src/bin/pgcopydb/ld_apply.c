@@ -454,6 +454,30 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 			}
 
 			/*
+			 * Replay is drained and we are about to idle.  Flush the libpq
+			 * pipeline so any queued apply statements actually reach the
+			 * target now.  In continuous FOLLOW mode a lone trailing
+			 * transaction (nothing after it to hit the per-COMMIT sync in
+			 * stream_apply_transaction) would otherwise sit buffered
+			 * client-side forever: counted as applied here (replay_lsn
+			 * advanced) but never sent to — let alone committed on — the
+			 * server.  Rate-limited to 1/sec, matching ld_replay.c.
+			 */
+			{
+				uint64_t now = time(NULL);
+
+				if (1 < (now - context->applyPgConn.pipelineSyncTime))
+				{
+					if (!pgsql_sync_pipeline(&(context->applyPgConn)))
+					{
+						log_error("Failed to sync the apply pipeline "
+								  "while draining replay");
+						return false;
+					}
+				}
+			}
+
+			/*
 			 * Not caught up yet.  In pipe mode the select() ceiling gives
 			 * ≤100 ms latency; in catchup-only mode sleep briefly.
 			 */
