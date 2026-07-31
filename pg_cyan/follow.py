@@ -58,6 +58,8 @@ from typing import Dict, List, Optional
 import psycopg2
 from psycopg2 import Error as PgError
 
+from pg_cyan.shutdown import graceful_terminate
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(message)s"
@@ -321,13 +323,17 @@ class PgCyanFollow:
                             {"path": self.ready_file, "error": str(e)})
 
     def close(self) -> None:
-        """Terminate the follow child (best-effort)."""
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        """Terminate the follow child cleanly (best-effort).
+
+        ``follow`` is the live child at controller teardown (the snapshot was
+        released mid-flow before CDC started), so it must stop cleanly -- flush
+        in-flight changes and release the source replication connection -- within
+        the pod grace window. Uses the shared ``graceful_terminate``
+        (``shutdown.py``): SIGTERM, wait the ~grace window, then SIGKILL + short
+        reap, reconciled with ``terminationGracePeriodSeconds: 60`` (issue #81;
+        this used to give up after only 30s, half the grace window -- #66).
+        """
+        graceful_terminate(self.proc, log_event=self._log_event)
 
     # --------------------------------------------------------------- start
 

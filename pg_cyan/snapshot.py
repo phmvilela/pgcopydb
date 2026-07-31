@@ -77,6 +77,12 @@ import psycopg2
 from psycopg2 import sql
 from psycopg2 import Error as PgError
 
+from pg_cyan.shutdown import (
+    graceful_terminate,
+    GRACEFUL_SHUTDOWN_TIMEOUT,
+    SIGKILL_REAP_TIMEOUT as _SIGKILL_REAP_TIMEOUT,
+)
+
 # Structured JSON logging (mirrors the other stages).
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -113,18 +119,12 @@ class PgCyanSnapshot:
 
     #: How long to wait for the child to export the snapshot before giving up.
     DEFAULT_SNAPSHOT_TIMEOUT = 120
-    #: How long to give the child to close its connection on a graceful stop
-    #: (the SIGTERM window before we escalate to SIGKILL). Sized just under the
-    #: controller pod's ``terminationGracePeriodSeconds: 60`` (see
-    #: ``deploy/k8s/35-statefulset-controller.yaml``) so pgcopydb gets nearly the
-    #: full grace window to exit cleanly, while leaving a margin for our own
-    #: SIGKILL + reap to run *before* the kubelet force-kills the pod at 60s
-    #: (issue #66: the old 30s gave up at the halfway mark).
-    DEFAULT_SHUTDOWN_TIMEOUT = 55
-    #: Seconds to reap the child after we SIGKILL it. SIGKILL is uninterruptible
-    #: so this returns almost immediately; kept small so a wedged reap can never
-    #: push total teardown past the pod grace period.
-    SIGKILL_REAP_TIMEOUT = 5
+    #: The SIGTERM grace window / post-SIGKILL reap for the pgcopydb child on a
+    #: graceful stop, sourced from the shared ``shutdown`` helper so the snapshot
+    #: and follow (#81) call sites stay reconciled with the pod's
+    #: ``terminationGracePeriodSeconds: 60`` (issue #66; see ``shutdown.py``).
+    DEFAULT_SHUTDOWN_TIMEOUT = GRACEFUL_SHUTDOWN_TIMEOUT
+    SIGKILL_REAP_TIMEOUT = _SIGKILL_REAP_TIMEOUT
 
     def __init__(
         self,
@@ -1035,26 +1035,18 @@ class PgCyanSnapshot:
         self._terminate_child()
 
     def _terminate_child(self) -> None:
-        """SIGTERM the pgcopydb child and reap it, escalating to SIGKILL."""
-        if self.proc is None or self.proc.poll() is not None:
-            return
-        try:
-            self.proc.terminate()
-        except OSError:
-            return
-        try:
-            self.proc.wait(timeout=self.shutdown_timeout)
-        except subprocess.TimeoutExpired:
-            self._log_event(
-                "shutdown", "warning",
-                "pgcopydb did not exit in time; sending SIGKILL",
-                {"timeout": self.shutdown_timeout},
-            )
-            try:
-                self.proc.kill()
-                self.proc.wait(timeout=self.SIGKILL_REAP_TIMEOUT)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+        """SIGTERM the pgcopydb child and reap it, escalating to SIGKILL.
+
+        Delegates to the shared ``graceful_terminate`` (``shutdown.py``) so the
+        snapshot and follow (#81) shutdowns stay reconciled with the pod grace
+        period (#66).
+        """
+        graceful_terminate(
+            self.proc,
+            grace_timeout=self.shutdown_timeout,
+            reap_timeout=self.SIGKILL_REAP_TIMEOUT,
+            log_event=self._log_event,
+        )
 
     def close_connection(self) -> None:
         """Close the short-lived source connection (if still open)."""

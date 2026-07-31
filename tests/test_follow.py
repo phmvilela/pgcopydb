@@ -7,6 +7,7 @@ controller's --dir, no --resume), the slot/URI guards, the attach happy path (wr
 readiness file), the child-dies-early and attach-timeout failures, and supervise().
 """
 import json
+import subprocess
 
 import pytest
 
@@ -248,3 +249,40 @@ def _monotonic_seq(values):
             pass
         return last[0]
     return _fn
+
+
+def test_close_escalates_to_sigkill_within_the_pod_grace(tmp_path):
+    """#81: a follow child that ignores SIGTERM is SIGKILLed, using the shared
+    (grace, reap) windows reconciled with the controller pod's 60s grace -- not
+    the old 30s that gave up at the halfway mark."""
+    from pg_cyan.shutdown import GRACEFUL_SHUTDOWN_TIMEOUT, SIGKILL_REAP_TIMEOUT
+
+    class _StubbornProc:
+        def __init__(self):
+            self.returncode = None
+            self.killed = False
+            self.wait_timeouts = []
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass  # ignores SIGTERM
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(cmd="pgcopydb", timeout=timeout)
+            return self.returncode
+
+    proc = _StubbornProc()
+    follower = _make(tmp_path)
+    follower.proc = proc
+    follower.close()
+
+    assert proc.killed is True
+    assert proc.wait_timeouts == [GRACEFUL_SHUTDOWN_TIMEOUT, SIGKILL_REAP_TIMEOUT]

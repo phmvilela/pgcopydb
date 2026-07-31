@@ -23,7 +23,10 @@ name: Integration tests
 # data + secondary indexes + PK/unique constraints (#24 descope) + ALL foreign keys
 # validated (#28); (c) CDC is streaming -- exactly one active consumer on the slot
 # (the controller pod); and (d) CDC actually REPLICATES -- a sentinel row inserted
-# on the source appears on the target (the full receive->transform->apply loop).
+# on the source appears on the target (the full receive->transform->apply loop);
+# and (e) the controller shuts down GRACEFULLY on SIGTERM -- it stops the CDC
+# follow child cleanly (no SIGKILL) within the pod grace window and leaves no
+# active consumer on the source slot (#81).
 # (d) landing depends on the sequence-sync phase 2s (#78): the COPY load leaves
 # target identity sequences at their start, so without 2s the CDC INSERT draws id=1,
 # collides with the copied row, and the change is silently dropped.
@@ -489,6 +492,97 @@ jobs:
           kubectl get configmap pgcyan-copylog -n "$NS" -o jsonpath='{.data.migration-copy-log\.json}' > migration-output/migration-copy-log.json 2>/dev/null || true
           ls -la migration-output
 
+      # ACCEPTANCE (#81): the controller must shut down GRACEFULLY -- on SIGTERM it
+      # stops the CDC `follow` child cleanly (releasing the source replication
+      # connection) within the pod grace window, NOT get SIGKILLed. We scale the
+      # StatefulSet to 0 (a real graceful SIGTERM, and -- unlike deleting the pod --
+      # it will not respawn), capturing the pod's logs AS IT TERMINATES (they vanish
+      # once the pod is gone -- the #66 lesson). Then assert the clean-stop line is
+      # present, the SIGKILL-escalation line is ABSENT, and the source slot has no
+      # lingering active consumer. Gating (hard fail), happy-path only.
+      - name: Assert graceful controller shutdown (no SIGKILL, slot released) -- #81
+        run: |
+          set -euo pipefail
+          mkdir -p migration-output
+          POD="$(kubectl get pod -l pgcyan.dev/component=controller -n "$NS" \
+            -o jsonpath='{.items[0].metadata.name}')"
+          [ -n "$POD" ] || { echo "::error::no controller pod found to test shutdown"; exit 1; }
+          echo "controller pod: $POD"
+
+          # Follow the pod's logs in the background so the shutdown events emitted
+          # DURING termination are captured before the pod (and its logs) disappear.
+          kubectl logs -f "$POD" -n "$NS" --tail=-1 > migration-output/controller-shutdown.log 2>&1 &
+          LOGPID=$!
+
+          # Graceful stop: scale to 0 -> SIGTERM with the pod's full 60s grace, no respawn.
+          kubectl scale statefulset pgcyan-controller -n "$NS" --replicas=0
+          kubectl wait --for=delete "pod/$POD" -n "$NS" --timeout=90s \
+            || { echo "::error::controller pod did not terminate within the grace window"; exit 1; }
+          wait "$LOGPID" 2>/dev/null || true
+
+          echo "----- controller shutdown log (tail) -----"
+          tail -n 30 migration-output/controller-shutdown.log || true
+          echo "------------------------------------------"
+
+          # (1) clean-stop line present (park() caught the signal and stopped CDC).
+          grep -q "stopped CDC and exiting park" migration-output/controller-shutdown.log \
+            || grep -q "Received signal .*shutting down" migration-output/controller-shutdown.log \
+            || { echo "::error::no clean-stop line in the controller shutdown logs (ungraceful?)"; exit 1; }
+
+          # (2) the SIGKILL-escalation line MUST NOT appear (shared shutdown.py warning).
+          if grep -q "pgcopydb did not exit in time; sending SIGKILL" migration-output/controller-shutdown.log; then
+            echo "::error::controller SIGKILLed its pgcopydb child -- shutdown was not graceful (#81)"
+            exit 1
+          fi
+          echo "graceful shutdown confirmed: clean stop, no SIGKILL"
+
+          # (3) the source slot persists (for cutover #27) but has NO active consumer
+          # now the controller is gone. CDC deactivation can lag a beat, so poll.
+          kubectl delete job pgcyan-slot-release-check -n "$NS" --ignore-not-found --wait=true
+          cat <<'EOF' | envsubst '${PGCYAN_IMAGE}' | kubectl apply -n "$NS" -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: pgcyan-slot-release-check
+            labels: { pgcyan.dev/phase: "controller-check" }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              metadata:
+                labels: { pgcyan.dev/phase: "controller-check" }
+              spec:
+                serviceAccountName: pgcyan-worker
+                restartPolicy: Never
+                containers:
+                  - name: check
+                    image: "${PGCYAN_IMAGE}"
+                    envFrom:
+                      - secretRef: { name: pgcyan-db-uris }
+                    command: ["sh", "-c"]
+                    args:
+                      - |
+                        i=0; slots=0; active=1
+                        while [ "$i" -lt 10 ]; do
+                          slots=$(psql "$PGCOPYDB_SOURCE_PGURI" -tAc "SELECT count(*) FROM pg_replication_slots WHERE slot_type='logical'")
+                          active=$(psql "$PGCOPYDB_SOURCE_PGURI" -tAc "SELECT count(*) FROM pg_replication_slots WHERE slot_type='logical' AND active")
+                          if [ "${active:-1}" = "0" ]; then break; fi
+                          i=$((i+1)); sleep 3
+                        done
+                        echo "SLOTRELEASE slots=${slots:-0} active=${active:-1}"
+          EOF
+          kubectl wait --for=condition=complete job/pgcyan-slot-release-check -n "$NS" --timeout=120s \
+            || { kubectl logs job/pgcyan-slot-release-check -n "$NS" || true; echo "::error::slot-release check did not complete"; exit 1; }
+          line="$(kubectl logs job/pgcyan-slot-release-check -n "$NS" --tail=-1 | grep -o 'SLOTRELEASE slots=[0-9]* active=[0-9]*' | tail -1)"
+          echo "slot state after shutdown: [$line]"
+          slots=$(echo "$line" | sed -E 's/.*slots=([0-9]+).*/\1/')
+          active=$(echo "$line" | sed -E 's/.*active=([0-9]+).*/\1/')
+          fail=0
+          [ "${slots:-0}" -ge 1 ]  || { echo "::error::the logical slot should persist for cutover, got slots=${slots:-}"; fail=1; }
+          [ "${active:-1}" -eq 0 ] || { echo "::error::slot still has an active consumer after teardown -- source connection not released (#81), got active=${active:-}"; fail=1; }
+          [ "$fail" -eq 0 ] || exit 1
+          echo "slot released cleanly: $slots slot(s) persist, 0 active consumers"
+
       # Teardown: deleting the controller StatefulSet cascade-deletes every
       # workload it owns (planner/pre-data/data-shard Jobs, shard PVCs); then drop
       # the marker + plan + copy logs + collector so a re-run starts clean. The
@@ -503,7 +597,7 @@ jobs:
           kubectl delete configmap -n "$NS" --ignore-not-found \
             pgcyan-migration-state pgcyan-plan pgcyan-copylog || true
           kubectl delete configmap -n "$NS" --ignore-not-found -l pgcyan.dev/copylog=shard || true
-          kubectl delete job pgcyan-collect-inputs pgcyan-target-check pgcyan-cdc-check pgcyan-cdc-roundtrip -n "$NS" --ignore-not-found --wait=false || true
+          kubectl delete job pgcyan-collect-inputs pgcyan-target-check pgcyan-cdc-check pgcyan-cdc-roundtrip pgcyan-slot-release-check -n "$NS" --ignore-not-found --wait=false || true
           kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/phase=data || true
           # the controller's own --dir PVC (volumeClaimTemplate; not cascaded)
           kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
