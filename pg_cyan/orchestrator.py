@@ -51,9 +51,11 @@ that phase's barrier before moving on:
 
   * Job phases block until every Job in the phase reports ``Complete``
     (or ``Failed``/exceeded ``backoffLimit``).
-  * Deployment phases (follow-CDC) block until the Deployment has its desired
-    ready replica count -- it runs forever by design, so "barrier" means
-    *ready*, not *completed*.
+  * Deployment phases block until the Deployment has its desired ready replica
+    count -- a long-running Deployment never "completes", so its barrier means
+    *ready*, not *completed*. (No current phase is a Deployment: CDC/follow is
+    now streamed in-pod by the controller, #26/#70, not a phase Deployment. The
+    handling is retained as generic capability for any future Deployment phase.)
 
 Fails fast: the first phase whose barrier does not resolve to success stops
 the walk immediately (``run()`` returns without applying later phases).

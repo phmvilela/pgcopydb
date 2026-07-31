@@ -17,9 +17,10 @@ sections around the COPY (see ``notes/migration-phases-lessons-learned.md`` item
 schema, no indexes, no vacuum -- which is exactly this phase's job.
 
 CONSISTENCY: every shard is pinned to the SAME ``--snapshot=<id>`` -- the
-consistent point the phase-1 holder (#23) exported and published into the
-``pgcyan-snapshot`` ConfigMap (issue #58), read here from ``$SNAPSHOT_ID`` -- so
-all shards copy the same instant.
+consistent point the controller (#70, which folded in the phase-1 holder #23)
+holds in-pod and injects into each phase pod as ``$SNAPSHOT_ID`` -- so all shards
+copy the same instant. (#70 superseded the earlier ``pgcyan-snapshot`` ConfigMap
+handoff, #58.)
 
 RESUME: each shard has its OWN ReadWriteOnce managed disk mounted at ``--dir``
 (``/work``); ``--resume`` means a killed/backed-off shard pod re-attaches the
@@ -558,7 +559,7 @@ class PgCyanDataShard:
         if not self.snapshot_id:
             self._log_event(
                 "run", "failure", "No snapshot id supplied",
-                {"remediation": "Pass --snapshot (from the pgcyan-snapshot ConfigMap the phase-1 holder publishes)"},
+                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each phase pod, #70)"},
             )
             self.errors.append(
                 "No snapshot id: pass --snapshot=<id> (the holder's snapshot)"

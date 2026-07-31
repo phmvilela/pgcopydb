@@ -89,7 +89,10 @@ spec:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
       # A graceful stop must let the controller tear down its snapshot child
-      # (close the source connection) before SIGKILL.
+      # (close the source connection) before SIGKILL. The wrapper's SIGTERM
+      # window (PgCyanSnapshot.DEFAULT_SHUTDOWN_TIMEOUT = 55s) is sized just
+      # under this grace period so it can escalate to its own SIGKILL + reap
+      # before the kubelet force-kills the pod at 60s (issue #66).
       terminationGracePeriodSeconds: 60
       # EVICTION = FULL RESTART (issue #70): a lost pod loses the in-pod snapshot.
       # Pin the controller to a STABLE node pool -- non-spot and excluded from

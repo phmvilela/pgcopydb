@@ -113,8 +113,18 @@ class PgCyanSnapshot:
 
     #: How long to wait for the child to export the snapshot before giving up.
     DEFAULT_SNAPSHOT_TIMEOUT = 120
-    #: How long to give the child to close its connection on shutdown.
-    DEFAULT_SHUTDOWN_TIMEOUT = 30
+    #: How long to give the child to close its connection on a graceful stop
+    #: (the SIGTERM window before we escalate to SIGKILL). Sized just under the
+    #: controller pod's ``terminationGracePeriodSeconds: 60`` (see
+    #: ``deploy/k8s/35-statefulset-controller.yaml``) so pgcopydb gets nearly the
+    #: full grace window to exit cleanly, while leaving a margin for our own
+    #: SIGKILL + reap to run *before* the kubelet force-kills the pod at 60s
+    #: (issue #66: the old 30s gave up at the halfway mark).
+    DEFAULT_SHUTDOWN_TIMEOUT = 55
+    #: Seconds to reap the child after we SIGKILL it. SIGKILL is uninterruptible
+    #: so this returns almost immediately; kept small so a wedged reap can never
+    #: push total teardown past the pod grace period.
+    SIGKILL_REAP_TIMEOUT = 5
 
     def __init__(
         self,
@@ -158,7 +168,9 @@ class PgCyanSnapshot:
             plan_file: optional ``plan.json`` to source publication/slot/mode from.
             pgcopydb_bin: pgcopydb executable name/path.
             snapshot_timeout: seconds to wait for the child to export the snapshot.
-            shutdown_timeout: seconds to let the child close its connection.
+            shutdown_timeout: the SIGTERM grace window (seconds) before escalating
+                to SIGKILL; sized just under the pod's terminationGracePeriodSeconds
+                (see DEFAULT_SHUTDOWN_TIMEOUT, issue #66).
             snapshot_configmap: name of the ConfigMap to publish the snapshot id
                 into for the shards (issue #58). ``None``/empty skips publishing
                 (local runs without a cluster); in-cluster the holder sets it.
@@ -1040,7 +1052,7 @@ class PgCyanSnapshot:
             )
             try:
                 self.proc.kill()
-                self.proc.wait(timeout=self.shutdown_timeout)
+                self.proc.wait(timeout=self.SIGKILL_REAP_TIMEOUT)
             except (OSError, subprocess.TimeoutExpired):
                 pass
 

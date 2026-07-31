@@ -23,10 +23,12 @@ this pod's own (empty) work dir -- the wrapper runs two steps:
   2. ``pgcopydb restore pre-data --dir=<work> --target=<uri>`` -- applies ONLY
      the pre-data section to the target.
 
-The snapshot id is read from the ``pgcyan-snapshot`` ConfigMap the holder
-publishes (issue #58), passed in as ``$SNAPSHOT_ID`` via ``configMapKeyRef`` --
-so the holder (phase 1) MUST run before this phase (the orchestrator DAG orders
-it that way; see ``orchestrator.py``). Consistency can be waived with
+The snapshot id arrives as ``$SNAPSHOT_ID``, injected into this Job's env at
+apply time by the controller (#70, which folded in the phase-1 holder #23) --
+which holds the consistent snapshot in-pod and orders this phase after it (see
+``orchestrator.py``). (#70 superseded the earlier ``pgcyan-snapshot`` ConfigMap
+handoff, #58 -- there is no separate holder Job and no ``configMapKeyRef``.)
+Consistency can be waived with
 ``--not-consistent`` (the dump then takes its own snapshot) only if the source
 schema is stable for the migration window.
 
@@ -376,7 +378,7 @@ class PgCyanPreData:
             self._log_event(
                 "run", "failure",
                 "No snapshot id supplied and --not-consistent not set",
-                {"remediation": "Pass --snapshot (from the pgcyan-snapshot ConfigMap the phase-1 holder publishes) or --not-consistent"},
+                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each phase pod, #70) or --not-consistent"},
             )
             self.errors.append(
                 "No snapshot id: pass --snapshot=<id> (holder's snapshot) or --not-consistent"

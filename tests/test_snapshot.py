@@ -454,6 +454,53 @@ def test_terminate_child_noop_when_already_exited(tmp_path):
     assert proc.terminated is False
 
 
+def test_terminate_child_escalates_to_sigkill_with_reconciled_timeouts(tmp_path):
+    """#66: a pgcopydb child that ignores SIGTERM is SIGKILLed, and the two waits
+    use the SIGTERM grace window then the short reap window -- both bounded so the
+    total teardown fits inside the pod's terminationGracePeriodSeconds."""
+    import subprocess
+
+    class _StubbornProc:
+        """SIGTERM does nothing; only SIGKILL stops it. Records wait() timeouts."""
+
+        def __init__(self):
+            self.returncode = None
+            self.killed = False
+            self.wait_timeouts = []
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass  # ignores SIGTERM
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            if self.returncode is None:  # graceful SIGTERM wait: never exits
+                raise subprocess.TimeoutExpired(cmd="pgcopydb", timeout=timeout)
+            return self.returncode  # post-SIGKILL reap
+
+    proc = _StubbornProc()
+    holder = _make_holder(tmp_path)
+    holder.proc = proc
+    holder._terminate_child()
+
+    assert proc.killed is True
+    # First wait = the SIGTERM grace window; second = the short SIGKILL reap.
+    assert proc.wait_timeouts == [
+        PgCyanSnapshot.DEFAULT_SHUTDOWN_TIMEOUT,
+        PgCyanSnapshot.SIGKILL_REAP_TIMEOUT,
+    ]
+    # Reconciled with the 60s pod grace: graceful window near-full, reap leaves margin.
+    assert PgCyanSnapshot.DEFAULT_SHUTDOWN_TIMEOUT < 60
+    assert (PgCyanSnapshot.DEFAULT_SHUTDOWN_TIMEOUT
+            + PgCyanSnapshot.SIGKILL_REAP_TIMEOUT) <= 60
+
+
 def test_hold_returns_child_exit_code_and_closes_connection(tmp_path):
     import signal
     saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}

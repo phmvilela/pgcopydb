@@ -68,9 +68,9 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "deployments/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
-  # PodDisruptionBudgets ship alongside the snapshot-holder/follow-cdc
-  # Deployments (50/80) -- the orchestrator applies whatever a phase manifest
-  # contains, which includes these.
+  # PodDisruptionBudgets ship with the controller StatefulSet (35) -- and the
+  # orchestrator applies whatever a phase manifest contains, so it keeps the
+  # verbs for any future Deployment/PDB phase too.
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
@@ -78,9 +78,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch"]
-  # Publish the generated plan + the snapshot id, and read the collected inputs.
-  # (The snapshot holder runs as this SA and publishes the pgcyan-snapshot
-  # ConfigMap; the planner Job publishes pgcyan-plan -- see issue #58 / #38.)
+  # Publish the generated plan + the aggregated copy log, and read the collected
+  # inputs. (The controller holds the snapshot in-pod and injects SNAPSHOT_ID
+  # directly, #70 -- no pgcyan-snapshot ConfigMap; the planner Job publishes
+  # pgcyan-plan -- see issue #58 / #38.)
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create", "get", "list", "watch", "patch", "update"]
@@ -148,8 +149,9 @@ metadata:
   name: pgcyan-viewer
   namespace: pgcyan-migration
 rules:
-  # Observe the migration DAG: pods (+ their logs), the jobs and the
-  # snapshot-holder / follow-cdc Deployments and the ReplicaSets they own.
+  # Observe the migration DAG: pods (+ their logs), the phase Jobs and the
+  # controller StatefulSet (which holds the snapshot in-pod and streams CDC,
+  # #70/#26). Deployment/ReplicaSet verbs are kept for any future Deployment phase.
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch"]
