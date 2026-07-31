@@ -76,17 +76,6 @@ spec:
 ---
 # (No phase-3b FK disk: since #28 the FK pass is pure psycopg2 -- no pgcopydb
 # catalog to persist -- so 71-job-phase3-fk.yaml uses an emptyDir, not a PVC.)
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: pgcyan-workdir-cdc          # phase 4 (80-deployment-follow-cdc.yaml)
-  namespace: pgcyan-migration
-  labels:
-    pgcyan.dev/workdir: "cdc"
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      # CDC may spill wal2json transform files here -- give it more headroom.
-      storage: 20Gi
-  storageClassName: managed-csi
+# (No phase-4 CDC disk here: under Option A (#26) the CONTROLLER is the CDC
+# consumer and uses its OWN --dir, a volumeClaimTemplate on the StatefulSet in
+# 35-statefulset-controller.yaml -- not a standalone PVC.)

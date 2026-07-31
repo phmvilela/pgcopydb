@@ -11,18 +11,26 @@ name: Integration tests
 # ONE job, `migration`, runs the whole implemented pipeline end-to-end via the
 # folded controller (#70) -- no per-phase jobs, no parallelism, no shared-object
 # race. It runs the phase -2 collector (barrier), then stands up the controller
-# StatefulSet with PGCYAN_STOP_AFTER=3b: the controller holds the consistent
+# StatefulSet with PGCYAN_FOLLOW_CDC=true: the controller holds the consistent
 # snapshot IN-POD and walks planner(-1) -> pre-data(0) -> data shards(2) ->
-# index(3a) -> FK(3b), injecting the snapshot id into the phase pods (no
-# pgcyan-snapshot ConfigMap) and owning every workload (delete the StatefulSet ->
-# owner-ref cascade). It waits on the run-state marker, then asserts (a) the
-# combined pgcyan-copylog ConfigMap -- a `completed` copy with per-table row
-# counts (#25), and (b) the target now has tables + data + secondary indexes +
-# PK/unique constraints (#24 descope) + ALL foreign keys validated (#28).
+# index(3a) -> FK(3b), injecting the snapshot id into the phase pods and owning
+# every workload (delete the StatefulSet -> owner-ref cascade). THEN, under Option
+# A (#26), the controller itself becomes the CDC consumer: it releases the snapshot
+# and runs `pgcopydb follow --resume` on its OWN --dir (where the slot record lives,
+# so follow reuses it -- no separate pod, no cross-pod --dir handoff). It waits on
+# the run-state marker, then asserts (a) the combined pgcyan-copylog ConfigMap -- a
+# `completed` copy with per-table row counts (#25); (b) the target now has tables +
+# data + secondary indexes + PK/unique constraints (#24 descope) + ALL foreign keys
+# validated (#28); (c) CDC is streaming -- exactly one active consumer on the slot
+# (the controller pod); and (d) CDC actually REPLICATES -- a sentinel row inserted
+# on the source appears on the target (the full receive->transform->apply loop).
+# (d) landing depends on the sequence-sync phase 2s (#78): the COPY load leaves
+# target identity sequences at their start, so without 2s the CDC INSERT draws id=1,
+# collides with the copied row, and the change is silently dropped.
 #
-# Bump PGCYAN_STOP_AFTER as phase 4 (CDC) lands. The planner->pre-data->data-shard
-# path is validated green on AKS (7 tables / ~4.8M rows across 4 disjoint shards);
-# phase 3 (#28) is first exercised end-to-end here. NOTE: cluster-backed; the
+# The planner->post-data path is validated green on AKS (7 tables / ~4.8M rows
+# across 4 disjoint shards); controller-owned CDC (#26 Option A) is first exercised
+# end-to-end here. NOTE: cluster-backed; the
 # source DB must contain tables (with FKs) for the copy + post-data to be meaningful.
 #
 # ---------------------------------------------------------------------------
@@ -67,7 +75,7 @@ env:
 
 jobs:
   migration:
-    name: End-to-end migration via the folded controller, through phase 3 (#70/#25/#28)
+    name: End-to-end migration via the folded controller, walk + controller-owned CDC (#70/#25/#28/#26)
     runs-on: ubuntu-latest
     environment: azure
     # ONE job, no parallelism -- the folded controller walks the WHOLE implemented
@@ -77,10 +85,11 @@ jobs:
     env:
       AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
       AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
-      # Walk through phase 3b (post-data: indexes #28 3a + FK constraints #28 3b --
-      # the last implemented phase) then park Ready. Phase 4 (CDC) is not built
-      # yet; bump this as it lands.
-      PGCYAN_STOP_AFTER: "3b"
+      # Run the WHOLE walk (planner -> post-data; PGCYAN_STOP_AFTER empty) and then
+      # stream CDC: after the walk the controller releases the snapshot and becomes
+      # the `pgcopydb follow` consumer on its own --dir (Option A, #26), staying Ready.
+      PGCYAN_STOP_AFTER: ""
+      PGCYAN_FOLLOW_CDC: "true"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -206,8 +215,11 @@ jobs:
           # so clear them by label or they leak into the next run's aggregation.
           kubectl delete configmap -n "$NS" --ignore-not-found -l pgcyan.dev/copylog=shard || true
           kubectl delete job -n "$NS" --ignore-not-found --wait=true \
-            pgcyan-collect-inputs pgcyan-target-check || true
+            pgcyan-collect-inputs pgcyan-target-check pgcyan-cdc-check pgcyan-cdc-roundtrip || true
           kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/phase=data || true
+          # the controller's own --dir PVC (volumeClaimTemplate; not cascaded by the
+          # StatefulSet delete) -- clear it so this run gets a fresh --dir.
+          kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
 
       # Phase -2 (collect inputs) is NOT part of the controller walk (which starts
       # at the planner, -1); run it + barrier first so the planner has its inputs.
@@ -228,14 +240,14 @@ jobs:
           envsubst '${PGCYAN_IMAGE}' < deploy/k8s/25-job-collect-inputs.yaml | kubectl apply -f -
           wait_job pgcyan-collect-inputs 900
 
-      # Apply the controller StatefulSet. envsubst fills the image AND
-      # PGCYAN_STOP_AFTER (=0) into the FIRST pod's env -- so it stops after
-      # pre-data. (Setting the env post-apply would roll the pod and trip the
-      # refuse-to-resume guard, hence baking it in at apply time.)
-      - name: Apply the migration controller (walk through phase 3)
+      # Apply the controller StatefulSet. envsubst bakes the image + PGCYAN_STOP_AFTER
+      # (empty = full walk) + PGCYAN_FOLLOW_CDC (=true, stream CDC after the walk)
+      # into the pod env at apply time. (Setting env post-apply would roll the pod
+      # and trip the refuse-to-resume guard, hence baking it in.)
+      - name: Apply the migration controller (walk + controller-owned CDC)
         run: |
           set -euo pipefail
-          envsubst '${PGCYAN_IMAGE} ${PGCYAN_STOP_AFTER}' \
+          envsubst '${PGCYAN_IMAGE} ${PGCYAN_STOP_AFTER} ${PGCYAN_FOLLOW_CDC} ${PGCYAN_FOLLOW_VERBOSE}' \
             < deploy/k8s/35-statefulset-controller.yaml | kubectl apply -f -
 
       # Completion signal is the run-state marker the controller patches, NOT
@@ -342,12 +354,135 @@ jobs:
           [ "$fail" -eq 0 ] || exit 1
           echo "target post-data OK: $tables tables, $indexes indexes, $pkuq PK/unique, $fks FKs ($fksvalid validated)"
 
+      # ACCEPTANCE (#26): after phase 4 the CDC consumer is streaming -- exactly ONE
+      # active consumer on the SOURCE slot (the controller released its snapshot so
+      # `pgcopydb follow` could attach), and migration-cdc-log.json says `streaming`.
+      # Checked in-cluster (source URI from the secret).
+      - name: Verify CDC is streaming (one active consumer on the slot)
+        run: |
+          set -euo pipefail
+          kubectl delete job pgcyan-cdc-check -n "$NS" --ignore-not-found --wait=true
+          cat <<'EOF' | envsubst '${PGCYAN_IMAGE}' | kubectl apply -n "$NS" -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: pgcyan-cdc-check
+            labels: { pgcyan.dev/phase: "controller-check" }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              metadata:
+                labels: { pgcyan.dev/phase: "controller-check" }
+              spec:
+                serviceAccountName: pgcyan-worker
+                restartPolicy: Never
+                containers:
+                  - name: check
+                    image: "${PGCYAN_IMAGE}"
+                    envFrom:
+                      - secretRef: { name: pgcyan-db-uris }
+                    command: ["sh", "-c"]
+                    args:
+                      - |
+                        psql "$PGCOPYDB_SOURCE_PGURI" -tA -v ON_ERROR_STOP=1 -c "SELECT 'CDC'||' slots='||(SELECT count(*) FROM pg_replication_slots WHERE slot_type='logical')||' active='||(SELECT count(*) FROM pg_replication_slots WHERE slot_type='logical' AND active)"
+          EOF
+          kubectl wait --for=condition=complete job/pgcyan-cdc-check -n "$NS" --timeout=120s \
+            || { kubectl logs job/pgcyan-cdc-check -n "$NS" || true; echo "::error::CDC check did not complete"; exit 1; }
+          line="$(kubectl logs job/pgcyan-cdc-check -n "$NS" --tail=-1 | grep -o 'CDC slots=[0-9]* active=[0-9]*' | tail -1)"
+          echo "CDC slot state: [$line]"
+          slots=$(echo "$line" | sed -E 's/.*slots=([0-9]+).*/\1/')
+          active=$(echo "$line" | sed -E 's/.*active=([0-9]+).*/\1/')
+          fail=0
+          [ "${slots:-0}" -ge 1 ]  || { echo "::error::expected a logical slot, got ${slots:-}"; fail=1; }
+          [ "${active:-0}" -eq 1 ] || { echo "::error::expected exactly 1 ACTIVE consumer on the slot (the controller's follow), got ${active:-}"; fail=1; }
+          # The consumer is the CONTROLLER pod itself (Option A, #26) -- its follow
+          # events + migration-cdc-log.json land in the collected controller.log.
+          [ "$fail" -eq 0 ] || exit 1
+          echo "CDC OK: $slots logical slot(s), $active active consumer -- streaming"
+
+      # ACCEPTANCE (#26, the strong one): prove CDC actually REPLICATES a live
+      # change end-to-end, not just that a consumer is attached. Insert a uniquely
+      # marked sentinel row on the SOURCE, then poll the TARGET until it appears --
+      # exercising the full receive -> transform -> apply loop (the apply half is the
+      # real unknown). CDC is async, so this is a bounded poll, not a single query.
+      # Runs in-cluster (both DBs reachable only from inside). On timeout it dumps
+      # the controller's CDC log for diagnosis.
+      - name: Verify CDC replicates a live change (source insert -> target)
+        run: |
+          set -euo pipefail
+          export PROBE="cdc-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "CDC round-trip probe: $PROBE"
+          kubectl delete job pgcyan-cdc-roundtrip -n "$NS" --ignore-not-found --wait=true
+          cat <<'EOF' | envsubst '${PGCYAN_IMAGE} ${PROBE}' | kubectl apply -n "$NS" -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: pgcyan-cdc-roundtrip
+            labels: { pgcyan.dev/phase: "controller-check" }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              metadata:
+                labels: { pgcyan.dev/phase: "controller-check" }
+              spec:
+                serviceAccountName: pgcyan-worker
+                restartPolicy: Never
+                containers:
+                  - name: roundtrip
+                    image: "${PGCYAN_IMAGE}"
+                    envFrom:
+                      - secretRef: { name: pgcyan-db-uris }
+                    env:
+                      - name: PROBE
+                        value: "${PROBE}"
+                    command: ["sh", "-c"]
+                    args:
+                      - |
+                        set -e
+                        # Insert a new row on the source (customers has no FK parent).
+                        # A hard failure here means the test setup is broken, not CDC.
+                        psql "$PGCOPYDB_SOURCE_PGURI" -v ON_ERROR_STOP=1 -c \
+                          "INSERT INTO public.customers (email, region) VALUES ('$PROBE', 'cdc')"
+                        echo "inserted $PROBE on source; polling target (<=30s)..."
+                        i=0
+                        while [ "$i" -lt 10 ]; do
+                          n=$(psql "$PGCOPYDB_TARGET_PGURI" -tAc \
+                            "SELECT count(*) FROM public.customers WHERE email = '$PROBE'" 2>/dev/null || echo 0)
+                          if [ "$n" = "1" ]; then echo "ROUNDTRIP found after ~$((i*3))s"; break; fi
+                          i=$((i+1)); sleep 3
+                        done
+                        # Tidy up probe rows on the source (best-effort; CDC
+                        # replicates the delete too). Then report the outcome.
+                        psql "$PGCOPYDB_SOURCE_PGURI" -c \
+                          "DELETE FROM public.customers WHERE email LIKE 'cdc-probe-%'" >/dev/null 2>&1 || true
+                        [ "${n:-0}" = "1" ] && exit 0
+                        echo "ROUNDTRIP notfound after 30s"; exit 1
+          EOF
+          # FATAL: the sequence-sync phase (2s) advances the target identity
+          # sequences after the copy, and the pgcopydb fork flushes the apply
+          # pipeline on drain (#26/#78), so a live source insert must appear on
+          # the target within the window. If it does not, that is a real
+          # regression -- dump the controller CDC log for diagnosis.
+          if ! kubectl wait --for=condition=complete job/pgcyan-cdc-roundtrip -n "$NS" --timeout=90s; then
+            echo "::error::CDC did not replicate the probe row within 30s (regression? check the apply pipeline flush #26 and the sequence sync #78)"
+            kubectl logs job/pgcyan-cdc-roundtrip -n "$NS" --tail=-1 || true
+            echo "--- controller CDC log (last 200) ---"
+            kubectl logs -l pgcyan.dev/component=controller -n "$NS" --tail=200 || true
+            exit 1
+          fi
+          kubectl logs job/pgcyan-cdc-roundtrip -n "$NS" --tail=-1 | grep -q "ROUNDTRIP found"
+          echo "CDC replication OK: a source insert appeared on the target"
+
       - name: Collect controller + phase logs
         if: always()
         run: |
           mkdir -p migration-output
+          # The controller streams CDC in-pod (Option A), so its follow events are
+          # in controller.log; there is no separate `cdc` pod.
           kubectl logs -l pgcyan.dev/component=controller -n "$NS" --tail=-1 > migration-output/controller.log 2>&1 || true
-          for phase in collect-inputs planner pre-data data post-data-index post-data-fk controller-check; do
+          for phase in collect-inputs planner pre-data data sequences post-data-index post-data-fk controller-check; do
             kubectl logs -l pgcyan.dev/phase="$phase" -n "$NS" --tail=-1 --prefix > "migration-output/${phase}.log" 2>&1 || true
           done
           kubectl get configmap pgcyan-migration-state -n "$NS" -o yaml > migration-output/run-state.yaml 2>/dev/null || true
@@ -357,7 +492,9 @@ jobs:
       # Teardown: deleting the controller StatefulSet cascade-deletes every
       # workload it owns (planner/pre-data/data-shard Jobs, shard PVCs); then drop
       # the marker + plan + copy logs + collector so a re-run starts clean. The
-      # snapshot child died with the controller pod, so nothing else to release.
+      # snapshot child + CDC follow child died with the controller pod. A
+      # StatefulSet's own volumeClaimTemplate PVC does NOT cascade -- delete it
+      # explicitly so the next run gets a fresh --dir.
       - name: Teardown
         if: always()
         run: |
@@ -366,8 +503,10 @@ jobs:
           kubectl delete configmap -n "$NS" --ignore-not-found \
             pgcyan-migration-state pgcyan-plan pgcyan-copylog || true
           kubectl delete configmap -n "$NS" --ignore-not-found -l pgcyan.dev/copylog=shard || true
-          kubectl delete job pgcyan-collect-inputs pgcyan-target-check -n "$NS" --ignore-not-found --wait=false || true
+          kubectl delete job pgcyan-collect-inputs pgcyan-target-check pgcyan-cdc-check pgcyan-cdc-roundtrip -n "$NS" --ignore-not-found --wait=false || true
           kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/phase=data || true
+          # the controller's own --dir PVC (volumeClaimTemplate; not cascaded)
+          kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
 
       - name: Upload controller logs
         if: always()

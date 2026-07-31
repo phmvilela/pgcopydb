@@ -217,6 +217,8 @@ stage's `--help` and module docstring.
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
 | `PGCYAN_SNAPSHOT_MODE`       | `coordinator-held` | `plan`: snapshot strategy |
 | `PGCYAN_PUBLICATION` / `PGCYAN_SLOT` | `pgcyan_pub` / `pgcyan_slot` | publication + replication-slot names |
+| `PGCYAN_PLUGIN` / `PGCYAN_ORIGIN` | `pgoutput` / `pgcyan` | CDC: logical decoding plugin + replication origin node name |
+| `PGCYAN_FOLLOW_CDC` | *(unset)* | `run-migration`: after the walk, become the CDC consumer (`pgcopydb follow` in-controller — #26); `true` to enable |
 | `PGCYAN_RUN_ID`              | *(clock)*   | `plan`: opaque run identifier    |
 | `PGCOPYDB_SOURCE_PGURI` / `PGCOPYDB_TARGET_PGURI` | *(unset)* | pgcopydb-native source/target libpq URIs (else `PG_SOURCE_*`) |
 | `SNAPSHOT_ID`               | *(unset)*   | `restore-predata` / `copy-shard`: consistent snapshot to pin to (**injected by the controller** — #70) |

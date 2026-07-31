@@ -12,6 +12,7 @@ from pg_cyan import cli as cli_module
 from pg_cyan.datashard import PgCyanDataShard as RealDataShard
 from pg_cyan.postfk import PgCyanForeignKeys as RealForeignKeys
 from pg_cyan.postindex import PgCyanPostIndex as RealPostIndex
+from pg_cyan.sequences import PgCyanSequences as RealSequences
 from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
 from pg_cyan.predata import PgCyanPreData as RealPreData
@@ -220,6 +221,19 @@ class _StubForeignKeys(RealForeignKeys):
                 "fk_total": 0, "fk_validated": 0, "errors": []}
 
 
+class _StubSequences(RealSequences):
+    """Records kwargs; success unless target is the 'bad' sentinel (#78)."""
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubSequences.last_kwargs = kwargs
+        self._ok = kwargs.get("target_pguri") != "postgres://bad/db"
+
+    def run(self):
+        return {"status": "success" if self._ok else "failure",
+                "sequences_total": 0, "sequences_synced": 0, "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
@@ -233,6 +247,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanController", _StubController)
     monkeypatch.setattr(cli_module, "PgCyanPostIndex", _StubPostIndex)
     monkeypatch.setattr(cli_module, "PgCyanForeignKeys", _StubForeignKeys)
+    monkeypatch.setattr(cli_module, "PgCyanSequences", _StubSequences)
     return CliRunner()
 
 
@@ -463,6 +478,22 @@ def test_build_indexes_exit_one_on_failure(runner):
     assert result.exit_code == 1
 
 
+def test_copy_sequences_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, [
+        "copy-sequences", "--source-pguri", "postgres://src/db",
+        "--target-pguri", "postgres://good/db",
+    ])
+    assert result.exit_code == 0
+    assert _StubSequences.last_kwargs["source_pguri"] == "postgres://src/db"
+
+
+def test_copy_sequences_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, [
+        "copy-sequences", "--target-pguri", "postgres://bad/db",
+    ])
+    assert result.exit_code == 1
+
+
 def test_build_foreign_keys_exit_zero_on_success(runner):
     result = runner.invoke(cli_module.cli, [
         "build-foreign-keys", "--source-pguri", "postgres://src/db",
@@ -499,6 +530,17 @@ def test_run_migration_stop_after_flows_through(runner):
     result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--stop-after", "2"])
     assert result.exit_code == 0
     assert _StubController.last_kwargs["stop_after"] == "2"
+
+
+def test_run_migration_follow_cdc_flows_through(runner):
+    # --follow-cdc must reach the controller (the manifest sets PGCYAN_FOLLOW_CDC);
+    # a regression here silently skips CDC (issue #26).
+    result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--follow-cdc"])
+    assert result.exit_code == 0
+    assert _StubController.last_kwargs["follow_cdc"] is True
+    # explicit off
+    runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--no-follow-cdc"])
+    assert _StubController.last_kwargs["follow_cdc"] is False
 
 
 def test_run_migration_stop_after_rejects_unknown_phase(runner):

@@ -29,7 +29,7 @@ phase −2 input collector are assumed already applied).
 | `60-job-phase2-datashard.template.yaml` | 2 | PVC+Job × N | `pg_cyan.cli copy-shard`: concurrent DATA-ONLY (`pgcopydb copy table-data`) COPY shards, each on its own RWO work disk; writes per-shard `migration-copy-log.json` and publishes it to its `pgcyan-copylog-<shard>` ConfigMap (slot/publication/snapshot + per-table row counts), which the orchestrator merges into the combined `pgcyan-copylog` ConfigMap |
 | `70-job-phase3-index.template.yaml` | 3a | PVC+Job × M | secondary index builds (shardable), each on its own RWO work disk |
 | `71-job-phase3-fk.yaml` | 3b | Job (single) | FK/constraint single coordinated pass |
-| `80-deployment-follow-cdc.yaml` | 4 | Deployment(1)+PDB | optional CDC catch-up → cutover |
+| *(CDC — no manifest)* | — | the controller itself | Under Option A (#26) the controller streams `pgcopydb follow` on its own `--dir` after the walk; there is no separate CDC Deployment (the slot-creator + streamer must share a `--dir`). |
 | `90-cronjob-slot-reaper.example.yaml` | — | CronJob (suspended EXAMPLE) | specification (#70) for reaping the orphaned SOURCE replication slot — the one leaked resource owner-ref cascade can't reach; customize the guard before enabling |
 
 `.template.yaml` files contain `${...}` placeholders the orchestrator substitutes

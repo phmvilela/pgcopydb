@@ -60,6 +60,7 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
 
+from pg_cyan.follow import PgCyanFollow
 from pg_cyan.orchestrator import PgCyanOrchestrator
 from pg_cyan.snapshot import PgCyanSnapshot, _holder_from_env
 
@@ -89,8 +90,10 @@ class PgCyanController:
         in_cluster: bool = True,
         ready_file: str = DEFAULT_READY_FILE,
         stop_after: Optional[str] = None,
+        follow_cdc: bool = False,
         core_api=None,
         orchestrator_factory: Optional[Callable[..., PgCyanOrchestrator]] = None,
+        follow_factory: Optional[Callable[..., PgCyanFollow]] = None,
     ) -> None:
         """
         Args:
@@ -103,9 +106,15 @@ class PgCyanController:
             in_cluster: Load in-cluster credentials (else local kubeconfig).
             ready_file: Path the readiness probe tests for; written when the
                 controller is healthy, absent when parked/failed.
+            follow_cdc: After a full successful walk, become the CDC consumer --
+                release the snapshot then stream ``pgcopydb follow`` on this pod's
+                own ``--dir`` (Option A, issue #26). ``False`` -> park after the
+                walk (no CDC). Skipped when ``stop_after`` halts before post-data.
             core_api: Injectable CoreV1Api (own pod + state ConfigMap); built if omitted.
             orchestrator_factory: Injectable builder ``(**kwargs) -> orchestrator``
                 for tests; defaults to constructing a real ``PgCyanOrchestrator``.
+            follow_factory: Injectable builder ``(**kwargs) -> PgCyanFollow`` for the
+                CDC consumer; defaults to building from the holder + env.
         """
         self.holder = holder
         self.namespace = namespace
@@ -113,6 +122,10 @@ class PgCyanController:
         self.in_cluster = in_cluster
         self.ready_file = ready_file
         self.stop_after = stop_after
+        self.follow_cdc = follow_cdc
+        self.follow_factory = follow_factory or self._default_follow
+        self.cdc: Optional[PgCyanFollow] = None       # the streaming CDC child, once started
+        self._released = False       # snapshot deliberately released ahead of CDC (#26)
         self.errors = []
 
         if core_api is None:
@@ -133,6 +146,24 @@ class PgCyanController:
 
     def _default_orchestrator(self, **kwargs) -> PgCyanOrchestrator:
         return PgCyanOrchestrator(namespace=self.namespace, in_cluster=self.in_cluster, **kwargs)
+
+    def _default_follow(self, **kwargs) -> PgCyanFollow:
+        """Build the CDC consumer on THIS pod's --dir (so follow reuses the slot).
+
+        The work dir mirrors the holder's ``--dir`` (``pgcopydb snapshot --follow``
+        populated its ``source.db`` with the slot record), and the readiness file is
+        shared with the controller so the probe reflects CDC health.
+        """
+        return PgCyanFollow(
+            source_pguri=os.getenv("PGCOPYDB_SOURCE_PGURI") or None,
+            target_pguri=os.getenv("PGCOPYDB_TARGET_PGURI") or None,
+            work_dir=os.getenv("PGCYAN_WORK_DIR", PgCyanFollow.DEFAULT_WORK_DIR),
+            ready_file=self.ready_file,
+            # Optional CDC debug knob: run `pgcopydb follow --verbose` (logs each
+            # change) when PGCYAN_FOLLOW_VERBOSE is set. Off by default.
+            verbose=os.getenv("PGCYAN_FOLLOW_VERBOSE", "").strip().lower() in ("1", "true", "yes"),
+            **kwargs,
+        )
 
     def _log_event(self, event_type: str, status: str, message: str,
                    details: Optional[Dict] = None) -> None:
@@ -191,9 +222,61 @@ class PgCyanController:
 
         ``True`` when the child is running -- or when there is no child at all
         (a ``--not-consistent`` run holds nothing), so we never spuriously abort.
+        Also ``True`` once we have DELIBERATELY released the snapshot before CDC
+        (issue #26): from that point its absence is by design, not a failure.
         """
+        if self._released:
+            return True
         proc = self.holder.proc
         return proc is None or proc.poll() is None
+
+    @staticmethod
+    def _walk_reached_postdata(result: Dict) -> bool:
+        """Did the walk complete through post-data (the last phase) -- i.e. is the
+        target ready for CDC to apply against? True when it ran the whole DAG, or
+        stopped after the last phase (``PgCyanOrchestrator.PHASES[-1]``)."""
+        last_phase = PgCyanOrchestrator.PHASES[-1]["id"]
+        return result.get("stopped_after") in (None, last_phase)
+
+    def _start_cdc(self, snapshot_id: Optional[str], summary: Dict) -> bool:
+        """
+        Release the held snapshot, then start streaming CDC on this pod's --dir.
+        Returns whether the controller is Ready (CDC attached). Updates ``summary``.
+        """
+        # The held snapshot keeps the slot acquired; release it so `follow` can
+        # attach. The slot is persistent + the --dir catalog survives, so follow
+        # --resume reuses the slot instead of re-creating it.
+        self._release_snapshot()
+        self.cdc = self.follow_factory(slot_name=self.holder.slot_name,
+                                       plugin=self.holder.plugin)
+        cdc = self.cdc.start()
+        if cdc.get("status") == "success":
+            summary["cdc"] = "streaming"
+            self._log_event("cdc", "success", "CDC streaming; controller is the consumer",
+                            {"slot": self.holder.slot_name})
+            return True
+        summary["status"] = "failure"
+        summary["cdc"] = "failed"
+        summary["errors"].extend(cdc.get("errors", []))
+        self._log_event("cdc", "failure", "CDC failed to start after the walk", {})
+        return False
+
+    def _release_snapshot(self) -> None:
+        """
+        Close the held snapshot so its slot frees up for CDC (issue #26).
+
+        The controller's ``pgcopydb snapshot --follow`` child keeps the slot
+        acquired while its exported-snapshot connection is open, so a second
+        consumer (``pgcopydb follow``) cannot attach. The snapshot's last user was
+        the phase-2 copy; the slot is persistent (WAL retained), so closing here
+        loses nothing. Idempotent -- the orchestrator calls it once, before phase 4.
+        """
+        if self._released:
+            return
+        self._log_event("release_snapshot", "success",
+                        "Closing the held snapshot ahead of CDC", {})
+        self.holder.close()
+        self._released = True
 
     # ----------------------------------------------------------- run-state
 
@@ -277,6 +360,22 @@ class PgCyanController:
         and observable (Ready iff the migration is healthy) rather than exiting
         and letting the StatefulSet crash-loop it. A signal tears it down cleanly.
         """
+        # If CDC is streaming (Option A, #26), supervise the follow child: block
+        # while it streams, and if it exits on its own, drop readiness and stay
+        # parked not-ready (observable, no crash-loop) rather than exiting.
+        if self.cdc is not None:
+            self._log_event("park", "success", "Streaming CDC; waiting for SIGTERM")
+            try:
+                rc = self.cdc.supervise(stop=lambda: False)
+                self._set_ready(False)
+                self._log_event("park", "warning" if rc else "success",
+                                f"CDC stream ended (rc={rc}); parking not-ready")
+            except KeyboardInterrupt:
+                self.cdc.close()
+                self._set_ready(False)
+                self._log_event("park", "success", "Signalled; stopped CDC and exiting park")
+                return
+
         self._log_event("park", "success", "Parked; waiting for SIGTERM (kubectl delete to release)")
         try:
             while True:
@@ -370,19 +469,31 @@ class PgCyanController:
             summary["phases"] = result.get("phases", [])
             summary["errors"].extend(result.get("errors", []))
             summary["status"] = result.get("status", "failure")
-            summary["ready"] = summary["status"] == "success"
+            walk_ok = summary["status"] == "success"
+
+            # 4) CDC (Option A, issue #26): after a FULL successful walk, become the
+            #    CDC consumer -- release the snapshot (freeing the slot) then stream
+            #    `pgcopydb follow` on THIS pod's --dir, where the slot record lives
+            #    so follow reuses it. Skipped when stopped before post-data.
+            if walk_ok and self.follow_cdc and self._walk_reached_postdata(result):
+                summary["ready"] = self._start_cdc(snapshot_id, summary)
+            else:
+                summary["ready"] = walk_ok
+
             self._update_run_status("succeeded" if summary["ready"] else "failed",
                                     snapshot=snapshot_id)
             self._set_ready(summary["ready"])
             self._log_event(
                 "walk", "success" if summary["status"] == "success" else "failure",
                 f"Migration DAG walk finished: {summary['status']}",
-                {"snapshot": snapshot_id, "owned": summary["owned"]},
+                {"snapshot": snapshot_id, "owned": summary["owned"], "cdc": summary.get("cdc")},
             )
             return summary
         except KeyboardInterrupt:
             self.errors.append("Interrupted; snapshot released and migration stopped")
             self._set_ready(False)
+            if self.cdc is not None:
+                self.cdc.close()
             return summary
         finally:
             # Always release the snapshot child so no stale source connection /
@@ -402,6 +513,7 @@ def run_migration_from_env() -> int:
         in_cluster=os.getenv("PGCYAN_IN_CLUSTER", "true").strip().lower() not in ("0", "false", "no"),
         ready_file=os.getenv("PGCYAN_READY_FILE", PgCyanController.DEFAULT_READY_FILE),
         stop_after=os.getenv("PGCYAN_STOP_AFTER") or None,
+        follow_cdc=os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes"),
     )
     summary = controller.run()
     print(json.dumps(summary, indent=2, default=str))

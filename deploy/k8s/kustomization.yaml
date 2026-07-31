@@ -41,5 +41,7 @@ resources:
   # holder (50-deployment-snapshot-holder.yaml, now removed).
   - 35-statefulset-controller.yaml
   - 40-job-phase0-predata.yaml
+  - 62-job-sequences.yaml
   - 71-job-phase3-fk.yaml
-  - 80-deployment-follow-cdc.yaml
+  # (No 80-deployment-follow-cdc: under Option A (#26) the controller streams CDC
+  # itself; the standalone CDC Deployment was removed.)

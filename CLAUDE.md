@@ -86,8 +86,10 @@ read the linked module before changing a stage.
 | `plan` | `planner.py` · `PgCyanPlanner` | −1 | Offline transform: LPT bin-pack tables into N disjoint copy shards + `shard-<n>.filters`; **LOB abort gate**. |
 | `restore-predata` | `predata.py` · `PgCyanPreData` | 0 | Pre-data schema to target (tables/sequences/functions — **no** indexes/PK/FK/triggers; those are post-data #28). |
 | `copy-shard` | `datashard.py` · `PgCyanDataShard` | 2 | One disjoint shard's **data-only** copy (`pgcopydb copy table-data`); per-table row counts → `pgcyan-copylog-<shard>` ConfigMap. |
+| `copy-sequences` | `sequences.py` · `PgCyanSequences` | 2s | **Custom SQL**: source `pg_sequences` → target `setval` — the COPY load leaves target identity/serial sequences at their start, so CDC/post-cutover inserts collide on id=1 (#78). |
 | `build-indexes` | `postindex.py` · `PgCyanPostIndex` | 3a | One shard's secondary indexes **+ PK/unique constraints** — **custom SQL** (`pg_get_indexdef`/`pg_get_constraintdef` → target DDL); PK/unique was #24's descope. |
 | `build-foreign-keys` | `postfk.py` · `PgCyanForeignKeys` | 3b | **Custom SQL** (not pgcopydb): source FKs → target `ADD … NOT VALID` then `VALIDATE`; single pass; writes `target-pg-postload-log.json`. |
+| *(controller-owned)* | `follow.py` · `PgCyanFollow` | CDC | **Not a CLI stage.** After the walk, the controller releases its snapshot and *becomes* the CDC consumer — `pgcopydb follow --resume` on its OWN `--dir` (so follow reuses the slot; slot-creator + streamer must share a `--dir`). Gated by `PGCYAN_FOLLOW_CDC`. Option A, #26. |
 | `orchestrate` | `orchestrator.py` · `PgCyanOrchestrator` | — | Walks the DAG, applies each phase manifest, blocks on its barrier; aggregates the combined `pgcyan-copylog`. |
 | `run-migration` | `controller.py` · `PgCyanController` | — | **The folded controller (#70)**: holds the snapshot in-pod and drives the whole DAG. This is what runs in-cluster. |
 | *(no command)* | `snapshot.py` · `PgCyanSnapshot` | 1 | Snapshot sub-component — establishes + holds the consistent slot/snapshot; driven in-pod by the controller (standalone `snapshot-hold` retired in #70). |
@@ -106,13 +108,15 @@ read the linked module before changing a stage.
 
 **The migration DAG** (nodes = `deploy/k8s/` manifests, edges = the
 orchestrator): `plan(-1)` → `pre-data(0)` → `data shards(2, ×N)` →
-`index(3a, ×M)` → `FK(3b)` → `follow-CDC(4)`. The **controller** (`run-migration`,
-a single-pod StatefulSet) holds the consistent snapshot in its own pod for the
-whole copy and **injects `SNAPSHOT_ID`** into the phase pods (no `pgcyan-snapshot`
-ConfigMap), **owns** every workload it creates (delete it → cascade), and
-**refuses to resume** a lost-snapshot restart (parks not-ready). See
-`notes/k8s-sharded-migration-topology.md` for the topology and the module
-docstrings for each node.
+`sequences(2s)` → `index(3a, ×M)` → `FK(3b)`. The **controller** (`run-migration`, a single-pod
+StatefulSet) holds the consistent snapshot in its own pod for the whole copy and
+**injects `SNAPSHOT_ID`** into the phase pods (no `pgcyan-snapshot` ConfigMap),
+**owns** every workload it creates (delete it → cascade), and **refuses to resume**
+a lost-snapshot restart (parks not-ready). **CDC is not a DAG phase**: after the
+walk the controller *itself* streams `pgcopydb follow` on its own `--dir` (Option
+A, #26) — the slot-creator and streamer must share one pgcopydb `--dir`, so a
+separate pod can't do it. See `notes/k8s-sharded-migration-topology.md` for the
+topology and the module docstrings for each node.
 
 ## Configuration & secrets
 
@@ -159,12 +163,14 @@ Exactly **four** GitHub workflows, each with one clear job (issue #50 cleanup):
   only (no `latest`, no version tag). No deploy step.
 - `.github/workflows/integration-tests.yml` -- manual (`workflow_dispatch`),
   cluster-backed. **One `migration` job** stands up the folded controller
-  (`run-migration`, `PGCYAN_STOP_AFTER=2`) and walks the whole implemented DAG
-  end-to-end (planner → pre-data → data shards), asserting the combined
-  `pgcyan-copylog` ConfigMap (#25's AC) and the data-only target schema shape.
-  Needs `PG_TARGET_*` + a source with tables. Validated green on AKS. **To run or
-  debug it, use the `run-integration-test` skill** (`.claude/skills/`) -- it has
-  the dispatch/watch/artifact-log flow and the known failure modes.
+  (`run-migration`, `PGCYAN_FOLLOW_CDC=true`) and walks the whole implemented DAG
+  end-to-end (planner → pre-data → data shards → index → FK), then the controller
+  streams CDC on its own `--dir` (#26 Option A). Asserts the combined
+  `pgcyan-copylog` ConfigMap (#25), the post-data target shape (indexes + PK/unique
+  + validated FKs, #28), and one active consumer on the slot (#26). Needs
+  `PG_TARGET_*` + a source with tables (and FKs). **To run or debug it, use the
+  `run-integration-test` skill** (`.claude/skills/`) -- dispatch/watch/artifact-log
+  flow + known failure modes.
 - `.github/workflows/terraform-aks.yml` -- `terraform fmt`/`validate` for the
   AKS module.
 

@@ -231,11 +231,13 @@ def test_load_phase_manifests_static_phase_reads_real_files():
 
 
 def test_load_phase_manifests_static_phase_multi_doc():
+    # A multi-document manifest is split into all its objects (the controller
+    # StatefulSet manifest carries a Service + StatefulSet + PDB).
     orch = make_orchestrator()
-    phase = {"id": "4", "name": "follow-cdc", "manifest": "80-deployment-follow-cdc.yaml"}
+    phase = {"id": "ctl", "name": "controller", "manifest": "35-statefulset-controller.yaml"}
     docs = orch._load_phase_manifests(phase, plan=None)
     kinds = {d["kind"] for d in docs}
-    assert kinds == {"Deployment", "PodDisruptionBudget"}
+    assert kinds == {"Service", "StatefulSet", "PodDisruptionBudget"}
 
 
 def test_load_phase_manifests_templated_phase_renders_pvc_and_job_per_shard():
@@ -263,7 +265,7 @@ def test_load_phase_manifests_templated_phase_renders_pvc_and_job_per_shard():
 
 def test_load_phase_manifests_index_template_renders_job_per_index_shard():
     orch = make_orchestrator()
-    phase = dict(PgCyanOrchestrator.PHASES[3])  # index
+    phase = dict(next(p for p in PgCyanOrchestrator.PHASES if p["id"] == "3a"))  # index
     assert phase["id"] == "3a"
     docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
     jobs = [d["metadata"]["name"] for d in docs if d["kind"] == "Job"]
@@ -479,7 +481,7 @@ def _all_deployments_ready_apps_api():
     return FakeAppsApi(deployment_outcomes={"pgcyan-snapshot-holder": 1, "pgcyan-follow-cdc": 1})
 
 
-def test_run_happy_path_applies_all_six_phases_in_order():
+def test_run_happy_path_applies_all_phases_in_order():
     batch_api = _all_jobs_complete_batch_api()
     apps_api = _all_deployments_ready_apps_api()
     core_api = FakeCoreApi(plan=SAMPLE_PLAN)
@@ -488,8 +490,10 @@ def test_run_happy_path_applies_all_six_phases_in_order():
 
     assert summary["status"] == "success"
     assert summary["run_id"] == "pgcyan-test-run"
-    # NO snapshot-holder phase: the controller holds the snapshot in-pod (#70).
-    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "2", "3a", "3b", "4"]
+    # NO snapshot-holder phase (controller holds it in-pod, #70) and NO CDC phase:
+    # under Option A (#26) the controller streams CDC itself after the walk. Includes
+    # the sequence-sync phase 2s (#78) between the data copy and the index builds.
+    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "2", "2s", "3a", "3b"]
     assert all(p["success"] for p in summary["phases"])
     # each DATA shard got its own RWO work-dir PVC stamped (issue #58); the index
     # shards are pure psycopg2 (#28) and use emptyDir, so they stamp no PVC.
@@ -500,12 +504,12 @@ def test_run_happy_path_applies_all_six_phases_in_order():
     created_job_names = {name for _, name, _ in batch_api.created}
     assert created_job_names == {
         "pgcyan-planner", "pgcyan-phase0-predata", "pgcyan-datashard-shard-0",
-        "pgcyan-datashard-shard-1", "pgcyan-index-idx-0", "pgcyan-index-idx-1",
-        "pgcyan-phase3-fk",
+        "pgcyan-datashard-shard-1", "pgcyan-sequences", "pgcyan-index-idx-0",
+        "pgcyan-index-idx-1", "pgcyan-phase3-fk",
     }
-    # only follow-CDC is a Deployment now (the holder Deployment is gone)
+    # NO Deployment: the CDC follow-cdc Deployment is gone (controller streams CDC).
     created_deployment_names = {name for _, name, _ in apps_api.created}
-    assert created_deployment_names == {"pgcyan-follow-cdc"}
+    assert created_deployment_names == set()
 
 
 def test_run_fails_fast_and_stops_the_dag():

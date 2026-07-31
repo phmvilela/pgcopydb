@@ -213,10 +213,83 @@ resume** (parks not-ready) — clear it (and the plan/copylog CMs) between runs.
 
 ---
 
+## 12. pgcopydb setup steps are non-idempotent across separate pods (#28, #26)
+
+**The recurring pattern.** pgcopydb sub-commands assume they own a single shared
+`--dir` catalog for the whole clone. When we split the DAG across shared-nothing
+pods -- each with its OWN `--dir` -- a command re-runs a setup step it "already
+did" in another pod's state, and that step is often **non-idempotent**:
+
+- **#28:** `pgcopydb copy indexes`/`copy constraints` silently built nothing in a
+  standalone per-shard pod (they no-op without the clone's shared catalog) -> we
+  switched phase 3a to custom SQL.
+- **#26:** `pgcopydb follow` in a separate CDC pod (fresh `--dir`) re-runs the full
+  slot setup, aborting first on the publication then on the slot itself
+  (`replication slot "<slot>" already exists`, rc=6) -- and you CANNOT drop the slot
+  to fix it (it retains WAL from the copy's snapshot; dropping loses changes). Root
+  cause (verified in the pgcopydb source): `follow`'s only reuse path needs the
+  slot's `lsn`+`snapshot` already present in the `--dir` `source.db` catalog, and
+  in this fork the **sentinel** (resume coordinates) + CDC stores live in `--dir`
+  SQLite -- so a fresh `--dir` structurally cannot resume. **Resolution (Option A):
+  the controller itself streams CDC**, running `follow` on the SAME `--dir` its
+  `snapshot --follow` populated -- pgcopydb's native `clone --follow` lineage, where
+  the slot record is already local. No separate pod, no cross-pod handoff.
+  See `context/cdc-snapshot-slot-mvcc-qa.md` + `k8s-sharded-migration-topology.md`.
+- **#26 (follow-up):** and run that `follow` WITHOUT `--resume`. Two source facts:
+  slot reuse fires on the slot record being in `--dir` `source.db` (NOT gated on
+  `--resume`), while the `pgcopydb.sentinel` row is created ONLY when NOT `--resume`
+  (`--resume` skips it, expecting it to exist). `snapshot --follow` writes the slot
+  record but NOT the sentinel, so `follow --resume` reuses the slot then aborts
+  `sentinel ... 0 rows` (rc=12). Plain `follow` reuses the slot AND creates the
+  sentinel (startpos = slot LSN = the copy's snapshot point). `--resume` is only for
+  a genuine restart where the sentinel already exists.
+- **#26 (leftover origin):** plain `follow` also CREATES the target replication
+  origin, and accepts a pre-existing one only if its LSN == this run's startpos
+  (`acceptTrackedLSN = resume || lsn == startpos`). A prior/failed/**cancelled** run
+  leaves the origin behind at a STALE LSN (target-side; NOT cleaned by the source
+  slot/publication drops or the k8s teardown), so `follow` aborts `origin "<name>"
+  already exists` (rc=12). Fix: `PgCyanFollow.drop_stale_origin` drops it on the
+  target before follow (mirrors `drop_stale_slot`), so follow recreates a fresh
+  origin at this run's slot LSN. Full leftover-cleanup set now: slot + publication
+  (source, snapshot.py), origin (target, follow.py), sentinel/--dir (fresh PVC),
+  run-state marker (k8s teardown).
+- **#26 (apply must be enabled):** even fully attached, `follow` only PREFETCHES --
+  its catchup process replays to the target only once the sentinel `apply` flag is
+  set (`ld_apply.c`: "Waiting until the pgcopydb sentinel apply is enabled"). `clone
+  --follow` flips it after its base copy (`sentinel_update_apply(true)`); our copy is
+  a separate phase, so nothing did -> `write_lsn`/`flush_lsn` advance but `replay_lsn
+  0/0` and nothing lands on the target. Fix: `PgCyanFollow.enable_apply` runs
+  `pgcopydb stream sentinel set apply --dir <same dir>` once attached. Symptom to
+  recognise: CDC "streaming" (slot active) but the target never changes + `replay_lsn
+  0/0` in the follow log.
+- **#26 -> #78 (the real root cause):** even with apply enabled, the CDC round-trip
+  probe still did not land -- and `--debug` showed apply COMMITs the probe's txn, yet
+  a target `SELECT ... WHERE email=<probe>` finds nothing. Root cause: the sharded
+  COPY loads rows with explicit ids and NEVER advances the target's identity/serial
+  **sequences** (`pg_sequence_last_value` = NULL). pgcopydb's CDC transform sets
+  `GENERATED ALWAYS AS IDENTITY` columns to DEFAULT, so the replicated INSERT draws
+  `id` from the sequence -> gets **1** -> collides with the copied row id=1; the
+  conflict is swallowed on commit -> silent drop. `pgcopydb clone` avoids this with
+  its "STEP 9: reset sequences"; our custom copy skipped it. Fix: a **sequence-sync
+  phase (2s, #78)** -- custom SQL, source `pg_sequences` -> target `setval`, after
+  the copy. **Symptom to recognise:** CDC "committed" a change (COMMIT in the apply
+  log) but the row is absent, on a table with a `GENERATED ALWAYS AS IDENTITY` PK ->
+  check `SELECT pg_sequence_last_value(pg_get_serial_sequence('t','id'))` on the
+  target (NULL = never advanced = collision).
+
+**Rule of thumb for new phases:** any pgcopydb command that runs in a pod OTHER
+than the one that created the slot/snapshot/catalog will re-do publication/slot/
+schema setup against a fresh `--dir` (non-idempotently), and cannot resume (the
+sentinel + slot record are `--dir`-local). Either **keep the whole lifecycle in one
+pod on one persistent `--dir`** (what CDC does), or use custom SQL (what phase 3
+does). `rc=6` == a source-side setup step (publication
+/ slot) it could not (re)create.
+
 ## Quick pgcopydb exit-code cheat sheet (from this saga)
 
 - **rc=12** — work-dir / filesystem problem (couldn't create `--dir/schema`): permissions → item 1.
 - **rc=7**  — restore/catalog failure: snapshot mismatch (item 5) OR pg_restore returned non-zero (extensions/ACL → item 2).
+- **rc=6**  — source-side setup step (publication/slot) it could not (re)create: non-idempotent create against a fresh `--dir` → item 12.
 
 Always read the pgcopydb `FATAL`/`ERROR` lines in the pod log, not just the rc —
 the rc is the same for several distinct root causes.

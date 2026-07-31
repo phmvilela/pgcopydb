@@ -36,7 +36,9 @@ It has run green end-to-end on AKS (7 tables / ~4.8M rows across 4 shards).
    index (3a) Jobs 0..M (70 tmpl, shardable) + FK (3b) Job (71, single)
          │  BARRIER: schema+data equivalent
          ▼
-   follow-CDC (4)  Deployment(1)+PDB (80)   one slot, one consumer → cutover
+   CDC   NOT a DAG node — the CONTROLLER streams it (Option A, #26): after the walk
+         it releases the snapshot and runs `pgcopydb follow --resume` on its OWN
+         --dir (one slot, one consumer → cutover). No follow-cdc Deployment.
 ```
 
 The old **shared RWX PVC** and separate **snapshot-holder Deployment** are gone:
@@ -50,12 +52,12 @@ Azure Files (SMB) cannot host (#57/#58).
 | Object | Kind | Why |
 |---|---|---|
 | planner (30) | Job | runs once, produces the plan, exits |
-| **controller (35)** | **StatefulSet(1) + PDB** | holds the snapshot in-pod for the whole copy AND drives the DAG. StatefulSet for **at-most-one** (a Deployment can transiently run two during a rollout) + stable identity — **not** reschedule protection (see the fold, below). |
+| **controller (35)** | **StatefulSet(1) + PDB + RWO --dir PVC** | holds the snapshot in-pod for the whole copy, drives the DAG, AND streams CDC after it (Option A, #26). StatefulSet for **at-most-one** (a Deployment can transiently run two during a rollout) + stable identity — **not** reschedule protection (see the fold, below). Its `--dir` is a managed-disk RWO volumeClaimTemplate (POSIX locking + CDC-store capacity). |
 | pre-data (40) | Job | one coordinator pass, then done |
 | data shards (60) | **Jobs, N of them**, each + its own RWO disk | horizontal scale-out = *more Jobs*, not fatter pods. COPY is **network-bound**, so more pods = more aggregate throughput. RWO disk = real POSIX locking for pgcopydb's catalog + resume state (#58). |
 | index (70) | Jobs, M of them | index builds are independent → shardable |
 | FK (71) | **single** Job | an FK spans two tables that may be in different shards; one coordinated pass (internal parallelism via `--restore-jobs`) |
-| follow/CDC (80) | Deployment(1) + PDB | logical decoding = one slot, one consumer; **cannot** be sharded |
+| CDC (follow) | **the controller itself** (Option A, #26) — no separate object | logical decoding = one slot, one consumer; **cannot** be sharded. The slot-creator + streamer must share one pgcopydb `--dir`, so the controller (which created the slot) streams `follow --resume` on its own `--dir` after the walk — a separate pod with a fresh `--dir` cannot reuse the slot/sentinel. |
 
 ## The three things that make it correct (and where it bites)
 

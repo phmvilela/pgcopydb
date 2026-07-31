@@ -1,11 +1,14 @@
 # 35-statefulset-controller.yaml
 # ---------------------------------------------------------------------------
-# THE MIGRATION CONTROLLER (issue #70) -- the folded snapshot-holder + DAG
-# orchestrator, run as a SINGLE-POD StatefulSet. This one pod both HOLDS the
-# consistent snapshot in-process (`pgcopydb snapshot --follow`, node-local
-# scratch) and WALKS the migration DAG (planner -> pre-data -> data shards ->
-# index -> FK -> CDC), injecting the snapshot id straight into the phase pods and
-# owning every workload it creates.
+# THE MIGRATION CONTROLLER (issue #70, #26) -- the folded snapshot-holder + DAG
+# orchestrator + CDC consumer, run as a SINGLE-POD StatefulSet. This one pod HOLDS
+# the consistent snapshot in-process (`pgcopydb snapshot --follow`), WALKS the
+# migration DAG (planner -> pre-data -> data shards -> index -> FK), injecting the
+# snapshot id into the phase pods and owning every workload it creates, and THEN --
+# under Option A (#26) -- releases the snapshot and becomes the CDC consumer itself
+# (`pgcopydb follow --resume` on its OWN --dir, where the slot record lives so
+# follow reuses it). CDC is a controller-owned step, not a separate pod, because
+# the slot-creator and the streamer must share one pgcopydb --dir.
 #
 # WHY A STATEFULSET (not a Deployment/Job):
 #   * AT-MOST-ONE. A StatefulSet(1) never runs two pods at once -- it won't start
@@ -22,10 +25,14 @@
 # Job/Deployment/PVC it creates, so `kubectl delete statefulset pgcyan-controller`
 # cascade-deletes the whole migration. Correct now that the snapshot lives here.
 #
-# SNAPSHOT --dir ON emptyDir: pgcopydb keeps a SQLite catalog in WAL mode under
-# --dir, which needs locking/shared-memory Azure Files (SMB) does not provide
-# (issue #57). A node-local emptyDir gives real POSIX locking; the snapshot is
-# non-resumable anyway (a restart re-snapshots), so ephemeral scratch is fine.
+# --dir ON A MANAGED-DISK PVC (volumeClaimTemplate): pgcopydb keeps a SQLite
+# catalog in WAL mode under --dir, which needs locking Azure Files (SMB) cannot
+# provide (issue #57) -- a managed-csi RWO disk gives real POSIX locking (like the
+# data shards, #58). Unlike the snapshot (non-resumable), the CDC phase writes a
+# prefetch/replay store here that can grow during a long catch-up, so it needs
+# bounded, dedicated capacity rather than node-ephemeral emptyDir. The StatefulSet
+# reattaches the same PVC by ordinal on restart (foundation for future CDC
+# restart-resume; today refuse-to-resume still parks such a restart, issue #70).
 #
 # TODO(#70 PR-B): the refuse-to-resume readiness probe (park in a not-ready state
 # on a lost-snapshot restart, rather than crash-loop) and node-pool pinning
@@ -71,12 +78,16 @@ spec:
       # stamp owner-refs) -- so it runs as the pgcyan-orchestrator SA, NOT the
       # API-less worker SA. DB auth is the pgcyan-db-uris Secret (envFrom).
       serviceAccountName: pgcyan-orchestrator
-      # The image runs as non-root uid 1000 ('migration'); the emptyDir scratch is
-      # writable by it without fsGroup.
+      # The image runs as non-root uid 1000 ('migration'). A freshly-provisioned
+      # managed disk mounts root:root 0755, which uid 1000 cannot write; fsGroup
+      # group-owns the --dir PVC to gid 1000 so pgcopydb can write its catalog.
+      # OnRootMismatch skips re-chowning on every restart.
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       # A graceful stop must let the controller tear down its snapshot child
       # (close the source connection) before SIGKILL.
       terminationGracePeriodSeconds: 60
@@ -119,11 +130,21 @@ spec:
             # integration test to stop before the unbuilt phases 3/4.
             - name: PGCYAN_STOP_AFTER
               value: "${PGCYAN_STOP_AFTER}"
+            # After a full successful walk, become the CDC consumer (Option A, #26):
+            # release the snapshot then `pgcopydb follow` on this --dir. Filled by
+            # envsubst; EMPTY (default) = park after the walk, no CDC. Set "true" to
+            # run change data capture through to cutover.
+            - name: PGCYAN_FOLLOW_CDC
+              value: "${PGCYAN_FOLLOW_CDC}"
+            # Optional CDC debug: run `pgcopydb follow --verbose` to log each
+            # applied change. Filled by envsubst; EMPTY (default) = normal logging.
+            - name: PGCYAN_FOLLOW_VERBOSE
+              value: "${PGCYAN_FOLLOW_VERBOSE}"
           envFrom:
             - secretRef:
                 name: pgcyan-db-uris    # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI
           volumeMounts:
-            - name: pgcopydb-scratch
+            - name: pgcopydb-workdir
               mountPath: /pgcopydb
           resources:
             # Control-plane + a held libpq connection: light. The heavy COPY runs
@@ -142,10 +163,21 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 15
             failureThreshold: 2
-      volumes:
-        # Node-local scratch for pgcopydb's SQLite/WAL catalog (issue #57).
-        - name: pgcopydb-scratch
-          emptyDir: {}
+  # The controller's own pgcopydb --dir: a managed-disk RWO PVC (POSIX locking +
+  # persistence/capacity for the CDC store, #57/#58/#26). Reattached by ordinal on
+  # restart. Owner-ref cascade doesn't reach a StatefulSet's own PVCs, so teardown
+  # deletes it explicitly (see the integration test / a slot-reaper, #29).
+  volumeClaimTemplates:
+    - metadata:
+        name: pgcopydb-workdir
+        labels:
+          pgcyan.dev/component: "controller"
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+        storageClassName: managed-csi   # TODO: confirm the RWO class name on the cluster
 ---
 # Resist VOLUNTARY disruption (node drain / autoscaler) of the singleton while a
 # migration is in flight -- an eviction loses the snapshot and forces a full

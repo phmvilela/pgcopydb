@@ -21,6 +21,7 @@ from pg_cyan import __version__
 from pg_cyan.controller import PgCyanController
 from pg_cyan.datashard import PgCyanDataShard
 from pg_cyan.postfk import PgCyanForeignKeys
+from pg_cyan.sequences import PgCyanSequences
 from pg_cyan.postindex import PgCyanPostIndex
 from pg_cyan.lobs import PgCyanLobs
 from pg_cyan.metrics import PgCyanMetrics
@@ -262,9 +263,10 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
                  poll_interval: int, job_timeout: int, in_cluster: bool) -> None:
     """Walk the migration DAG: apply each phase in order and block on its barrier.
 
-    Applies planner(-1) -> pre-data(0) -> data shards(2) -> index(3a) -> FK(3b)
-    -> follow-CDC(4), stopping (without applying later phases) at the first phase
-    whose Jobs/Deployments do not all succeed/become ready. Standalone: the
+    Applies planner(-1) -> pre-data(0) -> data shards(2) -> index(3a) -> FK(3b),
+    stopping (without applying later phases) at the first phase whose Jobs/
+    Deployments do not all succeed/become ready. (CDC is not a DAG phase -- the
+    controller streams it after the walk, #26.) Standalone: the
     snapshot is NOT held (that is what `run-migration` adds -- issue #70); pass
     SNAPSHOT_ID some other way if a phase needs it.
     """
@@ -449,6 +451,34 @@ def build_indexes(source_pguri: str, target_pguri: str,
         sys.exit(2)
 
 
+@cli.command(name="copy-sequences")
+@click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
+              show_default="$PGCOPYDB_SOURCE_PGURI", help="Source libpq URI (sequence values read from here).")
+@click.option("--target-pguri", default=lambda: os.getenv("PGCOPYDB_TARGET_PGURI"),
+              show_default="$PGCOPYDB_TARGET_PGURI", help="Target libpq URI (sequences setval'd here).")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
+              show_default="$PG_OUTPUT_DIR", help="Directory for target-pg-sequences-log[-errors].json.")
+def copy_sequences(source_pguri: str, target_pguri: str, output_dir: str) -> None:
+    """Sync the target's sequences to the source after the copy (phase 2s, issue #78).
+
+    Custom SQL (not pgcopydb): read each source sequence's value and ``setval`` it on
+    the target, so target identity/serial sequences continue past the copied rows.
+    The COPY-based data load leaves them at their start, which would make CDC (#26)
+    and post-cutover inserts collide on id=1. Runs once, after the data copy, before
+    CDC. Writes ``target-pg-sequences-log.json``.
+    """
+    worker = PgCyanSequences(
+        source_pguri=source_pguri or None, target_pguri=target_pguri or None,
+        output_dir=output_dir or None,
+    )
+    try:
+        summary = worker.run()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
 @cli.command(name="build-foreign-keys")
 @click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
               show_default="$PGCOPYDB_SOURCE_PGURI", help="Source libpq URI (introspected for FK defs).")
@@ -488,20 +518,26 @@ def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) ->
               type=click.Choice([p["id"] for p in PgCyanOrchestrator.PHASES]),
               show_default="$PGCYAN_STOP_AFTER (empty/unset = the whole DAG)",
               help="Bring the pipeline up through this phase id, then park Ready (e.g. 2 = through the data copy).")
-def run_migration(namespace: str, in_cluster: bool, stop_after: str) -> None:
-    """Hold the snapshot in-pod and walk the whole migration DAG (issue #70).
+@click.option("--follow-cdc/--no-follow-cdc",
+              default=lambda: os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes"),
+              show_default="$PGCYAN_FOLLOW_CDC (unset = off)",
+              help="After a full walk, become the CDC consumer (`pgcopydb follow`, issue #26).")
+def run_migration(namespace: str, in_cluster: bool, stop_after: str, follow_cdc: bool) -> None:
+    """Hold the snapshot in-pod and walk the whole migration DAG (issue #70, #26).
 
     The folded controller: it establishes and HOLDS the consistent snapshot in
     its own pod (no separate holder Deployment, no `pgcyan-snapshot` ConfigMap),
-    then walks planner -> pre-data -> data shards -> index -> FK -> CDC, injecting
-    the snapshot id straight into the pods and owning every workload it creates so
-    deleting the controller cascade-deletes the migration. Runs as a single-pod
-    StatefulSet; config is env-driven (the manifest sets it).
+    walks planner -> pre-data -> data shards -> index -> FK injecting the snapshot
+    id into the pods and owning every workload it creates, then -- with
+    ``--follow-cdc`` -- releases the snapshot and becomes the CDC consumer itself
+    (`pgcopydb follow` on its own --dir, Option A #26). Single-pod StatefulSet;
+    config is env-driven (the manifest sets it).
     """
     from pg_cyan.snapshot import _holder_from_env
     holder = _holder_from_env()
     controller = PgCyanController(holder=holder, namespace=namespace,
-                                  in_cluster=in_cluster, stop_after=stop_after or None)
+                                  in_cluster=in_cluster, stop_after=stop_after or None,
+                                  follow_cdc=follow_cdc)
     try:
         summary = controller.run()
         click.echo(json.dumps(summary, indent=2, default=str))

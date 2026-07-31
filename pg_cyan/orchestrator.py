@@ -31,8 +31,10 @@ Implements the phase walk from ``deploy/k8s/README.md`` /
 ``notes/k8s-sharded-migration-topology.md``::
 
     planner(-1) -> pre-data(0) -> data shards(2, xN)
-    -> index(3a, xM) -> FK(3b) -> follow-CDC(4)
+    -> index(3a, xM) -> FK(3b)
 
+There is NO CDC phase: under Option A (issue #26) the controller streams CDC
+itself after the walk (see ``pg_cyan/controller.py`` / ``pg_cyan/follow.py``).
 There is NO snapshot-holder phase: under the folded model (issue #70) the
 CONTROLLER that drives this orchestrator (``pg_cyan/controller.py``) holds the
 consistent snapshot in its OWN pod and passes the id in via ``snapshot_id``,
@@ -179,6 +181,11 @@ class PgCyanOrchestrator:
             "plan_key": "data_shards", "needs_plan": True, "substitutions": _data_shard_substitutions,
             "aggregate_copy_logs": True, "needs_snapshot": True,
         },
+        # Sequence sync right after the copy: the COPY-based load leaves target
+        # identity/serial sequences at their start, so CDC/post-cutover inserts would
+        # collide on id=1 (issue #78). Custom psycopg2 (source pg_sequences ->
+        # target setval); no snapshot (sequences are not MVCC).
+        {"id": "2s", "name": "sequences", "manifest": "62-job-sequences.yaml"},
         {
             "id": "3a", "name": "index", "template": "70-job-phase3-index.template.yaml",
             "plan_key": "index_shards", "needs_plan": True, "substitutions": _index_shard_substitutions,
@@ -187,7 +194,10 @@ class PgCyanOrchestrator:
             # collectors -- they need no injected snapshot.
         },
         {"id": "3b", "name": "fk", "manifest": "71-job-phase3-fk.yaml"},
-        {"id": "4", "name": "follow-cdc", "manifest": "80-deployment-follow-cdc.yaml"},
+        # Phase 4 (CDC) is NOT an orchestrator phase: under Option A (issue #26) the
+        # controller itself becomes the CDC consumer after the walk, streaming
+        # `pgcopydb follow` on its own --dir (the slot-creator and the streamer must
+        # share a --dir; a separate pod cannot reuse the slot). See controller.py.
     ]
 
     def __init__(

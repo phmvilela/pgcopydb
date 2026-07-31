@@ -33,6 +33,9 @@ class _FakeHolder:
         self._summary = {"status": status, "snapshot_name": snapshot,
                          "slot": "pgcyan_slot", "publication": "pgcyan_pub"}
         self.proc = _FakeProc(proc_alive)
+        # The controller hands these to the orchestrator for the CDC phase (#26).
+        self.slot_name = "pgcyan_slot"
+        self.plugin = "pgoutput"
         self.established = False
         self.closed = False
 
@@ -82,7 +85,28 @@ class _FakeCore:
         self.state = {**(self.state or {}), **body["data"]}
 
 
-def _make_controller(holder=None, core=None, orch_result=None, capture=None, ready_file=None):
+class _FakeFollow:
+    """Records kwargs; start() succeeds unless slot is the 'bad' sentinel (#26 A)."""
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.started = False
+        self.closed = False
+
+    def start(self):
+        self.started = True
+        ok = self.kwargs.get("slot_name") != "bad-slot"
+        return {"status": "success" if ok else "failure",
+                "slot": self.kwargs.get("slot_name"), "errors": [] if ok else ["boom"]}
+
+    def supervise(self, stop):
+        return 0
+
+    def close(self):
+        self.closed = True
+
+
+def _make_controller(holder=None, core=None, orch_result=None, capture=None,
+                     ready_file=None, follow_cdc=False):
     holder = holder or _FakeHolder()
 
     def factory(**kwargs):
@@ -91,9 +115,16 @@ def _make_controller(holder=None, core=None, orch_result=None, capture=None, rea
             capture["orch"] = orch
         return orch
 
+    def follow_factory(**kwargs):
+        cdc = _FakeFollow(**kwargs)
+        if capture is not None:
+            capture["cdc"] = cdc
+        return cdc
+
     return PgCyanController(
         holder=holder, namespace="pgcyan-migration", pod_name="pgcyan-controller-0",
         core_api=core or _FakeCore(), orchestrator_factory=factory,
+        follow_factory=follow_factory, follow_cdc=follow_cdc,
         ready_file=ready_file or "/tmp/pgcyan-test-ready-unused",
     )
 
@@ -199,6 +230,72 @@ def test_stop_after_flows_to_orchestrator():
     ctl.stop_after = "2"
     ctl.run()
     assert capture["orch"].kwargs["stop_after"] == "2"
+
+
+def test_no_cdc_by_default_parks_after_walk():
+    # follow_cdc defaults off: the controller parks Ready after the walk, no CDC.
+    capture = {}
+    ctl = _make_controller(capture=capture)   # follow_cdc=False
+    summary = ctl.run()
+    assert summary["status"] == "success" and summary["ready"] is True
+    assert ctl.cdc is None
+    assert "cdc" not in summary
+
+
+def test_full_walk_starts_cdc_on_controller_dir(monkeypatch):
+    # Option A (#26): after a full successful walk, the controller releases the
+    # snapshot and becomes the CDC consumer (streaming on its own --dir).
+    capture = {}
+    ctl = _make_controller(capture=capture, follow_cdc=True)
+    summary = ctl.run()
+    assert summary["status"] == "success" and summary["ready"] is True
+    assert summary["cdc"] == "streaming"
+    assert capture["cdc"].started is True
+    # the slot the holder created is handed to the CDC follow (not the orchestrator)
+    assert capture["cdc"].kwargs["slot_name"] == "pgcyan_slot"
+    assert capture["cdc"].kwargs["plugin"] == "pgoutput"
+    # the snapshot was released before CDC (freeing the slot)
+    assert ctl._released is True
+    # the orchestrator no longer receives slot/release wiring
+    assert "slot_name" not in capture["orch"].kwargs
+    assert "release_snapshot" not in capture["orch"].kwargs
+
+
+def test_cdc_start_failure_marks_not_ready(monkeypatch):
+    # If CDC fails to attach, the controller is not Ready and the run is a failure.
+    holder = _FakeHolder()
+    holder.slot_name = "bad-slot"     # _FakeFollow.start() fails for this slot
+    ctl = _make_controller(holder=holder, follow_cdc=True)
+    summary = ctl.run()
+    assert summary["status"] == "failure" and summary["ready"] is False
+    assert summary["cdc"] == "failed"
+
+
+def test_cdc_skipped_when_walk_stops_before_postdata():
+    # Stopping the walk before post-data (stopped_after != last phase) => no CDC.
+    capture = {}
+    ctl = _make_controller(capture=capture, follow_cdc=True,
+                           orch_result={"status": "success", "stopped_after": "2",
+                                        "phases": [], "errors": []})
+    summary = ctl.run()
+    assert summary["status"] == "success"
+    assert ctl.cdc is None                 # CDC not started (post-data not reached)
+
+
+def test_release_snapshot_closes_holder_and_marks_healthy():
+    # Releasing the snapshot ahead of CDC (#26) closes the holder, and from then
+    # on the health-check reports healthy (its absence is by design, not failure).
+    ctl = _make_controller()
+    holder = ctl.holder
+    assert ctl._snapshot_alive() is True          # child alive pre-release
+    ctl._release_snapshot()
+    assert holder.closed is True                   # holder torn down
+    assert ctl._released is True
+    assert ctl._snapshot_alive() is True           # released => healthy, not aborting
+    # idempotent: a second call is a no-op
+    holder.closed = False
+    ctl._release_snapshot()
+    assert holder.closed is False
 
 
 def test_resolve_owner_reference_shape():

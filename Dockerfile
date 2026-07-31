@@ -8,30 +8,77 @@
 #   * python + pg_cyan CLI -- planner/monitoring/cutover (`python -m pg_cyan.cli`)
 #
 # Tool versions are set via build ARGs. kubectl is fully pinned + checksum
-# verified; pgcopydb takes the PGDG repo's current build unless you pin an exact
-# apt version (PGCOPYDB_APT_VERSION) -- an unavailable pin fails the build.
+# verified; pgcopydb is COMPILED from the phmvilela/pgcopydb fork pinned to an
+# exact commit (PGCOPYDB_GIT_REF) in a multi-stage builder -- see the pgcopydb
+# section below for why we build from source rather than apt-install PGDG.
 #
 # Acceptance (issue #39):
 #   docker run <image> pgcopydb --version           -> succeeds
 #   docker run <image> python -m pg_cyan.cli --help  -> succeeds
 # ---------------------------------------------------------------------------
+
+# --- pgcopydb: compiled from the phmvilela/pgcopydb fork (multi-stage) -------
+# We build pgcopydb from source rather than apt-installing the PGDG package
+# because the migration depends on a fork patch to the SQLite CDC apply path
+# (flush the libpq pipeline when the replay queue drains, so a trailing CDC
+# change actually lands on the target -- PGDG's stock 0.18 does not have it).
+# Pin PGCOPYDB_GIT_REF to the exact fork commit so the image is reproducible.
+#   PGVERSION -- the postgresql-server-dev / libpq major the binary links.
+ARG PGVERSION=16
+ARG PGCOPYDB_GIT_URL=https://github.com/phmvilela/pgcopydb.git
+ARG PGCOPYDB_GIT_REF=428a7f5137660da078ff7da5ee4ae00d2f75ba72
+
+FROM debian:12-slim AS pgcopydb-build
+ARG PGVERSION
+ARG PGCOPYDB_GIT_URL
+ARG PGCOPYDB_GIT_REF
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg git; \
+    install -d /usr/share/postgresql-common/pgdg; \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main ${PGVERSION}" \
+        > /etc/apt/sources.list.d/pgdg.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential make \
+        libedit-dev libgc-dev libicu-dev libkrb5-dev liblz4-dev libncurses-dev \
+        libpam-dev libpq-dev libpq5 libreadline-dev libselinux1-dev libssl-dev \
+        libxml2-dev libxslt1-dev libzstd-dev zlib1g-dev \
+        "postgresql-server-dev-${PGVERSION}"; \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /usr/src
+RUN set -eux; \
+    git clone --filter=blob:none "${PGCOPYDB_GIT_URL}" pgcopydb; \
+    cd pgcopydb; \
+    git checkout "${PGCOPYDB_GIT_REF}"
+WORKDIR /usr/src/pgcopydb
+# Build the bundled SQLite (CDC store) first, then pgcopydb itself. `install`
+# drops the binary at /usr/lib/postgresql/${PGVERSION}/bin/pgcopydb.
+RUN set -eux; \
+    make -C src/bin/lib/sqlite clean sqlite3.o sqlite3; \
+    install src/bin/lib/sqlite/sqlite3 /usr/local/bin/sqlite3; \
+    make -s clean; \
+    make -s -j"$(nproc)" install; \
+    "/usr/lib/postgresql/${PGVERSION}/bin/pgcopydb" --version
+
+# ---------------------------------------------------------------------------
 FROM python:3.10-slim AS base
 
 # Pinned tool versions.
-#   PGCOPYDB_APT_VERSION -- exact PGDG apt version string pgcopydb is pinned to
-#     (verified building on Debian trixie: `pgcopydb --version` -> 0.18). Bump
-#     deliberately; an unavailable pin fails the build rather than drifting.
-#     Set to empty to float to the PGDG repo's current build.
 #   KUBECTL_VERSION  -- matches the AKS control-plane version pinned in
 #     terraform/aks (kubernetes 1.33); kubectl is supported +/-1 minor.
-ARG PGCOPYDB_APT_VERSION=0.18-1.pgdg13+1
+ARG PGVERSION=16
 ARG KUBECTL_VERSION=v1.33.0
 
 WORKDIR /app
 
-# --- pgcopydb (+ postgres client) from the PostgreSQL PGDG apt repository ----
-# PGDG is pgcopydb's canonical distribution and resolves its shared-library
-# deps (libpq, etc.) transitively, which copying a bare binary would not.
+# --- pgcopydb runtime: the fork binary + its shared-lib deps ----------------
+# psql (postgresql-client) is used by the phase Jobs and pulls libpq5; libgc1
+# is pgcopydb's Boehm-GC runtime dep. Both from PGDG so the major matches the
+# builder's libpq. The pgcopydb binary + bundled sqlite3 are copied from the
+# builder stage.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
@@ -41,14 +88,15 @@ RUN set -eux; \
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list; \
     apt-get update; \
-    if [ -n "${PGCOPYDB_APT_VERSION}" ]; then \
-        apt-get install -y --no-install-recommends postgresql-client "pgcopydb=${PGCOPYDB_APT_VERSION}"; \
-    else \
-        apt-get install -y --no-install-recommends postgresql-client pgcopydb; \
-    fi; \
-    pgcopydb --version; \
+    apt-get install -y --no-install-recommends \
+        "postgresql-client-${PGVERSION}" \
+        libgc1 libedit2 libncurses6 liblz4-1 libzstd1 \
+        libxml2 libxslt1.1 libselinux1 libreadline8; \
     apt-get purge -y --auto-remove gnupg; \
     rm -rf /var/lib/apt/lists/*
+COPY --from=pgcopydb-build /usr/lib/postgresql/${PGVERSION}/bin/pgcopydb /usr/local/bin/pgcopydb
+COPY --from=pgcopydb-build /usr/local/bin/sqlite3 /usr/local/bin/sqlite3
+RUN pgcopydb --version
 
 # --- kubectl (pinned, checksum-verified against upstream) -------------------
 # The planner Job runs `kubectl apply` to publish the pgcyan-plan ConfigMap.
