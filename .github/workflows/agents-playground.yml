@@ -1,0 +1,94 @@
+name: Secure Agents Playground
+
+# A sandbox the agent can trigger itself to test in-progress changes against the
+# REAL AKS cluster, BEFORE promoting them to the production workflows (which need
+# a human-approved PR). The actual test steps live in the local composite action
+# ./agent-workflow-steps (action.yml) so the agent iterates there and re-runs
+# this workflow. Currently it exercises the controller wait-to-start mode (#85).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC token for azure/login
+  contents: read
+  actions: write    # dispatch build.yml if the commit's image is missing
+
+env:
+  NS: pgcyan-migration
+  ACR_NAME: ${{ vars.ACR_NAME || 'pgcyanacr' }}
+
+jobs:
+  secure_job:
+    runs-on: ubuntu-latest
+    environment: azure
+    # Secrets can't be read inside a composite action, so map everything the
+    # steps need into env here; the composite action reads it via ${{ env.* }}.
+    env:
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      PG_SOURCE_HOST: ${{ vars.PG_SOURCE_HOST }}
+      PG_SOURCE_PORT: ${{ vars.PG_SOURCE_PORT }}
+      PG_SOURCE_USER: ${{ secrets.PG_SOURCE_USER }}
+      PG_SOURCE_PASSWORD: ${{ secrets.PG_SOURCE_PASSWORD }}
+      PG_SOURCE_DATABASE: ${{ vars.PG_SOURCE_DATABASE }}
+      PG_TARGET_HOST: ${{ vars.PG_TARGET_HOST }}
+      PG_TARGET_PORT: ${{ vars.PG_TARGET_PORT }}
+      PG_TARGET_USER: ${{ secrets.PG_TARGET_USER }}
+      PG_TARGET_PASSWORD: ${{ secrets.PG_TARGET_PASSWORD }}
+      PG_TARGET_DATABASE: ${{ vars.PG_TARGET_DATABASE }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          # The migration workloads run IN the cluster; the runner only needs
+          # Azure (OIDC + ARM), the AKS API server, ACR (for `az acr repository
+          # show`), package registries, and GitHub (auto-allowed by harden-runner).
+          allowed-endpoints: >
+            registry.npmjs.org
+            api.anthropic.com
+            sentry.io
+            statsig.com
+            marketplace.visualstudio.com
+            vscode.blob.core.windows.net
+            update.code.visualstudio.com
+            pypi.org
+            files.pythonhosted.org
+            registry.terraform.io
+            releases.hashicorp.com
+            login.microsoftonline.com
+            management.azure.com
+            pgcyanacr.azurecr.io
+            pg-cyan-aks-jet81h4i.hcp.westus2.azmk8s.io
+            productionresultssa1.blob.core.windows.net
+            productionresultssa2.blob.core.windows.net
+            productionresultssa3.blob.core.windows.net
+            productionresultssa4.blob.core.windows.net
+            productionresultssa5.blob.core.windows.net
+            productionresultssa6.blob.core.windows.net
+            productionresultssa7.blob.core.windows.net
+            productionresultssa8.blob.core.windows.net
+            productionresultssa9.blob.core.windows.net
+            productionresultssa10.blob.core.windows.net
+            productionresultssa11.blob.core.windows.net
+            productionresultssa12.blob.core.windows.net
+            productionresultssa13.blob.core.windows.net
+            productionresultssa14.blob.core.windows.net
+            productionresultssa15.blob.core.windows.net
+            productionresultssa16.blob.core.windows.net
+            productionresultssa17.blob.core.windows.net
+            productionresultssa18.blob.core.windows.net
+            productionresultssa18.blob.core.windows.net
+            productionresultssa20.blob.core.windows.net
+
+      # A local composite action (uses: ./agent-workflow-steps) requires the repo
+      # to be checked out first.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run agent-defined steps
+        uses: ./agent-workflow-steps

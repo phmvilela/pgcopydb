@@ -1,0 +1,20 @@
+name: "pgcyan agents playground steps"
+description: >
+  Agent-authored steps run by the "Secure Agents Playground" workflow to test
+  changes against the REAL AKS cluster before promoting them to the production
+  workflows (which need a human-approved PR). The agent edits this file freely
+  and re-triggers the playground to iterate. It currently exercises the
+  controller wait-to-start mode (issue #85): provision the controller PARKED
+  pre-snapshot, assert `GET /status` shows `waiting-to-start` with no snapshot,
+  `POST /start`, then assert the snapshot is established and the (planner-only,
+  fast) walk succeeds -- then tear everything down.
+
+  Credentials are read from `env` (secrets/vars mapped in the calling workflow),
+  since composite actions cannot read the `secrets` context directly. `NS` and
+  `ACR_NAME` come from the workflow-level env.
+runs:
+  using: composite
+  steps:
+    - name: Resolve the pgcyan image (commit short SHA)
+      shell: bash
+      run: echo "PGCYAN_IMAGE=${ACR_NAME}.azurecr.io/pgcyan:$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
