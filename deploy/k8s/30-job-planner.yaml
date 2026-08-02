@@ -72,7 +72,9 @@ spec:
             - name: work
               mountPath: /work
           resources:
-            requests: { cpu: "500m", memory: "512Mi" }
+            # Offline transform: small request so it co-schedules with the
+            # controller on a single small node; limit stays generous.
+            requests: { cpu: "100m", memory: "256Mi" }
             limits:   { cpu: "1",    memory: "1Gi" }
       volumes:
         - name: inputs

@@ -107,8 +107,13 @@ def _data_shard_substitutions(entry: Dict, plan: Dict) -> Dict[str, str]:
     them in its migration-copy-log.json.
     """
     resources = entry.get("resources") or {}
-    cpu = str(resources.get("cpu", "1"))
-    memory = str(resources.get("memory", "1Gi"))
+    # `cpu`/`memory` are the limits; `*_request` the (smaller) requests so a
+    # shard co-schedules with the controller on a small node without throttling
+    # the copy. Requests fall back to the limit when unset (older plans).
+    cpu_limit = str(resources.get("cpu", "1"))
+    mem_limit = str(resources.get("memory", "1Gi"))
+    cpu_request = str(resources.get("cpu_request", cpu_limit))
+    mem_request = str(resources.get("memory_request", mem_limit))
     return {
         "SHARD_NAME": str(entry["name"]),
         "FILTER_FILE": str(entry["filter_file"]),
@@ -116,10 +121,10 @@ def _data_shard_substitutions(entry: Dict, plan: Dict) -> Dict[str, str]:
         "SPLIT_TABLES_LARGER_THAN": str(entry["split_tables_larger_than"]),
         "SLOT_NAME": str((plan.get("slot") or {}).get("name", "")),
         "PUBLICATION_NAME": str((plan.get("publication") or {}).get("name", "")),
-        "CPU_REQUEST": cpu,
-        "MEM_REQUEST": memory,
-        "CPU_LIMIT": cpu,
-        "MEM_LIMIT": memory,
+        "CPU_REQUEST": cpu_request,
+        "MEM_REQUEST": mem_request,
+        "CPU_LIMIT": cpu_limit,
+        "MEM_LIMIT": mem_limit,
     }
 
 

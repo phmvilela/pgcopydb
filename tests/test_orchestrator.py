@@ -591,6 +591,42 @@ def test_data_shard_env_carries_plan_slot_and_publication():
     ]
 
 
+def test_data_shard_substitutions_decouples_request_from_limit():
+    from pg_cyan.orchestrator import _data_shard_substitutions
+    plan = {"slot": {"name": "s"}, "publication": {"name": "p"}}
+    entry = {
+        "name": "shard-0", "filter_file": "f", "table_jobs": 4,
+        "split_tables_larger_than": "50GB",
+        "resources": {"cpu": "1", "cpu_request": "100m",
+                      "memory": "1Gi", "memory_request": "256Mi"},
+    }
+    sub = _data_shard_substitutions(entry, plan)
+    # small request (co-schedules with the controller) + generous limit (no throttle)
+    assert sub["CPU_REQUEST"] == "100m" and sub["CPU_LIMIT"] == "1"
+    assert sub["MEM_REQUEST"] == "256Mi" and sub["MEM_LIMIT"] == "1Gi"
+
+
+def test_data_shard_substitutions_request_falls_back_to_limit():
+    from pg_cyan.orchestrator import _data_shard_substitutions
+    plan = {"slot": {"name": "s"}, "publication": {"name": "p"}}
+    entry = {  # old-style plan: only cpu/memory, no *_request
+        "name": "shard-0", "filter_file": "f", "table_jobs": 4,
+        "split_tables_larger_than": "50GB",
+        "resources": {"cpu": "2", "memory": "4Gi"},
+    }
+    sub = _data_shard_substitutions(entry, plan)
+    assert sub["CPU_REQUEST"] == "2" == sub["CPU_LIMIT"]
+    assert sub["MEM_REQUEST"] == "4Gi" == sub["MEM_LIMIT"]
+
+
+def test_planner_default_shard_request_below_limit():
+    # The default the planner emits must keep the request schedulable (< limit).
+    from pg_cyan.planner import PgCyanPlanner
+    r = PgCyanPlanner.DEFAULT_SHARD_RESOURCES
+    assert r["cpu_request"] == "100m" and r["cpu"] == "1"
+    assert r["memory_request"] == "256Mi" and r["memory"] == "1Gi"
+
+
 # ----------------------------------------------------- copy-log aggregation
 
 def _shard_log(shard, tables, slot="pgcyan_slot", pub="pgcyan_pub", snap="0000000A-1"):

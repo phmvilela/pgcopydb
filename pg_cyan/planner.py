@@ -82,8 +82,15 @@ class PgCyanPlanner:
     DEFAULT_SNAPSHOT_MODE = "coordinator-held"
     DEFAULT_PUBLICATION = "pgcyan_pub"
     DEFAULT_SLOT = "pgcyan_slot"
-    #: Per-shard pod resource requests/limits (phase-2 COPY is network-bound).
-    DEFAULT_SHARD_RESOURCES = {"cpu": "2", "memory": "4Gi"}
+    #: Per-shard pod resources. Phase-2 COPY is network-bound, so requests are
+    #: kept small enough to co-schedule with the controller on a single small
+    #: node (``*_request``), while limits stay generous so the copy is not CPU-
+    #: throttled. ``cpu``/``memory`` are the limits; ``cpu_request``/
+    #: ``memory_request`` the requests (see ``orchestrator._data_shard_substitutions``).
+    DEFAULT_SHARD_RESOURCES = {
+        "cpu": "1", "cpu_request": "100m",
+        "memory": "1Gi", "memory_request": "256Mi",
+    }
 
     def __init__(
         self,
