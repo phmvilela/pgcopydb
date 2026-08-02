@@ -1,0 +1,5 @@
+# pgcyan control-plane API runtime deps (issue #86).
+# Kept minimal for the skeleton; the Kubernetes client + DB drivers arrive with
+# the provisioning/registry tickets (#87/#88).
+fastapi==0.115.6
+uvicorn[standard]==0.32.1

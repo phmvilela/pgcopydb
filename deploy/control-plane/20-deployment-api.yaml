@@ -1,0 +1,84 @@
+# 20-deployment-api.yaml (control plane -- issue #86)
+# ---------------------------------------------------------------------------
+# The control-plane API Deployment. Single replica with the `Recreate` strategy
+# because it mounts the RWO SQLite registry PVC -- a rolling update would try to
+# run two pods on the same ReadWriteOnce volume and wedge.
+#
+# IMAGE: like deploy/k8s, the image is a `${PGCYAN_CONTROL_PLANE_IMAGE}`
+# placeholder filled at apply time (envsubst) -- never a concrete tag in git.
+# For a manual apply:
+#   export PGCYAN_CONTROL_PLANE_IMAGE=<acr>.azurecr.io/pgcyan-control-plane:<tag>
+#   envsubst '${PGCYAN_CONTROL_PLANE_IMAGE}' < 20-deployment-api.yaml | kubectl apply -f -
+# (The automated build/deploy is issue #91.)
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgcyan-control-plane-api
+  namespace: pgcyan-system
+  labels:
+    app.kubernetes.io/part-of: pgcyan
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # RWO registry volume -> never two pods at once
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: pgcyan
+        app.kubernetes.io/component: control-plane
+    spec:
+      serviceAccountName: pgcyan-control-plane
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000          # make the mounted RWO /data writable by uid 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: "${PGCYAN_CONTROL_PLANE_IMAGE}"
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PGCYAN_DATA_DIR
+              value: "/data"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # Tiny + small requests so it co-schedules on a small node (the
+            # cheap single-node integration cluster); generous limit.
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+          volumeMounts:
+            - name: registry
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp   # readOnlyRootFilesystem -> give uvicorn a writable /tmp
+      volumes:
+        - name: registry
+          persistentVolumeClaim:
+            claimName: pgcyan-control-plane-registry
+        - name: tmp
+          emptyDir: {}

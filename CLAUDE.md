@@ -183,6 +183,25 @@ running image (resolved from its pod spec via `_resolve_image`) so every phase
 Job/Deployment it launches shares its exact build. Never commit a concrete
 image or digest to the manifests or `kustomization.yaml`.
 
+## Control plane (issue #84 book of work)
+
+A separate, long-lived service that provisions and drives **per-migration**
+sandboxes on demand — distinct from a single migration run. Two new trees:
+
+- **`control-plane/api/`** — a standalone **FastAPI** service (its own
+  `requirements.txt` + `Dockerfile`, image `pgcyan-control-plane`), NOT part of
+  the `pg_cyan` package or the heavy migration image. Skeleton today (`GET
+  /health`, #86); provisioning/registry/start-status-teardown land in #87–#90.
+  Its tests live under `control-plane/api/tests/` and are **not** collected by
+  the repo-root `pytest` (run them from `control-plane/api`).
+- **`deploy/control-plane/`** — the fixed **`pgcyan-system`** namespace: SA +
+  **cluster-scoped** RBAC (create/delete namespaces and the resources inside
+  per-migration namespaces), an RWO SQLite-registry PVC (`/data`, #58 pattern),
+  the API Deployment (single replica, `Recreate` — RWO volume) + Service. Same
+  image-placeholder convention as `deploy/k8s`: `${PGCYAN_CONTROL_PLANE_IMAGE}`
+  filled by `envsubst` at apply time. Applied **manually** for now; the deploy
+  workflow is #91.
+
 ## Style
 
 - Python 3.10+, type hints on public methods, docstrings in the existing style

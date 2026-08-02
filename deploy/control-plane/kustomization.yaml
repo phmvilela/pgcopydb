@@ -1,0 +1,26 @@
+# kustomization.yaml (control plane -- issue #86)
+# ---------------------------------------------------------------------------
+# Bundles the fixed control-plane manifests (namespace, RBAC, registry PVC,
+# API Deployment, Service) so the whole set can be previewed/applied at once.
+#
+# Like deploy/k8s, the API image is NOT pinned here: 20-deployment-api.yaml
+# carries an `image: "${PGCYAN_CONTROL_PLANE_IMAGE}"` placeholder filled at
+# apply time. `kubectl kustomize deploy/control-plane` emits the literal
+# placeholder -- fill it (envsubst) before applying.
+#
+# Usage:
+#   kubectl kustomize deploy/control-plane          # preview (placeholder image)
+#   PGCYAN_CONTROL_PLANE_IMAGE=<reg>/pgcyan-control-plane:<tag> \
+#     kubectl kustomize deploy/control-plane | envsubst '${PGCYAN_CONTROL_PLANE_IMAGE}' | kubectl apply -f -
+#
+# The automated build + deploy workflow is issue #91; for now this is applied
+# manually.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace.yaml
+  - 01-rbac.yaml
+  - 10-pvc-registry.yaml
+  - 20-deployment-api.yaml
+  - 30-service-api.yaml

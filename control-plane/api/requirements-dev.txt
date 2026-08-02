@@ -1,0 +1,4 @@
+# Test-only deps for the control-plane API. httpx backs FastAPI's TestClient.
+-r requirements.txt
+pytest==7.4.3
+httpx==0.28.1

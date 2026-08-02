@@ -1,0 +1,22 @@
+# 30-service-api.yaml (control plane -- issue #86)
+# ---------------------------------------------------------------------------
+# ClusterIP Service in front of the API Deployment. In-cluster only for now
+# (the React UI / external ingress is a later ticket, #84). Port 80 -> 8000 so
+# callers use a conventional http port.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgcyan-control-plane-api
+  namespace: pgcyan-system
+  labels:
+    app.kubernetes.io/part-of: pgcyan
+    app.kubernetes.io/component: control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

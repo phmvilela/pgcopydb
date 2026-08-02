@@ -1,0 +1,14 @@
+# 00-namespace.yaml (control plane -- issue #86)
+# ---------------------------------------------------------------------------
+# The FIXED, long-lived namespace that hosts the control-plane API. Unlike the
+# per-migration `pgcyan-migration` namespace (deploy/k8s/), this one is created
+# once and persists; the control plane provisions a SEPARATE, disposable
+# namespace per migration (later tickets) using its cluster-scoped RBAC.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgcyan-system
+  labels:
+    app.kubernetes.io/part-of: pgcyan
+    app.kubernetes.io/component: control-plane
