@@ -43,6 +43,16 @@ the full walk runs (planner -> pre-data -> shards -> index -> FK -> CDC) with th
 id injected. A ``health_check`` the barrier loop polls means a child that dies
 mid-walk aborts the copy rather than "succeeding" against a dead snapshot.
 
+WAIT-TO-START: with ``PGCYAN_WAIT_FOR_START`` set, the controller does
+NOT snapshot on launch. It serves a small HTTP control API (``GET /status``,
+``GET /health``, ``POST /start``) on ``api_port`` (the ``pgcyan-controller``
+Service, :9999) and parks **before** taking the snapshot; it establishes the
+snapshot + walks only when ``POST /start`` arrives (see ``serve_and_run``). So a
+provisioned-but-idle pod holds no replication slot / snapshot on the source until
+the tester starts it -- the control plane provisions in this mode and
+triggers the start via the endpoint. Default off preserves the immediate-run
+behavior the integration test relies on.
+
 Never raises: ``run()`` always tears the snapshot child down (``finally``) so a
 graceful pod exit leaves no stale source connection.
 """
@@ -52,9 +62,11 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
-from typing import Callable, Dict, Optional
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable, Dict, Optional, Tuple
 
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
@@ -81,6 +93,9 @@ class PgCyanController:
     #: File the readiness probe checks; present == Ready. Removed/absent == not
     #: ready (parked/halted/failed). Lives on the pod's node-local scratch.
     DEFAULT_READY_FILE = "/pgcopydb/ready"
+    #: Port the control API listens on in wait-to-start mode (matches the
+    #: ``pgcyan-controller`` Service).
+    DEFAULT_API_PORT = 9999
 
     def __init__(
         self,
@@ -91,6 +106,7 @@ class PgCyanController:
         ready_file: str = DEFAULT_READY_FILE,
         stop_after: Optional[str] = None,
         follow_cdc: bool = False,
+        api_port: int = DEFAULT_API_PORT,
         core_api=None,
         orchestrator_factory: Optional[Callable[..., PgCyanOrchestrator]] = None,
         follow_factory: Optional[Callable[..., PgCyanFollow]] = None,
@@ -123,10 +139,21 @@ class PgCyanController:
         self.ready_file = ready_file
         self.stop_after = stop_after
         self.follow_cdc = follow_cdc
+        self.api_port = api_port
         self.follow_factory = follow_factory or self._default_follow
         self.cdc: Optional[PgCyanFollow] = None       # the streaming CDC child, once started
         self._released = False       # snapshot deliberately released ahead of CDC (#26)
         self.errors = []
+
+        #: Lifecycle state for the control API's ``GET /status``:
+        #: initialized -> waiting-to-start -> running -> succeeded|failed|halted.
+        self.state = "initialized"
+        #: The latest run summary, updated in place during the walk so ``/status``
+        #: can surface partial progress (e.g. the snapshot id once established).
+        self._summary: Optional[Dict] = None
+        #: Set by ``POST /start`` to release the pre-snapshot wait.
+        self._start_requested = threading.Event()
+        self._api_server: Optional[ThreadingHTTPServer] = None
 
         if core_api is None:
             self._load_kube_credentials(in_cluster)
@@ -383,6 +410,131 @@ class PgCyanController:
         except KeyboardInterrupt:
             self._log_event("park", "success", "Signalled; exiting park")
 
+    def _install_signal_handlers(self) -> None:
+        """Route SIGTERM/SIGINT through a ``KeyboardInterrupt`` so the walk, the
+        pre-start wait, and ``park()`` all unwind through clean shutdown. A no-op
+        off the main thread (e.g. under test), where signals can't be installed."""
+        def _on_signal(signum, _frame):
+            self._log_event("signal", "success", f"Received signal {signum}; shutting down")
+            raise KeyboardInterrupt()
+        try:
+            signal.signal(signal.SIGTERM, _on_signal)
+            signal.signal(signal.SIGINT, _on_signal)
+        except ValueError:
+            pass  # not on the main thread -- skip signal setup
+
+    # ------------------------------------------------------- control API
+
+    def _status_payload(self) -> Dict:
+        """The ``GET /status`` body: lifecycle state + whatever the run knows so far."""
+        s = self._summary or {}
+        return {
+            "state": self.state,
+            "ready": os.path.exists(self.ready_file),
+            "snapshot": s.get("snapshot"),
+            "cdc": s.get("cdc"),
+            "phases": s.get("phases", []),
+            "errors": s.get("errors", self.errors),
+        }
+
+    def handle_api(self, method: str, path: str) -> Tuple[int, Dict]:
+        """Route a control-API request to ``(status_code, json_body)``.
+
+        Pure logic (no sockets) so it is unit-testable; the HTTP handler is a thin
+        adapter over it. Routes: ``GET /status``, ``GET /health``, ``POST /start``.
+        """
+        path = (path.split("?", 1)[0]).rstrip("/") or "/"
+        if method == "GET" and path in ("/status", "/"):
+            return 200, self._status_payload()
+        if method == "GET" and path == "/health":
+            return 200, {"status": "ok", "state": self.state}
+        if method == "POST" and path == "/start":
+            return self._handle_start()
+        return 404, {"error": "not found", "method": method, "path": path}
+
+    def _handle_start(self) -> Tuple[int, Dict]:
+        """Handle ``POST /start`` -- idempotent: only the first call arms the run."""
+        if self.state in ("succeeded", "failed", "halted"):
+            return 200, {"state": self.state, "message": "migration already finished"}
+        if self._start_requested.is_set():
+            return 200, {"state": self.state, "message": "start already requested"}
+        self._start_requested.set()
+        self._log_event("start_signal", "success",
+                        "Received POST /start; beginning the migration", {})
+        return 202, {"state": "starting", "message": "migration start accepted"}
+
+    def _make_request_handler(self):
+        """Build a ``BaseHTTPRequestHandler`` bound to this controller."""
+        controller = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def _respond(self, code: int, payload: Dict) -> None:
+                body = json.dumps(payload, default=str).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                self._respond(*controller.handle_api("GET", self.path))
+
+            def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)   # drain + ignore any body
+                self._respond(*controller.handle_api("POST", self.path))
+
+            def log_message(self, *args):  # silence default stderr access logging
+                return
+
+        return _Handler
+
+    def start_api_server(self) -> ThreadingHTTPServer:
+        """Serve the control API on ``0.0.0.0:api_port`` in a daemon thread."""
+        server = ThreadingHTTPServer(("0.0.0.0", self.api_port), self._make_request_handler())
+        self._api_server = server
+        threading.Thread(target=server.serve_forever, name="pgcyan-control-api",
+                         daemon=True).start()
+        self._log_event("api", "success", f"Control API listening on :{self.api_port}",
+                        {"routes": ["GET /status", "GET /health", "POST /start"]})
+        return server
+
+    def _await_start(self) -> None:
+        """Block until ``POST /start`` arms the run. Interruptible by SIGTERM (the
+        1s poll lets a signal-raised ``KeyboardInterrupt`` land while waiting)."""
+        while not self._start_requested.wait(timeout=1.0):
+            pass
+
+    def serve_and_run(self) -> Dict:
+        """Wait-to-start lifecycle: serve the control API and park
+        **before** taking the snapshot; establish it + walk the DAG only once
+        ``POST /start`` arrives, then park. So an idle, provisioned pod holds no
+        replication slot / snapshot on the source until the tester starts it."""
+        self._install_signal_handlers()
+        server = self.start_api_server()
+        try:
+            self.state = "waiting-to-start"
+            self._set_ready(True)   # Ready so the Service routes /start to this pod
+            self._log_event("wait_start", "success",
+                            "Parked pre-snapshot; POST /start to begin the migration",
+                            {"port": self.api_port})
+            self._await_start()
+            summary = self.run()
+            self.park()
+            return summary
+        except KeyboardInterrupt:
+            self._set_ready(False)
+            self._log_event("wait_start", "success",
+                            "Signalled before start; shutting down (no migration begun)", {})
+            return self._summary or {"status": "failure", "ready": False,
+                                     "state": "aborted", "errors": self.errors}
+        finally:
+            try:
+                server.shutdown()
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+
     # --------------------------------------------------------------- run
 
     def run(self) -> Dict:
@@ -402,17 +554,13 @@ class PgCyanController:
         """
         summary = {"status": "failure", "ready": False, "snapshot": None,
                    "owned": False, "phases": [], "errors": self.errors}
+        # Expose the (mutating) summary + state to the control API's /status.
+        self._summary = summary
+        self.state = "running"
 
         # SIGTERM/SIGINT -> tear the child down and stop. Raising KeyboardInterrupt
         # routes both the walk and the park() below through clean shutdown.
-        def _on_signal(signum, _frame):
-            self._log_event("signal", "success", f"Received signal {signum}; shutting down")
-            raise KeyboardInterrupt()
-        try:
-            signal.signal(signal.SIGTERM, _on_signal)
-            signal.signal(signal.SIGINT, _on_signal)
-        except ValueError:
-            pass  # not on the main thread (e.g. under test) -- skip signal setup
+        self._install_signal_handlers()
 
         # REFUSE-TO-RESUME: a pre-existing run-state marker means a prior pod
         # already began this run; its in-pod snapshot is gone and we must not
@@ -430,6 +578,7 @@ class PgCyanController:
                             "Refusing to resume a prior run; parking not-ready",
                             {"prior_status": prior, "state_configmap": self.STATE_CONFIGMAP})
             summary["status"] = "halted"
+            self.state = "halted"
             return summary
 
         try:
@@ -496,6 +645,9 @@ class PgCyanController:
                 self.cdc.close()
             return summary
         finally:
+            # Reflect the terminal lifecycle state for the control API's /status.
+            self.state = {"success": "succeeded", "halted": "halted"}.get(
+                summary["status"], "failed")
             # Always release the snapshot child so no stale source connection /
             # held slot is left behind.
             try:
@@ -505,7 +657,11 @@ class PgCyanController:
 
 
 def run_migration_from_env() -> int:
-    """Entry point for the StatefulSet: build from env, run, then park."""
+    """Entry point for the StatefulSet: build from env, run, then park.
+
+    With ``PGCYAN_WAIT_FOR_START`` set, the controller serves its control API and
+    waits for ``POST /start`` before taking the snapshot; otherwise it
+    runs immediately (the integration-test default)."""
     holder = _holder_from_env()
     controller = PgCyanController(
         holder=holder,
@@ -514,13 +670,17 @@ def run_migration_from_env() -> int:
         ready_file=os.getenv("PGCYAN_READY_FILE", PgCyanController.DEFAULT_READY_FILE),
         stop_after=os.getenv("PGCYAN_STOP_AFTER") or None,
         follow_cdc=os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes"),
+        api_port=int(os.getenv("PGCYAN_API_PORT", str(PgCyanController.DEFAULT_API_PORT))),
     )
-    summary = controller.run()
+    if os.getenv("PGCYAN_WAIT_FOR_START", "").strip().lower() in ("1", "true", "yes"):
+        summary = controller.serve_and_run()   # serves the API + parks pre-snapshot
+    else:
+        summary = controller.run()
+        # Park in the terminal state (Ready iff the migration succeeded) rather than
+        # exiting -- a StatefulSet pod would otherwise be restarted and crash-loop.
+        controller.park()
     print(json.dumps(summary, indent=2, default=str))
-    # Park in the terminal state (Ready iff the migration succeeded) rather than
-    # exiting -- a StatefulSet pod would otherwise be restarted and crash-loop.
-    controller.park()
-    return 0 if summary["status"] == "success" else 1
+    return 0 if summary.get("status") == "success" else 1
 
 
 if __name__ == "__main__":

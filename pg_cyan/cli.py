@@ -531,7 +531,12 @@ def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) ->
               default=lambda: os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes"),
               show_default="$PGCYAN_FOLLOW_CDC (unset = off)",
               help="After a full walk, become the CDC consumer (`pgcopydb follow`, issue #26).")
-def run_migration(namespace: str, in_cluster: bool, stop_after: str, follow_cdc: bool) -> None:
+@click.option("--wait-for-start/--no-wait-for-start",
+              default=lambda: os.getenv("PGCYAN_WAIT_FOR_START", "").strip().lower() in ("1", "true", "yes"),
+              show_default="$PGCYAN_WAIT_FOR_START (unset = off)",
+              help="Park pre-snapshot and serve a control API; take the snapshot and walk only on POST /start")
+def run_migration(namespace: str, in_cluster: bool, stop_after: str,
+                  follow_cdc: bool, wait_for_start: bool) -> None:
     """Hold the snapshot in-pod and walk the whole migration DAG (issue #70, #26).
 
     The folded controller: it establishes and HOLDS the consistent snapshot in
@@ -541,19 +546,28 @@ def run_migration(namespace: str, in_cluster: bool, stop_after: str, follow_cdc:
     ``--follow-cdc`` -- releases the snapshot and becomes the CDC consumer itself
     (`pgcopydb follow` on its own --dir, Option A #26). Single-pod StatefulSet;
     config is env-driven (the manifest sets it).
+
+    With ``--wait-for-start`` it does NOT snapshot on launch: it serves
+    a small control API (`GET /status`, `POST /start`) and parks pre-snapshot,
+    establishing the snapshot + walking only when `POST /start` arrives.
     """
     from pg_cyan.snapshot import _holder_from_env
     holder = _holder_from_env()
     controller = PgCyanController(holder=holder, namespace=namespace,
                                   in_cluster=in_cluster, stop_after=stop_after or None,
-                                  follow_cdc=follow_cdc)
+                                  follow_cdc=follow_cdc,
+                                  api_port=int(os.getenv("PGCYAN_API_PORT",
+                                                         str(PgCyanController.DEFAULT_API_PORT))))
     try:
-        summary = controller.run()
+        if wait_for_start:
+            summary = controller.serve_and_run()   # serves the API + parks pre-snapshot
+        else:
+            summary = controller.run()
+            # Park in the terminal state (Ready iff succeeded) rather than exiting --
+            # a StatefulSet pod would otherwise be restarted and crash-loop.
+            controller.park()
         click.echo(json.dumps(summary, indent=2, default=str))
-        # Park in the terminal state (Ready iff succeeded) rather than exiting --
-        # a StatefulSet pod would otherwise be restarted and crash-loop (#70).
-        controller.park()
-        sys.exit(0 if summary["status"] == "success" else 1)
+        sys.exit(0 if summary.get("status") == "success" else 1)
     except KeyboardInterrupt:
         sys.exit(2)
 

@@ -3,17 +3,11 @@ description: >
   Agent-authored steps run by the "Secure Agents Playground" workflow to test
   changes against the REAL AKS cluster before promoting them to the production
   workflows (which need a human-approved PR). The agent edits this file freely
-  and re-triggers the playground to iterate.
-
-  CURRENT TEST -- phase -2 collector reads the shared `pgcyan-db-uris` Secret:
-  the collect-inputs Job (deploy/k8s/25-job-collect-inputs.yaml) used to require
-  a separate `pgcyan-source-pg` Secret (PG_SOURCE_* keys) that the workflow no
-  longer creates -> CreateContainerConfigError. The fix points it at the single
-  pgcopydb-style `pgcyan-db-uris` Secret (PGCOPYDB_SOURCE_PGURI) and teaches the
-  psycopg2-based collectors to accept that URI (pg_cyan.postgres.conn). This job
-  stands up ONLY that collector against the real source DB and asserts it
-  connects (TLS via the URI's sslmode), runs both collectors, and publishes the
-  `pgcyan-planner-inputs` ConfigMap -- then tears everything down.
+  and re-triggers the playground to iterate. It currently exercises the
+  controller wait-to-start mode (issue #85): provision the controller PARKED
+  pre-snapshot, assert `GET /status` shows `waiting-to-start` with no snapshot,
+  `POST /start`, then assert the snapshot is established and the (planner-only,
+  fast) walk succeeds -- then tear everything down.
 
   Credentials are read from `env` (secrets/vars mapped in the calling workflow),
   since composite actions cannot read the `secrets` context directly. `NS` and
@@ -32,8 +26,11 @@ runs:
         tenant-id: ${{ env.AZURE_TENANT_ID }}
         subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
-    # Feature-branch commits have no image until build.yml publishes one; ensure
-    # the tag exists before the pod tries to pull it (else ImagePullBackOff).
+    # Feature-branch commits have no image until one is built (build.yml only
+    # publishes on push-to-main / dispatch). If the tag is missing, dispatch
+    # build.yml on this branch and poll ACR for the tag to land (same flow as the
+    # integration test). The image is pulled in-cluster by the kubelet, so the
+    # runner never needs ACR registry egress -- only `az acr repository show`.
     - name: Ensure the commit's image is published (build if missing)
       shell: bash
       env:
@@ -45,12 +42,12 @@ runs:
         if az acr repository show --name "$ACR_NAME" --image "pgcyan:${sha}" >/dev/null 2>&1; then
           echo "Image already present -- nothing to build."; exit 0
         fi
-        echo "Image pgcyan:${sha} not found; dispatching Build on ${GITHUB_REF_NAME} ..."
+        echo "Image pgcyan:${sha} not found; dispatching build.yml on ${GITHUB_REF_NAME} ..."
         gh workflow run build.yml --ref "$GITHUB_REF_NAME"
         timeout=1500; elapsed=0
         until az acr repository show --name "$ACR_NAME" --image "pgcyan:${sha}" >/dev/null 2>&1; do
           if [ "$elapsed" -ge "$timeout" ]; then
-            echo "::error::image pgcyan:${sha} still absent after ${timeout}s"; exit 1
+            echo "::error::image pgcyan:${sha} still absent after ${timeout}s -- check the Build run on ${GITHUB_REF_NAME}"; exit 1
           fi
           echo "waiting for pgcyan:${sha} to publish ... (${elapsed}s)"; sleep 20; elapsed=$((elapsed + 20))
         done
@@ -65,17 +62,13 @@ runs:
     - name: Ensure namespace + RBAC + work-dir PVC
       shell: bash
       run: |
-        set -euo pipefail
         kubectl apply -f deploy/k8s/00-namespace.yaml
         kubectl apply -f deploy/k8s/01-rbac.yaml
         kubectl apply -f deploy/k8s/20-pvc-workdir.yaml
 
-    # The single pgcopydb-style Secret the collector (and the controller/phase
-    # pods) read. Build the URIs from the mapped PG_*_* env, URL-encoding userinfo.
     - name: Create/refresh DB Secret (SOURCE + TARGET PGURIs)
       shell: bash
       run: |
-        set -euo pipefail
         enc() { python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
         sport="${PG_SOURCE_PORT:-5432}"; tport="${PG_TARGET_PORT:-5432}"
         su="$(enc "$PG_SOURCE_USER")"; sp="$(enc "$PG_SOURCE_PASSWORD")"
@@ -87,61 +80,86 @@ runs:
           --from-literal=PGCOPYDB_TARGET_PGURI="$target_uri" \
           --dry-run=client -o yaml | kubectl apply -f -
 
-    # Clean slate: drop any collector Job / published inputs from a prior run so
-    # this run re-creates them from scratch.
-    - name: Clear prior collector run
+    - name: Clear prior controller run (clean slate)
       shell: bash
       run: |
-        set -euo pipefail
-        kubectl delete job pgcyan-collect-inputs -n "$NS" --ignore-not-found --wait=true || true
-        kubectl delete configmap pgcyan-planner-inputs -n "$NS" --ignore-not-found || true
+        kubectl delete statefulset pgcyan-controller -n "$NS" --ignore-not-found --wait=true --cascade=foreground || true
+        kubectl delete configmap -n "$NS" --ignore-not-found \
+          pgcyan-migration-state pgcyan-plan pgcyan-copylog pgcyan-snapshot || true
+        kubectl delete configmap -n "$NS" --ignore-not-found -l pgcyan.dev/copylog=shard || true
+        kubectl delete job -n "$NS" --ignore-not-found --wait=true pgcyan-collect-inputs || true
+        kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
 
-    - name: Phase -2 -- run the collector against the real source DB (barrier)
+    # Phase -2 (collect inputs) is not part of the controller walk; the planner
+    # (the first phase we let the walk reach) needs its output.
+    - name: Phase -2 -- collect inputs (barrier)
       shell: bash
       run: |
         set -euo pipefail
-        wait_job() {
-          local job="$1" timeout="${2:-600}" elapsed=0 done_s fail_s
-          while true; do
-            done_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
-            fail_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
-            [ "$done_s" = "True" ] && { echo "job/$job Complete"; return 0; }
-            [ "$fail_s" = "True" ] && { echo "::error::job/$job Failed"; return 1; }
-            [ "$elapsed" -ge "$timeout" ] && { echo "::error::job/$job timed out after ${timeout}s"; return 1; }
-            sleep 10; elapsed=$((elapsed + 10))
-          done
-        }
         envsubst '${PGCYAN_IMAGE}' < deploy/k8s/25-job-collect-inputs.yaml | kubectl apply -f -
-        wait_job pgcyan-collect-inputs 600
+        kubectl wait --for=condition=complete job/pgcyan-collect-inputs -n "$NS" --timeout=900s \
+          || { kubectl logs job/pgcyan-collect-inputs -n "$NS" || true; echo "::error::collect-inputs did not complete"; exit 1; }
 
-    # Job-complete already proves the collector connected (TLS) + published; this
-    # confirms the ConfigMap actually carries both planner inputs as valid JSON.
-    - name: Assert planner inputs were published
+    # Apply the controller in WAIT-TO-START mode. PGCYAN_STOP_AFTER=-1 stops the
+    # walk right after the planner, so the test is quick but still proves the
+    # snapshot is established + the walk runs once /start arrives (issue #85).
+    - name: Apply the controller in WAIT-TO-START mode (#85)
+      shell: bash
+      env:
+        PGCYAN_WAIT_FOR_START: "true"
+        PGCYAN_STOP_AFTER: "-1"
+        PGCYAN_FOLLOW_CDC: ""
+        PGCYAN_FOLLOW_VERBOSE: ""
+      run: |
+        set -euo pipefail
+        envsubst '${PGCYAN_IMAGE} ${PGCYAN_STOP_AFTER} ${PGCYAN_FOLLOW_CDC} ${PGCYAN_FOLLOW_VERBOSE} ${PGCYAN_WAIT_FOR_START}' \
+          < deploy/k8s/35-statefulset-controller.yaml | kubectl apply -f -
+
+    - name: Assert parked PRE-snapshot (waiting-to-start, no snapshot yet)
       shell: bash
       run: |
         set -euo pipefail
-        kubectl get configmap pgcyan-planner-inputs -n "$NS" -o json > /tmp/planner-inputs.json
-        python3 - <<'PY'
-        import json
-        cm = json.load(open("/tmp/planner-inputs.json"))
-        data = cm.get("data", {})
-        for key in ("source-pg-metrics.json", "source-pg-largeobjects.json"):
-            assert key in data and data[key].strip(), f"missing/empty {key}"
-            json.loads(data[key])  # must be valid JSON
-        print("planner-inputs OK ->", ", ".join(sorted(data)))
-        PY
+        # In wait-to-start the controller writes /pgcopydb/ready while parked, so
+        # rollout status returns once it is up and serving the control API.
+        kubectl rollout status statefulset/pgcyan-controller -n "$NS" --timeout=180s
+        POD="$(kubectl get pod -l pgcyan.dev/component=controller -n "$NS" -o jsonpath='{.items[0].metadata.name}')"
+        echo "controller pod: $POD"
+        get() { kubectl exec "$POD" -n "$NS" -- python -c \
+          "import urllib.request;print(urllib.request.urlopen('http://localhost:9999$1').read().decode())"; }
+        s="$(get /status)"; echo "status: $s"
+        echo "$s" | python3 -c "import sys,json; d=json.load(sys.stdin); \
+          assert d['state']=='waiting-to-start', d; assert d.get('snapshot') is None, d; \
+          print('OK: parked pre-snapshot, no snapshot established yet')"
 
-    - name: Dump collector diagnostics on failure
-      if: failure()
+    - name: POST /start and assert the migration begins (snapshot established)
       shell: bash
       run: |
-        echo "=== pods ==="; kubectl get pods -n "$NS" -l pgcyan.dev/phase=collect-inputs -o wide || true
-        echo "=== collector logs ==="; kubectl logs -n "$NS" -l job-name=pgcyan-collect-inputs --tail=-1 || true
-        echo "=== events ==="; kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -30 || true
+        set -euo pipefail
+        POD="$(kubectl get pod -l pgcyan.dev/component=controller -n "$NS" -o jsonpath='{.items[0].metadata.name}')"
+        echo "starting migration via POST /start ..."
+        kubectl exec "$POD" -n "$NS" -- python -c \
+          "import urllib.request; r=urllib.request.Request('http://localhost:9999/start',method='POST'); \
+           print(urllib.request.urlopen(r).read().decode())"
+        state="?"; snap="None"
+        for i in $(seq 1 60); do
+          s="$(kubectl exec "$POD" -n "$NS" -- python -c \
+            "import urllib.request;print(urllib.request.urlopen('http://localhost:9999/status').read().decode())" 2>/dev/null || echo '{}')"
+          state="$(echo "$s" | python3 -c "import sys,json;print(json.load(sys.stdin).get('state'))" 2>/dev/null || echo '?')"
+          snap="$(echo  "$s" | python3 -c "import sys,json;print(json.load(sys.stdin).get('snapshot'))" 2>/dev/null || echo None)"
+          echo "[$i] state=$state snapshot=$snap"
+          [ "$state" = "succeeded" ] && break
+          [ "$state" = "failed" ] && { echo "::error::walk failed after /start"; kubectl logs "$POD" -n "$NS" --tail=120 || true; exit 1; }
+          sleep 10
+        done
+        [ "$state" = "succeeded" ] || { echo "::error::did not reach 'succeeded' after /start"; kubectl logs "$POD" -n "$NS" --tail=120 || true; exit 1; }
+        { [ "$snap" != "None" ] && [ -n "$snap" ]; } || { echo "::error::no snapshot was established"; exit 1; }
+        echo "OK (#85): snapshot established ONLY after /start ($snap); planner walk succeeded"
 
     - name: Teardown
       if: always()
       shell: bash
       run: |
+        kubectl delete statefulset pgcyan-controller -n "$NS" --ignore-not-found --wait=true --cascade=foreground || true
+        kubectl delete configmap -n "$NS" --ignore-not-found pgcyan-migration-state pgcyan-plan pgcyan-copylog || true
         kubectl delete job pgcyan-collect-inputs -n "$NS" --ignore-not-found --wait=false || true
-        kubectl delete configmap pgcyan-planner-inputs -n "$NS" --ignore-not-found || true
+        kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true

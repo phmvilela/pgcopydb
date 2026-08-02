@@ -49,9 +49,12 @@ spec:
   clusterIP: None            # headless -- StatefulSet governing Service
   selector:
     pgcyan.dev/component: "controller"
+  # The controller's control API (issue #85): GET /status, POST /start. The
+  # control-plane API reaches it here to start/observe a wait-to-start migration.
   ports:
-    - name: placeholder
+    - name: control-api
       port: 9999
+      targetPort: control-api
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -143,9 +146,19 @@ spec:
             # applied change. Filled by envsubst; EMPTY (default) = normal logging.
             - name: PGCYAN_FOLLOW_VERBOSE
               value: "${PGCYAN_FOLLOW_VERBOSE}"
+            # Wait-to-start (issue #85): when "true", the controller serves its
+            # control API and parks BEFORE taking the snapshot, establishing it +
+            # walking only on `POST /start`. Filled by envsubst; EMPTY (default) =
+            # snapshot + walk immediately on launch (the integration-test default).
+            # The control-plane API (#87) sets this "true" when it provisions.
+            - name: PGCYAN_WAIT_FOR_START
+              value: "${PGCYAN_WAIT_FOR_START}"
           envFrom:
             - secretRef:
                 name: pgcyan-db-uris    # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI
+          ports:
+            - name: control-api        # GET /status, POST /start (issue #85)
+              containerPort: 9999
           volumeMounts:
             - name: pgcopydb-workdir
               mountPath: /pgcopydb

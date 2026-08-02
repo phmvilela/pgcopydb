@@ -106,7 +106,7 @@ class _FakeFollow:
 
 
 def _make_controller(holder=None, core=None, orch_result=None, capture=None,
-                     ready_file=None, follow_cdc=False):
+                     ready_file=None, follow_cdc=False, api_port=0):
     holder = holder or _FakeHolder()
 
     def factory(**kwargs):
@@ -124,7 +124,7 @@ def _make_controller(holder=None, core=None, orch_result=None, capture=None,
     return PgCyanController(
         holder=holder, namespace="pgcyan-migration", pod_name="pgcyan-controller-0",
         core_api=core or _FakeCore(), orchestrator_factory=factory,
-        follow_factory=follow_factory, follow_cdc=follow_cdc,
+        follow_factory=follow_factory, follow_cdc=follow_cdc, api_port=api_port,
         ready_file=ready_file or "/tmp/pgcyan-test-ready-unused",
     )
 
@@ -305,3 +305,74 @@ def test_resolve_owner_reference_shape():
         "apiVersion": "apps/v1", "kind": "StatefulSet", "name": "pgcyan-controller",
         "uid": "u-1", "controller": True, "blockOwnerDeletion": True,
     }
+
+
+# --------------------------------------------------- wait-to-start (issue #85)
+
+def test_handle_api_status_health_and_unknown_routes(tmp_path):
+    ctl = _make_controller(ready_file=str(tmp_path / "ready"))
+    ctl.state = "waiting-to-start"
+
+    code, body = ctl.handle_api("GET", "/status")
+    assert code == 200 and body["state"] == "waiting-to-start" and body["ready"] is False
+
+    code, body = ctl.handle_api("GET", "/health")
+    assert code == 200 and body["status"] == "ok"
+
+    # Trailing slash + query string are normalized; unknown route/verb -> 404.
+    assert ctl.handle_api("GET", "/status/?x=1")[0] == 200
+    assert ctl.handle_api("GET", "/nope")[0] == 404
+    assert ctl.handle_api("DELETE", "/status")[0] == 404
+
+
+def test_post_start_is_idempotent(tmp_path):
+    ctl = _make_controller(ready_file=str(tmp_path / "ready"))
+    ctl.state = "waiting-to-start"
+    assert ctl._start_requested.is_set() is False
+
+    code, _ = ctl.handle_api("POST", "/start")
+    assert code == 202 and ctl._start_requested.is_set()          # first call arms it
+
+    code, _ = ctl.handle_api("POST", "/start")
+    assert code == 200                                            # idempotent no-op
+
+    ctl.state = "succeeded"                                       # already finished
+    code, body = ctl.handle_api("POST", "/start")
+    assert code == 200 and "finished" in body["message"]
+
+
+def test_wait_to_start_holds_snapshot_until_start_signal(tmp_path):
+    """The snapshot is established only AFTER POST /start, not at launch (#85)."""
+    import threading
+    import time
+
+    holder = _FakeHolder()
+    ctl = _make_controller(holder=holder, ready_file=str(tmp_path / "ready"), api_port=0)
+    ctl.park = lambda: None                     # don't block after the walk in this test
+
+    result = {}
+    t = threading.Thread(target=lambda: result.__setitem__("summary", ctl.serve_and_run()),
+                         daemon=True)
+    t.start()
+    try:
+        # Reaches the pre-snapshot wait; the snapshot is NOT taken yet.
+        for _ in range(100):
+            if ctl.state == "waiting-to-start":
+                break
+            time.sleep(0.02)
+        assert ctl.state == "waiting-to-start"
+        assert holder.established is False
+        assert ctl.handle_api("GET", "/status")[1]["state"] == "waiting-to-start"
+
+        # Signal start -> the run establishes the snapshot and walks.
+        assert ctl.handle_api("POST", "/start")[0] == 202
+        t.join(timeout=5)
+        assert not t.is_alive()
+    finally:
+        ctl._start_requested.set()              # ensure the thread can't hang on failure
+        t.join(timeout=2)
+
+    assert holder.established is True                     # snapshot taken AFTER start
+    assert result["summary"]["status"] == "success"
+    code, body = ctl.handle_api("GET", "/status")
+    assert body["state"] == "succeeded" and body["snapshot"] == "SNAP-1"

@@ -91,7 +91,7 @@ read the linked module before changing a stage.
 | `build-foreign-keys` | `postfk.py` · `PgCyanForeignKeys` | 3b | **Custom SQL** (not pgcopydb): source FKs → target `ADD … NOT VALID` then `VALIDATE`; single pass; writes `target-pg-postload-log.json`. |
 | *(controller-owned)* | `follow.py` · `PgCyanFollow` | CDC | **Not a CLI stage.** After the walk, the controller releases its snapshot and *becomes* the CDC consumer — `pgcopydb follow --resume` on its OWN `--dir` (so follow reuses the slot; slot-creator + streamer must share a `--dir`). Gated by `PGCYAN_FOLLOW_CDC`. Option A, #26. |
 | `orchestrate` | `orchestrator.py` · `PgCyanOrchestrator` | — | Walks the DAG, applies each phase manifest, blocks on its barrier; aggregates the combined `pgcyan-copylog`. |
-| `run-migration` | `controller.py` · `PgCyanController` | — | **The folded controller (#70)**: holds the snapshot in-pod and drives the whole DAG. This is what runs in-cluster. |
+| `run-migration` | `controller.py` · `PgCyanController` | — | **The folded controller (#70)**: holds the snapshot in-pod and drives the whole DAG. This is what runs in-cluster. With `--wait-for-start`/`PGCYAN_WAIT_FOR_START` (#85) it parks **pre-snapshot** and serves a control API (`GET /status`, `POST /start` on :9999), snapshotting + walking only when `POST /start` arrives — the control-plane (#84) entry point. |
 | *(no command)* | `snapshot.py` · `PgCyanSnapshot` | 1 | Snapshot sub-component — establishes + holds the consistent slot/snapshot; driven in-pod by the controller (standalone `snapshot-hold` retired in #70). |
 
 **Shared conventions** (embodied by every stage; details in each docstring):

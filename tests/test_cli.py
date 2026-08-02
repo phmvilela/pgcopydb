@@ -177,6 +177,8 @@ class _StubController:
     """
 
     last_kwargs = None
+    #: Mirror the real class attribute the CLI reads for the default API port (#85).
+    DEFAULT_API_PORT = 9999
 
     def __init__(self, **kwargs):
         _StubController.last_kwargs = kwargs
@@ -189,6 +191,10 @@ class _StubController:
 
     def park(self):
         return None  # no-op: real controller blocks until SIGTERM
+
+    def serve_and_run(self):
+        # Wait-to-start path (#85): stands in for run()+park() gated by POST /start.
+        return self.run()
 
 
 class _StubPostIndex(RealPostIndex):
@@ -576,6 +582,14 @@ def test_run_migration_exit_zero_on_success(runner):
 def test_run_migration_exit_one_on_failure(runner):
     result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "bad_ns"])
     assert result.exit_code == 1
+
+
+def test_run_migration_wait_for_start_uses_serve_and_run(runner):
+    # --wait-for-start routes through serve_and_run() (which the stub maps to a
+    # successful run) rather than run()+park() -- issue #85.
+    result = runner.invoke(cli_module.cli,
+                           ["run-migration", "--namespace", "ok_ns", "--wait-for-start"])
+    assert result.exit_code == 0
 
 
 def test_run_migration_kubeconfig_flag(runner):
