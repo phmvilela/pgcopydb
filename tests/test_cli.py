@@ -327,6 +327,63 @@ def test_source_largeobjects_output_dir_falls_back_to_env(runner, monkeypatch):
     assert _StubLobsCollector.last_kwargs["output_dir"] == "/tmp/pgcyan-out"
 
 
+# The in-cluster collector Job carries only the pgcopydb-style PGCOPYDB_SOURCE_PGURI
+# (the shared `pgcyan-db-uris` Secret), not the discrete PG_SOURCE_* vars -- so the
+# metrics/lobs commands must derive their psycopg2 connection from that URI,
+# percent-decoding userinfo and honouring the URI's sslmode.
+def test_source_pg_metrics_connection_from_pguri(runner, monkeypatch):
+    monkeypatch.setenv(
+        "PGCOPYDB_SOURCE_PGURI",
+        "postgres://us%40er:p%3Aw@db.example.com:6432/ok_db?sslmode=require",
+    )
+    result = runner.invoke(cli_module.cli, ["source-pg-metrics"])
+    assert result.exit_code == 0
+    k = _StubMetricsCollector.last_kwargs
+    assert k["host"] == "db.example.com"
+    assert k["port"] == 6432
+    assert k["user"] == "us@er"          # %40 decoded
+    assert k["password"] == "p:w"        # %3A decoded
+    assert k["database"] == "ok_db"
+    assert k["sslmode"] == "require"
+
+
+def test_source_largeobjects_connection_from_pguri(runner, monkeypatch):
+    monkeypatch.setenv(
+        "PGCOPYDB_SOURCE_PGURI",
+        "postgres://u:s@lob.example.com:5555/ok_db?sslmode=verify-full",
+    )
+    result = runner.invoke(cli_module.cli, ["source-largeobjects"])
+    assert result.exit_code == 0
+    k = _StubLobsCollector.last_kwargs
+    assert k["host"] == "lob.example.com"
+    assert k["port"] == 5555
+    assert k["sslmode"] == "verify-full"
+
+
+def test_source_pg_metrics_explicit_flag_overrides_pguri(runner, monkeypatch):
+    monkeypatch.setenv(
+        "PGCOPYDB_SOURCE_PGURI",
+        "postgres://u:s@uri-host:5432/uri_db?sslmode=require",
+    )
+    runner.invoke(cli_module.cli, ["source-pg-metrics", "--database", "ok_db",
+                                   "--host", "flag-host"])
+    k = _StubMetricsCollector.last_kwargs
+    assert k["host"] == "flag-host"      # explicit flag beats the URI
+    assert k["database"] == "ok_db"
+
+
+def test_source_pg_metrics_falls_back_to_discrete_env(runner, monkeypatch):
+    # No PGCOPYDB_SOURCE_PGURI -> the discrete PG_SOURCE_* path is unchanged.
+    monkeypatch.delenv("PGCOPYDB_SOURCE_PGURI", raising=False)
+    monkeypatch.setenv("PG_SOURCE_HOST", "legacy-host")
+    monkeypatch.setenv("PG_SOURCE_DATABASE", "ok_db")
+    result = runner.invoke(cli_module.cli, ["source-pg-metrics"])
+    assert result.exit_code == 0
+    k = _StubMetricsCollector.last_kwargs
+    assert k["host"] == "legacy-host"
+    assert k["sslmode"] is None          # unset -> connect() omits it
+
+
 def test_plan_exit_zero_on_success(runner):
     result = runner.invoke(cli_module.cli, ["plan", "--output-dir", "ok_dir"])
     assert result.exit_code == 0

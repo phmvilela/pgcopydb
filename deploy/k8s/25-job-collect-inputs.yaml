@@ -18,14 +18,16 @@
 #
 # It replaces the illustrative stub in 11-configmap-inputs.yaml with real data.
 #
-# DB auth: reads PG_SOURCE_* (+ PGSSLMODE) from the `pgcyan-source-pg` Secret,
+# DB auth: reads the single pgcopydb-style `PGCOPYDB_SOURCE_PGURI` from the
+# shared `pgcyan-db-uris` Secret (the same Secret the controller/phase pods use),
 # created out-of-band (never in git):
-#   kubectl create secret generic pgcyan-source-pg -n pgcyan-migration \
-#     --from-literal=PG_SOURCE_HOST=... --from-literal=PG_SOURCE_PORT=5432 \
-#     --from-literal=PG_SOURCE_USER=... --from-literal=PG_SOURCE_PASSWORD=... \
-#     --from-literal=PG_SOURCE_DATABASE=... --from-literal=PGSSLMODE=require
-# (Azure Postgres requires TLS -> PGSSLMODE=require. Prefer Workload Identity /
-# an Entra token over a static password once the CLI supports it.)
+#   kubectl create secret generic pgcyan-db-uris -n pgcyan-migration \
+#     --from-literal=PGCOPYDB_SOURCE_PGURI="postgres://user:pw@host:5432/db?sslmode=require" \
+#     --from-literal=PGCOPYDB_TARGET_PGURI="postgres://user:pw@host:5432/db?sslmode=require"
+# The collectors are psycopg2-based and accept this URI via
+# `pg_cyan.postgres.conn.source_conn_defaults` (URI preferred, else PG_SOURCE_*);
+# the URI's `sslmode=require` is honoured (Azure Postgres requires TLS). Prefer
+# Workload Identity / an Entra token over a static password once the CLI supports it.
 # ---------------------------------------------------------------------------
 apiVersion: batch/v1
 kind: Job
@@ -62,7 +64,7 @@ spec:
               --dry-run=client -o yaml | kubectl apply -f -
           envFrom:
             - secretRef:
-                name: pgcyan-source-pg   # PG_SOURCE_* (+ PGSSLMODE)
+                name: pgcyan-db-uris   # PGCOPYDB_SOURCE_PGURI (+ TARGET)
           volumeMounts:
             - name: work
               mountPath: /work

@@ -108,6 +108,7 @@ class PgCyanMetrics:
         database: str,
         timeout: int = 30,
         output_dir: str = ".",
+        sslmode: Optional[str] = None,
     ):
         """
         Initialize the metrics collector with connection parameters.
@@ -120,6 +121,8 @@ class PgCyanMetrics:
             database: Source database name
             timeout: Connection timeout in seconds
             output_dir: Directory the JSON output/error file is written to
+            sslmode: libpq sslmode (e.g. ``require``); omitted when ``None`` so
+                libpq/psycopg2 applies its own default.
         """
         self.host = host
         self.port = port
@@ -128,6 +131,7 @@ class PgCyanMetrics:
         self.database = database
         self.timeout = timeout
         self.output_dir = output_dir
+        self.sslmode = sslmode
         self.conn = None
         self.errors: List[str] = []
 
@@ -165,7 +169,7 @@ class PgCyanMetrics:
             True if connected, False otherwise
         """
         try:
-            self.conn = psycopg2.connect(
+            conn_kwargs = dict(
                 host=self.host,
                 port=self.port,
                 user=self.user,
@@ -173,6 +177,9 @@ class PgCyanMetrics:
                 database=self.database,
                 connect_timeout=self.timeout,
             )
+            if self.sslmode:
+                conn_kwargs["sslmode"] = self.sslmode
+            self.conn = psycopg2.connect(**conn_kwargs)
             self._log_event(
                 "connection",
                 "success",

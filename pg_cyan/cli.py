@@ -30,6 +30,7 @@ from pg_cyan.parameters import PgCyanParameters
 from pg_cyan.planner import PgCyanPlanner
 from pg_cyan.predata import PgCyanPreData
 from pg_cyan.preflight import PgCyanPreflight
+from pg_cyan.postgres.conn import _source_default
 
 
 @click.group()
@@ -108,16 +109,19 @@ def source_parameters(host: str, port: int, user: str, password: str,
 
 
 @cli.command(name="source-pg-metrics")
-@click.option("--host", default=lambda: os.getenv("PG_SOURCE_HOST", "localhost"),
-              show_default="$PG_SOURCE_HOST", help="Source PostgreSQL host.")
-@click.option("--port", type=int, default=lambda: int(os.getenv("PG_SOURCE_PORT", "5432")),
-              show_default="$PG_SOURCE_PORT", help="Source PostgreSQL port.")
-@click.option("--user", default=lambda: os.getenv("PG_SOURCE_USER", "postgres"),
-              show_default="$PG_SOURCE_USER", help="Source database user.")
-@click.option("--password", default=lambda: os.getenv("PG_SOURCE_PASSWORD", ""),
-              help="Source database password (prefer $PG_SOURCE_PASSWORD).")
-@click.option("--database", default=lambda: os.getenv("PG_SOURCE_DATABASE", "postgres"),
-              show_default="$PG_SOURCE_DATABASE", help="Source database name.")
+@click.option("--host", default=_source_default("host"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_HOST", help="Source PostgreSQL host.")
+@click.option("--port", type=int, default=_source_default("port"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_PORT", help="Source PostgreSQL port.")
+@click.option("--user", default=_source_default("user"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_USER", help="Source database user.")
+@click.option("--password", default=_source_default("password"),
+              help="Source database password (prefer $PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_PASSWORD).")
+@click.option("--database", default=_source_default("database"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_DATABASE", help="Source database name.")
+@click.option("--sslmode", default=_source_default("sslmode"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PGSSLMODE",
+              help="libpq sslmode (e.g. require); omitted if unset.")
 @click.option("--timeout", type=int,
               default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
               show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Connection timeout (seconds).")
@@ -125,7 +129,7 @@ def source_parameters(host: str, port: int, user: str, password: str,
               show_default="$PG_OUTPUT_DIR",
               help="Directory for source-pg-metrics[-errors].json.")
 def source_pg_metrics(host: str, port: int, user: str, password: str,
-                      database: str, timeout: int, output_dir: str) -> None:
+                      database: str, sslmode: str, timeout: int, output_dir: str) -> None:
     """Collect source database metrics useful for migration planning.
 
     Writes ``source-pg-metrics.json`` on success, or
@@ -134,6 +138,7 @@ def source_pg_metrics(host: str, port: int, user: str, password: str,
     collector = PgCyanMetrics(
         host=host, port=port, user=user, password=password,
         database=database, timeout=timeout, output_dir=output_dir,
+        sslmode=sslmode or None,
     )
     try:
         summary = collector.collect()
@@ -146,16 +151,19 @@ def source_pg_metrics(host: str, port: int, user: str, password: str,
 
 
 @cli.command(name="source-largeobjects")
-@click.option("--host", default=lambda: os.getenv("PG_SOURCE_HOST", "localhost"),
-              show_default="$PG_SOURCE_HOST", help="Source PostgreSQL host.")
-@click.option("--port", type=int, default=lambda: int(os.getenv("PG_SOURCE_PORT", "5432")),
-              show_default="$PG_SOURCE_PORT", help="Source PostgreSQL port.")
-@click.option("--user", default=lambda: os.getenv("PG_SOURCE_USER", "postgres"),
-              show_default="$PG_SOURCE_USER", help="Source database user.")
-@click.option("--password", default=lambda: os.getenv("PG_SOURCE_PASSWORD", ""),
-              help="Source database password (prefer $PG_SOURCE_PASSWORD).")
-@click.option("--database", default=lambda: os.getenv("PG_SOURCE_DATABASE", "postgres"),
-              show_default="$PG_SOURCE_DATABASE", help="Source database name.")
+@click.option("--host", default=_source_default("host"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_HOST", help="Source PostgreSQL host.")
+@click.option("--port", type=int, default=_source_default("port"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_PORT", help="Source PostgreSQL port.")
+@click.option("--user", default=_source_default("user"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_USER", help="Source database user.")
+@click.option("--password", default=_source_default("password"),
+              help="Source database password (prefer $PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_PASSWORD).")
+@click.option("--database", default=_source_default("database"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PG_SOURCE_DATABASE", help="Source database name.")
+@click.option("--sslmode", default=_source_default("sslmode"),
+              show_default="$PGCOPYDB_SOURCE_PGURI or $PGSSLMODE",
+              help="libpq sslmode (e.g. require); omitted if unset.")
 @click.option("--timeout", type=int,
               default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
               show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Connection timeout (seconds).")
@@ -163,7 +171,7 @@ def source_pg_metrics(host: str, port: int, user: str, password: str,
               show_default="$PG_OUTPUT_DIR",
               help="Directory for source-pg-largeobjects[-errors].json.")
 def source_largeobjects(host: str, port: int, user: str, password: str,
-                        database: str, timeout: int, output_dir: str) -> None:
+                        database: str, sslmode: str, timeout: int, output_dir: str) -> None:
     """Count the source database's large objects and write the count to JSON.
 
     Writes ``source-pg-largeobjects.json`` on success, or
@@ -172,6 +180,7 @@ def source_largeobjects(host: str, port: int, user: str, password: str,
     collector = PgCyanLobs(
         host=host, port=port, user=user, password=password,
         database=database, timeout=timeout, output_dir=output_dir,
+        sslmode=sslmode or None,
     )
     try:
         summary = collector.collect()

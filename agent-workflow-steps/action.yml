@@ -3,11 +3,17 @@ description: >
   Agent-authored steps run by the "Secure Agents Playground" workflow to test
   changes against the REAL AKS cluster before promoting them to the production
   workflows (which need a human-approved PR). The agent edits this file freely
-  and re-triggers the playground to iterate. It currently exercises the
-  controller wait-to-start mode (issue #85): provision the controller PARKED
-  pre-snapshot, assert `GET /status` shows `waiting-to-start` with no snapshot,
-  `POST /start`, then assert the snapshot is established and the (planner-only,
-  fast) walk succeeds -- then tear everything down.
+  and re-triggers the playground to iterate.
+
+  CURRENT TEST -- phase -2 collector reads the shared `pgcyan-db-uris` Secret:
+  the collect-inputs Job (deploy/k8s/25-job-collect-inputs.yaml) used to require
+  a separate `pgcyan-source-pg` Secret (PG_SOURCE_* keys) that the workflow no
+  longer creates -> CreateContainerConfigError. The fix points it at the single
+  pgcopydb-style `pgcyan-db-uris` Secret (PGCOPYDB_SOURCE_PGURI) and teaches the
+  psycopg2-based collectors to accept that URI (pg_cyan.postgres.conn). This job
+  stands up ONLY that collector against the real source DB and asserts it
+  connects (TLS via the URI's sslmode), runs both collectors, and publishes the
+  `pgcyan-planner-inputs` ConfigMap -- then tears everything down.
 
   Credentials are read from `env` (secrets/vars mapped in the calling workflow),
   since composite actions cannot read the `secrets` context directly. `NS` and
@@ -18,3 +24,124 @@ runs:
     - name: Resolve the pgcyan image (commit short SHA)
       shell: bash
       run: echo "PGCYAN_IMAGE=${ACR_NAME}.azurecr.io/pgcyan:$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+    - name: Azure login (OIDC, passwordless)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    # Feature-branch commits have no image until build.yml publishes one; ensure
+    # the tag exists before the pod tries to pull it (else ImagePullBackOff).
+    - name: Ensure the commit's image is published (build if missing)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        sha="$(git rev-parse --short HEAD)"
+        echo "Required image: ${ACR_NAME}.azurecr.io/pgcyan:${sha}"
+        if az acr repository show --name "$ACR_NAME" --image "pgcyan:${sha}" >/dev/null 2>&1; then
+          echo "Image already present -- nothing to build."; exit 0
+        fi
+        echo "Image pgcyan:${sha} not found; dispatching Build on ${GITHUB_REF_NAME} ..."
+        gh workflow run build.yml --ref "$GITHUB_REF_NAME"
+        timeout=1500; elapsed=0
+        until az acr repository show --name "$ACR_NAME" --image "pgcyan:${sha}" >/dev/null 2>&1; do
+          if [ "$elapsed" -ge "$timeout" ]; then
+            echo "::error::image pgcyan:${sha} still absent after ${timeout}s"; exit 1
+          fi
+          echo "waiting for pgcyan:${sha} to publish ... (${elapsed}s)"; sleep 20; elapsed=$((elapsed + 20))
+        done
+        echo "Image pgcyan:${sha} is published."
+
+    - name: Get AKS credentials
+      uses: azure/aks-set-context@v4
+      with:
+        resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+        cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+    - name: Ensure namespace + RBAC + work-dir PVC
+      shell: bash
+      run: |
+        set -euo pipefail
+        kubectl apply -f deploy/k8s/00-namespace.yaml
+        kubectl apply -f deploy/k8s/01-rbac.yaml
+        kubectl apply -f deploy/k8s/20-pvc-workdir.yaml
+
+    # The single pgcopydb-style Secret the collector (and the controller/phase
+    # pods) read. Build the URIs from the mapped PG_*_* env, URL-encoding userinfo.
+    - name: Create/refresh DB Secret (SOURCE + TARGET PGURIs)
+      shell: bash
+      run: |
+        set -euo pipefail
+        enc() { python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+        sport="${PG_SOURCE_PORT:-5432}"; tport="${PG_TARGET_PORT:-5432}"
+        su="$(enc "$PG_SOURCE_USER")"; sp="$(enc "$PG_SOURCE_PASSWORD")"
+        tu="$(enc "$PG_TARGET_USER")"; tp="$(enc "$PG_TARGET_PASSWORD")"
+        source_uri="postgres://${su}:${sp}@${PG_SOURCE_HOST}:${sport}/${PG_SOURCE_DATABASE}?sslmode=require"
+        target_uri="postgres://${tu}:${tp}@${PG_TARGET_HOST}:${tport}/${PG_TARGET_DATABASE}?sslmode=require"
+        kubectl create secret generic pgcyan-db-uris -n "$NS" \
+          --from-literal=PGCOPYDB_SOURCE_PGURI="$source_uri" \
+          --from-literal=PGCOPYDB_TARGET_PGURI="$target_uri" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+    # Clean slate: drop any collector Job / published inputs from a prior run so
+    # this run re-creates them from scratch.
+    - name: Clear prior collector run
+      shell: bash
+      run: |
+        set -euo pipefail
+        kubectl delete job pgcyan-collect-inputs -n "$NS" --ignore-not-found --wait=true || true
+        kubectl delete configmap pgcyan-planner-inputs -n "$NS" --ignore-not-found || true
+
+    - name: Phase -2 -- run the collector against the real source DB (barrier)
+      shell: bash
+      run: |
+        set -euo pipefail
+        wait_job() {
+          local job="$1" timeout="${2:-600}" elapsed=0 done_s fail_s
+          while true; do
+            done_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+            fail_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+            [ "$done_s" = "True" ] && { echo "job/$job Complete"; return 0; }
+            [ "$fail_s" = "True" ] && { echo "::error::job/$job Failed"; return 1; }
+            [ "$elapsed" -ge "$timeout" ] && { echo "::error::job/$job timed out after ${timeout}s"; return 1; }
+            sleep 10; elapsed=$((elapsed + 10))
+          done
+        }
+        envsubst '${PGCYAN_IMAGE}' < deploy/k8s/25-job-collect-inputs.yaml | kubectl apply -f -
+        wait_job pgcyan-collect-inputs 600
+
+    # Job-complete already proves the collector connected (TLS) + published; this
+    # confirms the ConfigMap actually carries both planner inputs as valid JSON.
+    - name: Assert planner inputs were published
+      shell: bash
+      run: |
+        set -euo pipefail
+        kubectl get configmap pgcyan-planner-inputs -n "$NS" -o json > /tmp/planner-inputs.json
+        python3 - <<'PY'
+        import json
+        cm = json.load(open("/tmp/planner-inputs.json"))
+        data = cm.get("data", {})
+        for key in ("source-pg-metrics.json", "source-pg-largeobjects.json"):
+            assert key in data and data[key].strip(), f"missing/empty {key}"
+            json.loads(data[key])  # must be valid JSON
+        print("planner-inputs OK ->", ", ".join(sorted(data)))
+        PY
+
+    - name: Dump collector diagnostics on failure
+      if: failure()
+      shell: bash
+      run: |
+        echo "=== pods ==="; kubectl get pods -n "$NS" -l pgcyan.dev/phase=collect-inputs -o wide || true
+        echo "=== collector logs ==="; kubectl logs -n "$NS" -l job-name=pgcyan-collect-inputs --tail=-1 || true
+        echo "=== events ==="; kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -30 || true
+
+    - name: Teardown
+      if: always()
+      shell: bash
+      run: |
+        kubectl delete job pgcyan-collect-inputs -n "$NS" --ignore-not-found --wait=false || true
+        kubectl delete configmap pgcyan-planner-inputs -n "$NS" --ignore-not-found || true
