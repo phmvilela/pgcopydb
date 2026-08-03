@@ -1,6 +1,9 @@
-# pgcyan control-plane API runtime deps (issues #86, #87).
+# pgcyan control-plane API runtime deps (issues #86, #87, #88).
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 # Provisioning: apply the shared deploy/k8s manifests via the in-cluster client.
 kubernetes==30.1.0
 PyYAML==6.0.1
+# Clash detection: probe the source for a pre-existing pgcyan slot/publication
+# (same driver the migration image uses).
+psycopg2-binary==2.9.9

@@ -1,6 +1,6 @@
-"""Request/response models for the control-plane API (issue #87)."""
+"""Request/response models for the control-plane API (issues #87, #88)."""
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -35,6 +35,19 @@ class DbConn(BaseModel):
         auth = f"{user}:{pw}@" if (self.user or self.password) else ""
         return f"postgres://{auth}{self.host}:{self.port}/{self.database}?sslmode={self.sslmode}"
 
+    def endpoint(self) -> str:
+        """Credential-free ``host:port/db`` label for logs and the registry.
+
+        Never includes user/password -- the registry must not store secrets.
+        """
+        if self.uri:
+            parts = urlsplit(self.uri)
+            host = parts.hostname or ""
+            port = parts.port or 5432
+            db = parts.path.lstrip("/")
+            return f"{host}:{port}/{db}"
+        return f"{self.host}:{self.port}/{self.database}"
+
 
 class MigrationRequest(BaseModel):
     """Body of ``POST /migrations``: source + target, optional shard count."""
@@ -48,3 +61,14 @@ class MigrationCreated(BaseModel):
     id: str
     namespace: str
     state: str = "waiting-to-start"
+
+
+class MigrationRecord(BaseModel):
+    """A registry row as returned by ``GET /migrations`` (no credentials)."""
+    id: str
+    namespace: str
+    source: str
+    target: str
+    state: str
+    created_at: str
+    updated_at: str

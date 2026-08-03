@@ -80,8 +80,30 @@ kubectl exec "$POD" -n "$NS" -- python -c \
 #   -> {"state":"waiting-to-start", "snapshot": null, ...}   (no slot on the source yet)
 ```
 
-> **Concurrency caveat:** provisioned controllers use the default `pgcyan_slot` /
-> `pgcyan_pub` names (kept identical to the integration test — no drift). Two
-> migrations against the **same source** would collide on the slot **at start**
-> (not at provision). Per-migration slot naming / clash detection is #88.
+### Registry, singleton & clash detection (issue #88)
+
+Provisioned migrations are tracked in a SQLite registry on the RWO PVC
+(`/data/registry.db`), which survives API pod restarts and enforces **one active
+control-plane migration at a time**.
+
+```bash
+# List tracked migrations (newest first; no credentials).
+curl -fsS localhost:8080/migrations
+
+# A second POST while one is active -> 409 (singleton).
+curl -sS -o /dev/null -w '%{http_code}\n' -XPOST localhost:8080/migrations \
+  -H 'content-type: application/json' -d '{ ...same body... }'      # -> 409
+
+# A source already carrying pgcyan_slot / pgcyan_pub -> 409 (clash).
+# Registry persists across a pod restart:
+kubectl delete pod -n pgcyan-system -l app.kubernetes.io/component=control-plane
+# after the new pod is Running, the record is still listed:
+curl -fsS localhost:8080/migrations
+```
+
+> **Slot naming:** provisioned controllers still use the default `pgcyan_slot` /
+> `pgcyan_pub` names (kept identical to the integration test — no drift). Rather
+> than per-migration slot names, the control plane enforces **one active
+> migration at a time** (singleton) and refuses a source that already carries
+> those artifacts (clash) — so concurrent runs can't collide on the slot.
 

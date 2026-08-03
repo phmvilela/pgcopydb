@@ -21,13 +21,11 @@ def test_health_returns_200_ok():
 
 def test_health_reports_data_dir(monkeypatch, tmp_path):
     # A mounted, writable /data (here a tmp dir) is reported as writable.
-    monkeypatch.setenv("PGCYAN_DATA_DIR", str(tmp_path))
-    import importlib
-
+    # Patch the resolved module attribute rather than reloading the module:
+    # reloading swaps out app/get_* objects and pollutes other tests' overrides.
     import app.main as main
-    importlib.reload(main)
-    local = TestClient(main.app)
-    body = local.get("/health").json()
+
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    body = TestClient(main.app).get("/health").json()
     assert body["data_dir"] == str(tmp_path)
     assert body["data_dir_writable"] is True
-    importlib.reload(main)  # restore default for other tests

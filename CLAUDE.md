@@ -190,9 +190,17 @@ sandboxes on demand — distinct from a single migration run. Two new trees:
 
 - **`control-plane/api/`** — a standalone **FastAPI** service (its own
   `requirements.txt` + `Dockerfile`, image `pgcyan-control-plane`), NOT part of
-  the `pg_cyan` package or the heavy migration image. `GET /health` (#86) +
+  the `pg_cyan` package or the heavy migration image. `GET /health` (#86);
   `POST /migrations` (#87, provisions a per-migration namespace with the
-  controller parked in wait-to-start); registry/start-status-teardown are #88–#90.
+  controller parked in wait-to-start) + `GET /migrations` (#88, lists tracked
+  migrations); start-status-teardown are #89–#90. A **node-local SQLite
+  registry** on the RWO PVC (`app/registry.py`) tracks migrations and enforces
+  **one active control-plane migration at a time** (409) via a partial unique
+  index — the DB, not app-level check-then-act, picks the race winner, and a
+  terminal state frees the slot so a crash can't wedge it; a best-effort,
+  injectable **source probe** (`app/source_probe.py`, psycopg2) rejects a source
+  already carrying the pgcyan slot/publication (409). The registry stores only
+  `host:port/db` labels — **never credentials** (those live in the k8s Secret).
   Its tests live under `control-plane/api/tests/` and are **not** collected by
   the repo-root `pytest` (run them from `control-plane/api`). **Built from the
   repo-root context** (like the migration image) so it can bake in `deploy/k8s`:

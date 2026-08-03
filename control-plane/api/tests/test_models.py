@@ -15,6 +15,15 @@ def test_dbconn_uri_passthrough_wins():
     assert c.to_pguri() == "postgres://u:p@h:5432/db?sslmode=require"
 
 
+def test_endpoint_label_omits_credentials():
+    # from parts
+    assert DbConn(host="h", port=6432, user="u", password="p",
+                  database="db").endpoint() == "h:6432/db"
+    # from a uri (default port when absent)
+    assert DbConn(uri="postgres://u:p@h/db").endpoint() == "h:5432/db"
+    assert DbConn(uri="postgres://u:p@h:7000/db?sslmode=require").endpoint() == "h:7000/db"
+
+
 def test_dbconn_requires_uri_or_parts():
     with pytest.raises(ValidationError):
         DbConn(host="h")  # missing user + database

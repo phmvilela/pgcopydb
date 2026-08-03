@@ -28,6 +28,20 @@ import yaml
 #: The fixed namespace baked into deploy/k8s that we retarget per migration.
 NAMESPACE_TOKEN = "pgcyan-migration"
 
+#: Per-migration namespace naming, shared with the endpoint so it can reserve the
+#: registry row under the same name the provisioner will create.
+NAMESPACE_PREFIX = "pgcyan-mig-"
+
+
+def new_migration_id() -> str:
+    """A short, unique migration id."""
+    return uuid.uuid4().hex[:10]
+
+
+def namespace_for(migration_id: str) -> str:
+    """The per-migration namespace for a given migration id."""
+    return f"{NAMESPACE_PREFIX}{migration_id}"
+
 #: Manifests applied to stand up a parked migration (order matters: identities +
 #: storage + secret before the controller that consumes them).
 RBAC_MANIFEST = "01-rbac.yaml"
@@ -96,8 +110,8 @@ class Provisioner:
                 "control plane has no migration image configured "
                 "(set PGCYAN_MIGRATION_IMAGE on the API deployment)")
 
-        mid = migration_id or uuid.uuid4().hex[:10]
-        ns = f"pgcyan-mig-{mid}"
+        mid = migration_id or new_migration_id()
+        ns = namespace_for(mid)
         labels = {
             "app.kubernetes.io/part-of": "pgcyan",
             "app.kubernetes.io/component": "migration",
