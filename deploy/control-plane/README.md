@@ -42,6 +42,8 @@ kubectl kustomize deploy/control-plane \
 kubectl get pods -n pgcyan-system
 kubectl port-forward -n pgcyan-system svc/pgcyan-control-plane-api 8080:80 &
 curl -fsS localhost:8080/health          # -> {"status":"ok",...}
+# Or explore + drive the whole API interactively in a browser (#107):
+#   http://localhost:8080/docs   (Swagger UI -- Try it out hits the real cluster)
 
 # SA can provision namespaces + namespaced resources
 SA=system:serviceaccount:pgcyan-system:pgcyan-control-plane

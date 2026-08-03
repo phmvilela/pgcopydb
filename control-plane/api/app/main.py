@@ -1,5 +1,5 @@
 """
-pgcyan control-plane API (issues #86, #87, #88).
+pgcyan control-plane API (issues #86-#90; rich OpenAPI/Swagger #107).
 
 The control plane is a single, long-lived FastAPI service in the fixed
 ``pgcyan-system`` namespace. It provisions a per-migration namespace with the
@@ -69,7 +69,50 @@ DATA_DIR = os.getenv("PGCYAN_DATA_DIR", "/data")
 MANIFESTS_DIR = os.getenv("PGCYAN_MANIFESTS_DIR", "/app/deploy/k8s")
 REGISTRY_PATH = os.path.join(DATA_DIR, "registry.db")
 
-app = FastAPI(title="pgcyan control-plane API", version="0.1.0")
+API_DESCRIPTION = """\
+The **pgcyan control plane** provisions and drives per-migration PostgreSQL
+migration sandboxes on demand (design #84).
+
+Each migration gets its **own Kubernetes namespace** with the folded controller
+parked pre-snapshot; this API starts it, reports aggregated status, and tears it
+down -- enforcing **one active migration at a time** (a SQLite registry on the
+control plane's PVC is the arbiter).
+
+**Lifecycle**
+
+1. `POST /migrations` -- provision a parked sandbox
+2. `POST /migrations/{id}/start` -- take the snapshot and walk the DAG
+3. `GET  /migrations/{id}/status` -- poll aggregated controller + registry state
+4. `POST /migrations/{id}/done` -- stop CDC gracefully, delete the namespace
+
+> ⚠️ **This drives a real cluster.** Using **Try it out** creates and deletes real
+> Kubernetes namespaces, and `start` establishes a real replication slot on the
+> source database. Point it at a disposable dev environment.
+"""
+
+TAGS_METADATA = [
+    {"name": "migrations",
+     "description": "Provision, start, observe, and tear down per-migration sandboxes."},
+    {"name": "health", "description": "Liveness / readiness."},
+]
+
+app = FastAPI(
+    title="pgcyan control-plane API",
+    summary="Provision and drive on-demand PostgreSQL migration sandboxes.",
+    version="0.1.0",
+    description=API_DESCRIPTION,
+    openapi_tags=TAGS_METADATA,
+)
+
+
+def _error(description: str, example: str) -> dict:
+    """An OpenAPI error-response entry (a FastAPI ``responses=`` value).
+
+    Documents a failure code with an example ``{"detail": ...}`` body so the
+    schema shows what each error looks like without changing behaviour.
+    """
+    return {"description": description,
+            "content": {"application/json": {"example": {"detail": example}}}}
 
 
 def _now() -> str:
@@ -112,7 +155,7 @@ def get_teardown() -> Teardown:
     return Teardown(K8sApplier())
 
 
-@app.get("/health")
+@app.get("/health", tags=["health"], summary="Liveness / readiness probe")
 def health() -> dict:
     """Liveness/readiness probe target (see #86)."""
     return {
@@ -123,13 +166,32 @@ def health() -> dict:
     }
 
 
-@app.get("/migrations", response_model=List[MigrationRecord])
+@app.get("/migrations", tags=["migrations"], summary="List tracked migrations",
+         response_model=List[MigrationRecord])
 def list_migrations(registry: Registry = Depends(get_registry)) -> List[MigrationRecord]:
     """List tracked migrations (newest first), credentials never included."""
     return [MigrationRecord(**row) for row in registry.list()]
 
 
-@app.post("/migrations", status_code=201, response_model=MigrationCreated)
+@app.post(
+    "/migrations", status_code=201, tags=["migrations"],
+    summary="Provision a migration sandbox",
+    response_model=MigrationCreated,
+    responses={
+        409: _error(
+            "Another migration is already active (singleton), or the source "
+            "already carries pgcyan replication state (clash).",
+            "a migration is already active (id=a1b2c3d4e5, "
+            "namespace=pgcyan-mig-a1b2c3d4e5, state=running); tear it down "
+            "before starting another"),
+        422: _error("Request body invalid (e.g. neither uri nor host+user+database).",
+                    "provide either 'uri' or host + user + database"),
+        502: _error("Provisioning failed against the cluster.",
+                    "provisioning failed: <kubernetes error>"),
+        503: _error("The control plane has no migration image configured.",
+                    "control plane has no migration image configured "
+                    "(set PGCYAN_MIGRATION_IMAGE on the API deployment)"),
+    })
 def create_migration(
     req: MigrationRequest,
     provisioner: Provisioner = Depends(get_provisioner),
@@ -191,7 +253,19 @@ def _lookup(registry: Registry, migration_id: str) -> dict:
     return row
 
 
-@app.post("/migrations/{migration_id}/start", response_model=MigrationStarted)
+@app.post(
+    "/migrations/{migration_id}/start", tags=["migrations"],
+    summary="Start a provisioned migration",
+    response_model=MigrationStarted,
+    responses={
+        404: _error("No such migration.", "no migration 'a1b2c3d4e5'"),
+        409: _error("The migration already finished.",
+                    "migration a1b2c3d4e5 already finished (state=succeeded)"),
+        502: _error("The controller rejected the start.",
+                    "controller rejected start (HTTP 500): {...}"),
+        503: _error("The controller is unreachable.",
+                    "controller in pgcyan-mig-a1b2c3d4e5 is unreachable: <error>"),
+    })
 def start_migration(
     migration_id: str,
     registry: Registry = Depends(get_registry),
@@ -226,7 +300,11 @@ def start_migration(
         message=body.get("message", "start accepted"))
 
 
-@app.get("/migrations/{migration_id}/status", response_model=MigrationStatus)
+@app.get(
+    "/migrations/{migration_id}/status", tags=["migrations"],
+    summary="Aggregated migration status",
+    response_model=MigrationStatus,
+    responses={404: _error("No such migration.", "no migration 'a1b2c3d4e5'")})
 def migration_status(
     migration_id: str,
     registry: Registry = Depends(get_registry),
@@ -263,7 +341,15 @@ def migration_status(
         controller_reachable=reachable, controller=controller_body)
 
 
-@app.post("/migrations/{migration_id}/done", response_model=MigrationDone)
+@app.post(
+    "/migrations/{migration_id}/done", tags=["migrations"],
+    summary="Tear down a migration",
+    response_model=MigrationDone,
+    responses={
+        404: _error("No such migration.", "no migration 'a1b2c3d4e5'"),
+        502: _error("Teardown failed against the cluster.",
+                    "teardown of pgcyan-mig-a1b2c3d4e5 failed: <error>"),
+    })
 def done_migration(
     migration_id: str,
     registry: Registry = Depends(get_registry),

@@ -4,6 +4,25 @@ FastAPI service for the pgcyan control plane (design #84). It runs in the fixed
 `pgcyan-system` namespace and provisions/observes per-migration namespaces via
 its in-cluster ServiceAccount.
 
+## Interactive docs (Swagger / OpenAPI)
+
+The API self-documents (rich spec, #107):
+- **Swagger UI** — `/docs` (with *Try it out*)
+- **ReDoc** — `/redoc`
+- **raw spec** — `/openapi.json`
+
+Reach the deployed API over a port-forward and open Swagger in a browser:
+
+```bash
+kubectl port-forward -n pgcyan-system svc/pgcyan-control-plane-api 8080:80
+# → http://localhost:8080/docs
+```
+
+> ⚠️ **Try it out drives the real cluster.** `POST /migrations` creates a real
+> namespace and `…/start` opens a real replication slot on the source. Use a
+> disposable dev environment. (Swagger UI's JS/CSS load from a CDN, so the
+> browser opening `/docs` needs internet.)
+
 ## Endpoints
 
 | Method | Path | What |

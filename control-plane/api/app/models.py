@@ -1,8 +1,8 @@
-"""Request/response models for the control-plane API (issues #87, #88)."""
+"""Request/response models for the control-plane API (issues #87, #88, #107)."""
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class DbConn(BaseModel):
@@ -51,9 +51,17 @@ class DbConn(BaseModel):
 
 class MigrationRequest(BaseModel):
     """Body of ``POST /migrations``: source + target, optional shard count."""
-    source: DbConn
-    target: DbConn
+    source: DbConn = Field(description="the source Postgres to migrate FROM")
+    target: DbConn = Field(description="the target Postgres to migrate TO")
     shards: Optional[int] = Field(default=None, ge=1, description="copy shard count; planner default if omitted")
+
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "source": {"host": "src.postgres.database.azure.com", "port": 5432,
+                   "user": "migrator", "password": "s3cret", "database": "appdb"},
+        "target": {"uri": "postgres://migrator:s3cret@tgt.postgres.database.azure.com"
+                          ":5432/appdb?sslmode=require"},
+        "shards": 4,
+    }]})
 
 
 class MigrationCreated(BaseModel):
@@ -61,6 +69,10 @@ class MigrationCreated(BaseModel):
     id: str
     namespace: str
     state: str = "waiting-to-start"
+
+    model_config = ConfigDict(json_schema_extra={"examples": [
+        {"id": "a1b2c3d4e5", "namespace": "pgcyan-mig-a1b2c3d4e5",
+         "state": "waiting-to-start"}]})
 
 
 class MigrationRecord(BaseModel):
@@ -73,6 +85,14 @@ class MigrationRecord(BaseModel):
     created_at: str
     updated_at: str
 
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "id": "a1b2c3d4e5", "namespace": "pgcyan-mig-a1b2c3d4e5",
+        "source": "src.postgres.database.azure.com:5432/appdb",
+        "target": "tgt.postgres.database.azure.com:5432/appdb",
+        "state": "running",
+        "created_at": "2026-08-03T12:00:00+00:00",
+        "updated_at": "2026-08-03T12:03:21+00:00"}]})
+
 
 class MigrationStarted(BaseModel):
     """Response of ``POST /migrations/{id}/start``."""
@@ -80,6 +100,10 @@ class MigrationStarted(BaseModel):
     namespace: str
     state: str            # registry state after the start call
     message: str
+
+    model_config = ConfigDict(json_schema_extra={"examples": [
+        {"id": "a1b2c3d4e5", "namespace": "pgcyan-mig-a1b2c3d4e5",
+         "state": "running", "message": "migration start accepted"}]})
 
 
 class MigrationDone(BaseModel):
@@ -89,6 +113,10 @@ class MigrationDone(BaseModel):
     state: str = "done"
     graceful: bool
     message: str
+
+    model_config = ConfigDict(json_schema_extra={"examples": [
+        {"id": "a1b2c3d4e5", "namespace": "pgcyan-mig-a1b2c3d4e5", "state": "done",
+         "graceful": True, "message": "stopped CDC and deleted the namespace"}]})
 
 
 class MigrationStatus(BaseModel):
@@ -103,3 +131,10 @@ class MigrationStatus(BaseModel):
     state: str
     controller_reachable: bool
     controller: Optional[dict] = None
+
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "id": "a1b2c3d4e5", "namespace": "pgcyan-mig-a1b2c3d4e5",
+        "state": "running", "controller_reachable": True,
+        "controller": {"state": "running", "ready": True, "snapshot": "00000002-0000002A-1",
+                       "cdc": None, "phases": [{"id": "-1", "status": "succeeded"}],
+                       "errors": []}}]})
