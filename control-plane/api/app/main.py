@@ -16,6 +16,8 @@ Endpoints so far:
 * ``POST /migrations/{id}/start``  -- proxy the controller's ``POST /start`` (#89).
 * ``GET /migrations/{id}/status``  -- aggregate the controller's ``/status`` with
   the registry state (#89).
+* ``POST /migrations/{id}/done``   -- stop CDC gracefully, delete the namespace,
+  free the singleton (#90).
 
 ``PGCYAN_DATA_DIR`` (default ``/data``) is the mounted RWO volume that holds the
 SQLite registry; ``PGCYAN_MANIFESTS_DIR`` (default ``/app/deploy/k8s``) is where
@@ -31,6 +33,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from app.controller_client import ControllerClient, ControllerUnreachable
 from app.models import (
     MigrationCreated,
+    MigrationDone,
     MigrationRecord,
     MigrationRequest,
     MigrationStarted,
@@ -44,6 +47,7 @@ from app.provisioner import (
 )
 from app.registry import Registry
 from app.source_probe import SourceProbe
+from app.teardown import Teardown, TeardownError
 
 #: Controller lifecycle states that are terminal (mirrors the registry's).
 TERMINAL_STATES = ("succeeded", "failed", "halted")
@@ -99,6 +103,13 @@ def get_source_probe() -> SourceProbe:
 def get_controller_client() -> ControllerClient:
     """HTTP client for a migration's in-namespace controller. Overridden in tests."""
     return ControllerClient()
+
+
+def get_teardown() -> Teardown:
+    """Cluster-backed teardown (scale-down + namespace delete). Overridden in tests."""
+    from app.k8s import K8sApplier
+
+    return Teardown(K8sApplier())
 
 
 @app.get("/health")
@@ -250,3 +261,33 @@ def migration_status(
     return MigrationStatus(
         id=migration_id, namespace=row["namespace"], state=state,
         controller_reachable=reachable, controller=controller_body)
+
+
+@app.post("/migrations/{migration_id}/done", response_model=MigrationDone)
+def done_migration(
+    migration_id: str,
+    registry: Registry = Depends(get_registry),
+    teardown: Teardown = Depends(get_teardown),
+) -> MigrationDone:
+    """Tester-driven teardown: stop CDC gracefully, delete the namespace, and
+    mark the migration ``done`` -- freeing the singleton slot (#90).
+
+    Idempotent: a migration already torn down returns 200 without touching the
+    cluster.
+    """
+    row = _lookup(registry, migration_id)
+    if row["state"] == "done":
+        return MigrationDone(id=migration_id, namespace=row["namespace"],
+                             graceful=True, message="already torn down")
+
+    try:
+        result = teardown.teardown(row["namespace"])
+    except TeardownError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    registry.set_state(migration_id, "done", _now())
+    graceful = result["graceful"]
+    message = ("stopped CDC and deleted the namespace" if graceful else
+               "namespace deleted; controller did not confirm a clean stop in time")
+    return MigrationDone(id=migration_id, namespace=row["namespace"],
+                         graceful=graceful, message=message)

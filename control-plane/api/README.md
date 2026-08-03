@@ -13,6 +13,7 @@ its in-cluster ServiceAccount.
 | GET | `/migrations` | list tracked migrations from the registry, newest first — no credentials (#88). |
 | POST | `/migrations/{id}/start` | proxy the controller's `POST /start` so it takes the snapshot and walks the DAG; advances the registry to `running` (#89). Idempotent. **404** unknown id, **409** already finished, **503** controller unreachable. |
 | GET | `/migrations/{id}/status` | aggregate the controller's live `/status` with the registry state; a controller-reported transition is written back (a terminal state frees the singleton slot). Falls back to the registry view when the controller is unreachable (#89). |
+| POST | `/migrations/{id}/done` | teardown: stop CDC gracefully (scale the controller to 0 → SIGTERM), delete the namespace (cascade), mark the registry `done` and free the singleton (#90). Idempotent. **404** unknown id, **502** teardown failure. |
 
 `POST /migrations` body:
 
@@ -39,6 +40,7 @@ control-plane/api/
   app/registry.py        # node-local SQLite registry on the RWO PVC (#88)
   app/source_probe.py    # best-effort source slot/publication clash probe (#88)
   app/controller_client.py  # stdlib-urllib client for the controller API (#89)
+  app/teardown.py        # graceful stop (scale-to-0) + namespace delete (#90)
   requirements.txt       # fastapi, uvicorn, kubernetes, PyYAML, psycopg2-binary
   requirements-dev.txt   # + pytest, httpx
   Dockerfile             # slim, non-root; built from the REPO ROOT context
@@ -81,6 +83,26 @@ dep):
   reported transition is written straight back to the registry; a **terminal
   state frees the singleton slot** (#88). If the controller is unreachable (e.g.
   torn down) the registry view is returned with `controller_reachable=false`.
+
+## Teardown (#90)
+
+`POST /migrations/{id}/done` ends a migration cleanly (`app/teardown.py`):
+1. **Graceful CDC stop** — scale the controller StatefulSet to `0`. That is a real
+   SIGTERM to the pod (honouring its grace period) which, unlike deleting the
+   pod, does **not** respawn it. The controller catches SIGTERM in `park()` and
+   stops `pgcopydb follow` cleanly — no SIGKILL, since the shutdown window is
+   reconciled with the grace period in **#81/#83** (this endpoint's *no-SIGKILL*
+   guarantee is delivered jointly with that change).
+2. **Wait** for the controller pod to terminate — the observable proxy for "CDC
+   stopped, consumer detached". The control plane holds no source credentials to
+   probe the slot directly; the slot itself persists with 0 consumers for cutover
+   (#27), which #83 asserts cluster-side.
+3. **Delete the namespace** (cascade), then mark the registry `done` — freeing the
+   singleton so the next migration can start.
+
+Idempotent (an already-`done` migration is a no-op) and best-effort on the wait:
+if the pod doesn't confirm a clean stop within the window the namespace is still
+deleted, with `graceful=false` surfaced in the response.
 
 ## How provisioning stays drift-free
 

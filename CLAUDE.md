@@ -196,7 +196,10 @@ sandboxes on demand — distinct from a single migration run. Two new trees:
   migrations) + `POST/GET /migrations/{id}/start|status` (#89, proxy the
   controller's `/start` and aggregate its `/status`, reached over the migration
   namespace's headless `pgcyan-controller` Service via stdlib `urllib` —
-  `app/controller_client.py`); teardown is #90. A **node-local SQLite
+  `app/controller_client.py`) + `POST /migrations/{id}/done` (#90, teardown:
+  scale the controller to 0 for a graceful SIGTERM stop of CDC, wait, delete the
+  namespace, mark the registry `done` — `app/teardown.py`; the *no-SIGKILL*
+  guarantee rides on #81/#83's reconciled shutdown window). A **node-local SQLite
   registry** on the RWO PVC (`app/registry.py`) tracks migrations and enforces
   **one active control-plane migration at a time** (409) via a partial unique
   index — the DB, not app-level check-then-act, picks the race winner, and a

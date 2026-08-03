@@ -118,6 +118,28 @@ curl -fsS localhost:8080/migrations/$ID/status
 # ...eventually {"state":"succeeded",...}; the singleton slot is then free.
 ```
 
+### Teardown (issue #90)
+
+```bash
+# Run a migration to CDC-streaming, then tear it down.
+curl -fsS -XPOST localhost:8080/migrations/$ID/done
+#   -> {"id":"...","state":"done","graceful":true,"message":"stopped CDC and ..."}
+
+# 1. No SIGKILL of the follow child -- controller logs a clean stop (needs #81/#83):
+kubectl logs -n pgcyan-mig-$ID -l pgcyan.dev/component=controller --previous \
+  | grep -E 'stopped CDC and exiting park|SIGKILL'
+# 2. Source slot inactive/released (0 active consumers; slot persists for #27).
+# 3. Namespace deleted:
+kubectl get ns pgcyan-mig-$ID          # -> NotFound
+# 4. Registry shows it done; a fresh POST /migrations is accepted again:
+curl -fsS localhost:8080/migrations    # ... "state":"done" ...
+```
+
+> **#81/#83 co-requisite:** the *no-SIGKILL* guarantee (criterion above) is
+> delivered jointly with the reconciled CDC-shutdown window in #81/#83. The
+> teardown path itself (scale-to-0 → wait → delete) reuses the existing SIGTERM
+> mechanism and is independent of that change.
+
 > **Slot naming:** provisioned controllers still use the default `pgcyan_slot` /
 > `pgcyan_pub` names (kept identical to the integration test — no drift). Rather
 > than per-migration slot names, the control plane enforces **one active

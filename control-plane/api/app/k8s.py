@@ -19,6 +19,7 @@ class K8sApplier:
             api_client = client.ApiClient()
         self._api_client = api_client
         self._core = client.CoreV1Api(api_client)
+        self._apps = client.AppsV1Api(api_client)
 
     def create_namespace(self, name: str, labels: Dict[str, str]) -> None:
         from kubernetes import client
@@ -44,3 +45,19 @@ class K8sApplier:
         from kubernetes import utils
 
         utils.create_from_dict(self._api_client, doc)
+
+    # ---------------------------------------------------------- teardown (#90)
+
+    def scale_statefulset(self, namespace: str, name: str, replicas: int) -> None:
+        """Set a StatefulSet's replica count (0 = graceful SIGTERM, no respawn)."""
+        self._apps.patch_namespaced_stateful_set_scale(
+            name, namespace, {"spec": {"replicas": replicas}})
+
+    def count_pods(self, namespace: str, label_selector: str) -> int:
+        """Number of pods in ``namespace`` matching a label selector."""
+        pods = self._core.list_namespaced_pod(namespace, label_selector=label_selector)
+        return len(pods.items)
+
+    def delete_namespace(self, namespace: str) -> None:
+        """Delete a namespace (cascades to everything inside it)."""
+        self._core.delete_namespace(namespace)

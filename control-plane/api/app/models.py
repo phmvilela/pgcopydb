@@ -82,6 +82,15 @@ class MigrationStarted(BaseModel):
     message: str
 
 
+class MigrationDone(BaseModel):
+    """Response of ``POST /migrations/{id}/done`` (issue #90)."""
+    id: str
+    namespace: str
+    state: str = "done"
+    graceful: bool
+    message: str
+
+
 class MigrationStatus(BaseModel):
     """Response of ``GET /migrations/{id}/status`` (issue #89).
 

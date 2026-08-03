@@ -11,9 +11,11 @@ from app.main import (
     get_provisioner,
     get_registry,
     get_source_probe,
+    get_teardown,
 )
 from app.provisioner import Provisioner
 from app.registry import Registry
+from app.teardown import TeardownError
 
 # The real shared manifests the provisioner reads (repo deploy/k8s), so the
 # tests exercise the actual files that ship in the image (no drift).
@@ -77,6 +79,25 @@ class FakeController:
         return self.status_response
 
 
+class FakeTeardown:
+    """Stands in for the cluster teardown -- records namespaces, no real cluster.
+
+    Set ``graceful=False`` to simulate a controller that didn't stop in time, or
+    ``error=True`` to raise ``TeardownError``.
+    """
+
+    def __init__(self):
+        self.torn = []
+        self.graceful = True
+        self.error = False
+
+    def teardown(self, namespace):
+        self.torn.append(namespace)
+        if self.error:
+            raise TeardownError(f"teardown of {namespace} failed")
+        return {"namespace": namespace, "graceful": self.graceful}
+
+
 @pytest.fixture
 def manifests_dir():
     return MANIFESTS_DIR
@@ -106,13 +127,20 @@ def fake_controller():
 
 
 @pytest.fixture
-def client(fake_applier, registry, fake_probe, fake_controller):
+def fake_teardown():
+    """Teardown stand-in; tune .graceful/.error."""
+    return FakeTeardown()
+
+
+@pytest.fixture
+def client(fake_applier, registry, fake_probe, fake_controller, fake_teardown):
     """TestClient with all external-dependency hooks overridden by fakes."""
     app.dependency_overrides[get_provisioner] = lambda: Provisioner(
         MANIFESTS_DIR, "acr.example/pgcyan:test", fake_applier)
     app.dependency_overrides[get_registry] = lambda: registry
     app.dependency_overrides[get_source_probe] = lambda: fake_probe
     app.dependency_overrides[get_controller_client] = lambda: fake_controller
+    app.dependency_overrides[get_teardown] = lambda: fake_teardown
     try:
         yield TestClient(app)
     finally:
