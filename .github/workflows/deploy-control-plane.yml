@@ -1,0 +1,176 @@
+name: Deploy control plane
+
+# Builds the control-plane API image and applies the control-plane manifests to
+# the fixed `pgcyan-system` namespace on AKS -- the repeatable, one-dispatch form
+# of the manual apply in issue #86 (this is issue #91). Distinct from build.yml
+# (which builds the *migration* image) and integration-tests.yml (which stands up
+# a one-off migration in `pgcyan-migration`): here we deploy the long-lived
+# control plane that provisions per-migration namespaces on demand (#87-#90).
+#
+#   deploy : `az acr build` the control-plane image (REPO-ROOT context + the
+#            control-plane Dockerfile, so `deploy/k8s` is baked in), tagged by the
+#            COMMIT SHORT SHA; then `kubectl kustomize deploy/control-plane`
+#            piped through `envsubst` (filling the two image placeholders) into
+#            `kubectl apply`; then rollout + `GET /health`.
+#
+# Two image placeholders are filled at apply time (same convention as deploy/k8s):
+#   ${PGCYAN_CONTROL_PLANE_IMAGE} -- the API image built by THIS run (short SHA).
+#   ${PGCYAN_MIGRATION_IMAGE}     -- the `pgcyan:<tag>` the API stamps into each
+#                                    provisioned controller (#87). Override via the
+#                                    `migration_image_tag` dispatch input (used
+#                                    as-is), else it defaults to this commit's short
+#                                    SHA and is BUILT (dispatch build.yml) if the
+#                                    ACR does not already have it.
+#
+# Azure identity: logs in via passwordless OIDC as the `azure` environment's UAMI
+# (the same federated credential build.yml / integration-tests.yml use -- subject
+# `repo:<org>/<repo>:environment:azure`, hence `environment: azure`). It needs
+# Contributor on the ACR (for `az acr build`'s server-side Tasks run) and cluster
+# access (for `kubectl apply`), both granted by `terraform/aks`.
+#
+# PREREQUISITES:
+#   secrets:   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
+#   variables: AKS_RESOURCE_GROUP / AKS_CLUSTER_NAME
+#              ACR_NAME (optional; defaults to pgcyanacr)
+#
+# `workflow_dispatch` only for now (push-to-main automation is a later step).
+
+on:
+  workflow_dispatch:
+    inputs:
+      migration_image_tag:
+        description: >-
+          Migration image tag the control plane stamps into each provisioned
+          controller (pgcyan:<tag>). Blank = this commit's short SHA.
+        required: false
+        default: ""
+
+permissions:
+  id-token: write   # OIDC token for azure/login
+  contents: read
+  actions: write    # dispatch build.yml if the default migration image is missing
+
+env:
+  NS: pgcyan-system
+  ACR_NAME: ${{ vars.ACR_NAME || 'pgcyanacr' }}
+  CONTROL_PLANE_REPO: pgcyan-control-plane
+  MIGRATION_REPO: pgcyan
+
+jobs:
+  deploy:
+    name: Build + deploy the control plane to pgcyan-system
+    runs-on: ubuntu-latest
+    environment: azure
+    env:
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Guard -- require Azure + AKS config
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        run: |
+          missing=()
+          [ -z "${AZURE_CLIENT_ID}" ]    && missing+=("AZURE_CLIENT_ID secret")
+          [ -z "${AKS_RESOURCE_GROUP}" ] && missing+=("AKS_RESOURCE_GROUP variable")
+          [ -z "${AKS_CLUSTER_NAME}" ]   && missing+=("AKS_CLUSTER_NAME variable")
+          if [ ${#missing[@]} -ne 0 ]; then
+            printf '::error::missing config: %s\n' "${missing[*]}"
+            exit 1
+          fi
+
+      - name: Resolve image tags (control-plane = short SHA; migration = input or short SHA)
+        id: tags
+        run: |
+          sha="$(git rev-parse --short HEAD)"
+          mig="${{ inputs.migration_image_tag }}"
+          [ -z "$mig" ] && mig="$sha"
+          echo "short_sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "migration_tag=$mig" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC, passwordless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build + push the control-plane image (ACR Tasks, repo-root context)
+        run: |
+          az acr build \
+            --registry "${ACR_NAME}" \
+            --image "${CONTROL_PLANE_REPO}:${{ steps.tags.outputs.short_sha }}" \
+            --file control-plane/api/Dockerfile \
+            .
+
+      # The control plane stamps this migration image into every controller it
+      # provisions, so it must exist in the ACR. An explicitly provided tag is the
+      # caller's responsibility (used as-is). Otherwise the tag defaults to this
+      # commit's short SHA, which build.yml only publishes on push-to-main /
+      # dispatch -- so build it if the ACR does not already have it.
+      - name: Ensure the migration image the control plane will stamp exists (build if missing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tags.outputs.migration_tag }}"
+          if [ -n "${{ inputs.migration_image_tag }}" ]; then
+            echo "Using the provided migration image tag as-is: ${MIGRATION_REPO}:${tag}"
+            exit 0
+          fi
+          if az acr repository show --name "${ACR_NAME}" --image "${MIGRATION_REPO}:${tag}" >/dev/null 2>&1; then
+            echo "Migration image ${MIGRATION_REPO}:${tag} already present."
+            exit 0
+          fi
+          echo "${MIGRATION_REPO}:${tag} not found; dispatching build.yml on ${GITHUB_REF_NAME} ..."
+          gh workflow run build.yml --ref "$GITHUB_REF_NAME"
+          # ACR Tasks builds server-side (a few minutes); poll for the tag to land.
+          timeout=1500; elapsed=0
+          until az acr repository show --name "${ACR_NAME}" --image "${MIGRATION_REPO}:${tag}" >/dev/null 2>&1; do
+            if [ "$elapsed" -ge "$timeout" ]; then
+              echo "::error::migration image ${MIGRATION_REPO}:${tag} still absent after ${timeout}s -- check the Build run on ${GITHUB_REF_NAME}"
+              exit 1
+            fi
+            echo "waiting for ${MIGRATION_REPO}:${tag} to publish ... (${elapsed}s)"
+            sleep 20; elapsed=$((elapsed + 20))
+          done
+          echo "Migration image ${MIGRATION_REPO}:${tag} is published."
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Apply control-plane manifests (fill both image placeholders)
+        env:
+          PGCYAN_CONTROL_PLANE_IMAGE: ${{ env.ACR_NAME }}.azurecr.io/${{ env.CONTROL_PLANE_REPO }}:${{ steps.tags.outputs.short_sha }}
+          PGCYAN_MIGRATION_IMAGE: ${{ env.ACR_NAME }}.azurecr.io/${{ env.MIGRATION_REPO }}:${{ steps.tags.outputs.migration_tag }}
+        run: |
+          kubectl kustomize deploy/control-plane \
+            | envsubst '${PGCYAN_CONTROL_PLANE_IMAGE} ${PGCYAN_MIGRATION_IMAGE}' \
+            | kubectl apply -f -
+
+      - name: Wait for the API rollout
+        run: kubectl rollout status deploy/pgcyan-control-plane-api -n "${NS}" --timeout=180s
+
+      - name: Health check (GET /health from inside the pod)
+        run: |
+          kubectl exec deploy/pgcyan-control-plane-api -n "${NS}" -- \
+            python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health', timeout=5).read().decode())"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Control plane deployed to \`${NS}\`"
+            echo
+            echo "- API image: \`${ACR_NAME}.azurecr.io/${CONTROL_PLANE_REPO}:${{ steps.tags.outputs.short_sha }}\`"
+            echo "- Migration image stamped into controllers: \`${ACR_NAME}.azurecr.io/${MIGRATION_REPO}:${{ steps.tags.outputs.migration_tag }}\`"
+            echo
+            echo '```'
+            kubectl get deploy,svc,pvc -n "${NS}" 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

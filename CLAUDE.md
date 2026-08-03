@@ -155,7 +155,7 @@ topology and the module docstrings for each node.
 
 ## CI / workflows
 
-Exactly **four** GitHub workflows, each with one clear job (issue #50 cleanup):
+Exactly **five** GitHub workflows, each with one clear job (issue #50 cleanup, +#91):
 
 - `.github/workflows/unit-tests.yml` -- the DB-free pytest suite, on push/PR.
 - `.github/workflows/build.yml` -- builds the image and (on push to main /
@@ -171,6 +171,14 @@ Exactly **four** GitHub workflows, each with one clear job (issue #50 cleanup):
   `PG_TARGET_*` + a source with tables (and FKs). **To run or debug it, use the
   `run-integration-test` skill** (`.claude/skills/`) -- dispatch/watch/artifact-log
   flow + known failure modes.
+- `.github/workflows/deploy-control-plane.yml` -- manual (`workflow_dispatch`),
+  cluster-backed. Builds the **control-plane** API image (repo-root context,
+  `control-plane/api/Dockerfile`) tagged by the commit short SHA, pushes it to the
+  ACR, then applies `deploy/control-plane` to the fixed `pgcyan-system` namespace,
+  filling `${PGCYAN_CONTROL_PLANE_IMAGE}` (this build) and `${PGCYAN_MIGRATION_IMAGE}`
+  (the `pgcyan:<tag>` the API stamps into provisioned controllers, #87) via
+  `envsubst`; then rollout + `GET /health`. The repeatable form of #86's manual
+  apply (#91).
 - `.github/workflows/terraform-aks.yml` -- `terraform fmt`/`validate` for the
   AKS module.
 
