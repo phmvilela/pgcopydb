@@ -49,6 +49,12 @@ spec:
           env:
             - name: PGCYAN_DATA_DIR
               value: "/data"
+            # The pgcyan migration image the provisioned controllers run (#87).
+            # Filled by envsubst at apply time, same convention as the API image
+            # above; a plain apply without it leaves provisioning unconfigured
+            # (POST /migrations -> 503 until set).
+            - name: PGCYAN_MIGRATION_IMAGE
+              value: "${PGCYAN_MIGRATION_IMAGE}"
           readinessProbe:
             httpGet:
               path: /health

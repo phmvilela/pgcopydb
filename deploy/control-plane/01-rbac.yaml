@@ -43,6 +43,11 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
+  # The controller manifest carries a PodDisruptionBudget (and the orchestrator
+  # may apply more), so the control plane must be able to create them (#87).
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
   # Create the per-migration Role + RoleBinding (the orchestrator/worker RBAC
   # that deploy/k8s/01-rbac.yaml defines today). `bind`/`escalate` are required
   # so this SA may CREATE a Role/RoleBinding granting permissions without being

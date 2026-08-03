@@ -20,13 +20,18 @@ The API source lives in [`../../control-plane/api/`](../../control-plane/api/).
 
 ## Apply (manual for now — automated deploy is #91)
 
-The Deployment's image is a `${PGCYAN_CONTROL_PLANE_IMAGE}` placeholder, filled
-with `envsubst` at apply time (same convention as `deploy/k8s`):
+The Deployment carries two `envsubst` placeholders, filled at apply time (same
+convention as `deploy/k8s`):
+- `${PGCYAN_CONTROL_PLANE_IMAGE}` — the control-plane API image itself;
+- `${PGCYAN_MIGRATION_IMAGE}` — the pgcyan migration image the API stamps into
+  each provisioned controller (#87). Leave it and `POST /migrations` returns 503
+  until set.
 
 ```bash
 export PGCYAN_CONTROL_PLANE_IMAGE=<acr>.azurecr.io/pgcyan-control-plane:<tag>
+export PGCYAN_MIGRATION_IMAGE=<acr>.azurecr.io/pgcyan:<short-sha>
 kubectl kustomize deploy/control-plane \
-  | envsubst '${PGCYAN_CONTROL_PLANE_IMAGE}' \
+  | envsubst '${PGCYAN_CONTROL_PLANE_IMAGE} ${PGCYAN_MIGRATION_IMAGE}' \
   | kubectl apply -f -
 ```
 
@@ -56,3 +61,27 @@ kubectl delete pod -n pgcyan-system "$POD"
 NEW=$(kubectl get pod -n pgcyan-system -l app.kubernetes.io/component=control-plane -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n pgcyan-system "$NEW" -- cat /data/canary                 # -> hi
 ```
+
+### Provisioning a migration (issue #87)
+
+```bash
+kubectl port-forward -n pgcyan-system svc/pgcyan-control-plane-api 8080:80 &
+curl -fsS -XPOST localhost:8080/migrations -H 'content-type: application/json' -d '{
+  "source": {"host": "SRC_HOST", "user": "U", "password": "P", "database": "DB"},
+  "target": {"host": "TGT_HOST", "user": "U", "password": "P", "database": "DB"}
+}'                                          # -> 201 {"id": "...", "namespace": "pgcyan-mig-..."}
+
+NS=pgcyan-mig-<id>
+kubectl get ns "$NS"
+kubectl get pods -n "$NS"                   # controller Running...
+POD=$(kubectl get pod -n "$NS" -l pgcyan.dev/component=controller -o jsonpath='{.items[0].metadata.name}')
+kubectl exec "$POD" -n "$NS" -- python -c \
+  "import urllib.request;print(urllib.request.urlopen('http://localhost:9999/status').read().decode())"
+#   -> {"state":"waiting-to-start", "snapshot": null, ...}   (no slot on the source yet)
+```
+
+> **Concurrency caveat:** provisioned controllers use the default `pgcyan_slot` /
+> `pgcyan_pub` names (kept identical to the integration test — no drift). Two
+> migrations against the **same source** would collide on the slot **at start**
+> (not at provision). Per-migration slot naming / clash detection is #88.
+

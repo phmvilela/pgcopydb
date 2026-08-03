@@ -190,10 +190,16 @@ sandboxes on demand — distinct from a single migration run. Two new trees:
 
 - **`control-plane/api/`** — a standalone **FastAPI** service (its own
   `requirements.txt` + `Dockerfile`, image `pgcyan-control-plane`), NOT part of
-  the `pg_cyan` package or the heavy migration image. Skeleton today (`GET
-  /health`, #86); provisioning/registry/start-status-teardown land in #87–#90.
+  the `pg_cyan` package or the heavy migration image. `GET /health` (#86) +
+  `POST /migrations` (#87, provisions a per-migration namespace with the
+  controller parked in wait-to-start); registry/start-status-teardown are #88–#90.
   Its tests live under `control-plane/api/tests/` and are **not** collected by
-  the repo-root `pytest` (run them from `control-plane/api`).
+  the repo-root `pytest` (run them from `control-plane/api`). **Built from the
+  repo-root context** (like the migration image) so it can bake in `deploy/k8s`:
+  `docker build -f control-plane/api/Dockerfile .`. The provisioner reads those
+  baked manifests and only *retargets the namespace + fills `${PGCYAN_*}` env* at
+  apply time — the migration YAML is never re-declared (no drift). The controller
+  image it stamps in comes from the `PGCYAN_MIGRATION_IMAGE` env on the API pod.
 - **`deploy/control-plane/`** — the fixed **`pgcyan-system`** namespace: SA +
   **cluster-scoped** RBAC (create/delete namespaces and the resources inside
   per-migration namespaces), an RWO SQLite-registry PVC (`/data`, #58 pattern),
