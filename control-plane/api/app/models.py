@@ -72,3 +72,25 @@ class MigrationRecord(BaseModel):
     state: str
     created_at: str
     updated_at: str
+
+
+class MigrationStarted(BaseModel):
+    """Response of ``POST /migrations/{id}/start``."""
+    id: str
+    namespace: str
+    state: str            # registry state after the start call
+    message: str
+
+
+class MigrationStatus(BaseModel):
+    """Response of ``GET /migrations/{id}/status`` (issue #89).
+
+    ``state`` is the registry's view (authoritative for the singleton). The
+    controller's live ``/status`` payload is nested under ``controller`` when the
+    pod is reachable, else ``null`` with ``controller_reachable=false``.
+    """
+    id: str
+    namespace: str
+    state: str
+    controller_reachable: bool
+    controller: Optional[dict] = None

@@ -11,6 +11,8 @@ its in-cluster ServiceAccount.
 | GET | `/health` | liveness/readiness (#86) |
 | POST | `/migrations` | provision a fresh per-migration namespace with the controller parked pre-snapshot; returns `{id, namespace}` (#87). **Does not start** the migration. Rejected with **409** if another migration is active (singleton) or the source already carries the pgcyan slot/publication (clash, #88). |
 | GET | `/migrations` | list tracked migrations from the registry, newest first — no credentials (#88). |
+| POST | `/migrations/{id}/start` | proxy the controller's `POST /start` so it takes the snapshot and walks the DAG; advances the registry to `running` (#89). Idempotent. **404** unknown id, **409** already finished, **503** controller unreachable. |
+| GET | `/migrations/{id}/status` | aggregate the controller's live `/status` with the registry state; a controller-reported transition is written back (a terminal state frees the singleton slot). Falls back to the registry view when the controller is unreachable (#89). |
 
 `POST /migrations` body:
 
@@ -36,6 +38,7 @@ control-plane/api/
   app/k8s.py             # in-cluster applier (thin k8s-client I/O)
   app/registry.py        # node-local SQLite registry on the RWO PVC (#88)
   app/source_probe.py    # best-effort source slot/publication clash probe (#88)
+  app/controller_client.py  # stdlib-urllib client for the controller API (#89)
   requirements.txt       # fastapi, uvicorn, kubernetes, PyYAML, psycopg2-binary
   requirements-dev.txt   # + pytest, httpx
   Dockerfile             # slim, non-root; built from the REPO ROOT context
@@ -60,6 +63,24 @@ is `Recreate`, single replica → single writer). `POST /migrations` is gated by
   `pgcyan_slot`/`pgcyan_pub` (a torn-down or externally run migration the
   registry can't see) → **409**. Probe connection/permission failures don't
   block (non-clashing databases stay the operator's responsibility).
+
+## Start & status (#89)
+
+The controller (#85) serves a control API on `:9999`, fronted by a **headless
+Service** `pgcyan-controller` in the migration's namespace; it makes itself Ready
+while parked in wait-to-start, so the Service routes to it *before* the migration
+begins. The control plane reaches it by cross-namespace DNS —
+`http://pgcyan-controller.<namespace>.svc.cluster.local:9999` — via a thin,
+injectable stdlib-`urllib` client (`app/controller_client.py`, no new runtime
+dep):
+- **`POST /migrations/{id}/start`** proxies the controller's `POST /start`
+  (idempotent) and advances the registry to `running`.
+- **`GET /migrations/{id}/status`** aggregates the controller's live `/status`
+  with the registry state. The controller and registry share one state
+  vocabulary (`waiting-to-start`→`running`→`succeeded`|`failed`|`halted`), so a
+  reported transition is written straight back to the registry; a **terminal
+  state frees the singleton slot** (#88). If the controller is unreachable (e.g.
+  torn down) the registry view is returned with `controller_reachable=false`.
 
 ## How provisioning stays drift-free
 

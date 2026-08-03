@@ -193,7 +193,10 @@ sandboxes on demand — distinct from a single migration run. Two new trees:
   the `pg_cyan` package or the heavy migration image. `GET /health` (#86);
   `POST /migrations` (#87, provisions a per-migration namespace with the
   controller parked in wait-to-start) + `GET /migrations` (#88, lists tracked
-  migrations); start-status-teardown are #89–#90. A **node-local SQLite
+  migrations) + `POST/GET /migrations/{id}/start|status` (#89, proxy the
+  controller's `/start` and aggregate its `/status`, reached over the migration
+  namespace's headless `pgcyan-controller` Service via stdlib `urllib` —
+  `app/controller_client.py`); teardown is #90. A **node-local SQLite
   registry** on the RWO PVC (`app/registry.py`) tracks migrations and enforces
   **one active control-plane migration at a time** (409) via a partial unique
   index — the DB, not app-level check-then-act, picks the race winner, and a

@@ -101,6 +101,23 @@ kubectl delete pod -n pgcyan-system -l app.kubernetes.io/component=control-plane
 curl -fsS localhost:8080/migrations
 ```
 
+### Start & status (issue #89)
+
+```bash
+kubectl port-forward -n pgcyan-system svc/pgcyan-control-plane-api 8080:80 &
+ID=<id from POST /migrations>
+
+# Kick off the migration: the control plane proxies the controller's POST /start.
+curl -fsS -XPOST localhost:8080/migrations/$ID/start
+#   -> {"id":"...","namespace":"pgcyan-mig-...","state":"running","message":"..."}
+kubectl get pods -n pgcyan-mig-$ID          # phase pods appear as the DAG walks
+
+# Poll aggregated status (controller /status + registry state).
+curl -fsS localhost:8080/migrations/$ID/status
+#   -> {"state":"running","controller_reachable":true,"controller":{"phases":[...]}}
+# ...eventually {"state":"succeeded",...}; the singleton slot is then free.
+```
+
 > **Slot naming:** provisioned controllers still use the default `pgcyan_slot` /
 > `pgcyan_pub` names (kept identical to the integration test — no drift). Rather
 > than per-migration slot names, the control plane enforces **one active

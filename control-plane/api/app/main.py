@@ -13,6 +13,9 @@ Endpoints so far:
 * ``POST /migrations`` -- provision a parked per-migration namespace (#87),
   gated by the singleton + source-clash rules (#88).
 * ``GET /migrations``  -- list tracked migrations from the registry (#88).
+* ``POST /migrations/{id}/start``  -- proxy the controller's ``POST /start`` (#89).
+* ``GET /migrations/{id}/status``  -- aggregate the controller's ``/status`` with
+  the registry state (#89).
 
 ``PGCYAN_DATA_DIR`` (default ``/data``) is the mounted RWO volume that holds the
 SQLite registry; ``PGCYAN_MANIFESTS_DIR`` (default ``/app/deploy/k8s``) is where
@@ -25,7 +28,14 @@ from typing import List
 
 from fastapi import Depends, FastAPI, HTTPException
 
-from app.models import MigrationCreated, MigrationRecord, MigrationRequest
+from app.controller_client import ControllerClient, ControllerUnreachable
+from app.models import (
+    MigrationCreated,
+    MigrationRecord,
+    MigrationRequest,
+    MigrationStarted,
+    MigrationStatus,
+)
 from app.provisioner import (
     Provisioner,
     ProvisionError,
@@ -34,6 +44,22 @@ from app.provisioner import (
 )
 from app.registry import Registry
 from app.source_probe import SourceProbe
+
+#: Controller lifecycle states that are terminal (mirrors the registry's).
+TERMINAL_STATES = ("succeeded", "failed", "halted")
+
+
+def _registry_state_for(controller_state: str) -> str:
+    """Map a controller lifecycle state onto the registry's vocabulary.
+
+    The two vocabularies match, except the controller's transient ``starting`` /
+    ``initialized`` collapse onto the registry's active states.
+    """
+    if controller_state in TERMINAL_STATES:
+        return controller_state
+    if controller_state in ("running", "starting"):
+        return "running"
+    return "waiting-to-start"
 
 DATA_DIR = os.getenv("PGCYAN_DATA_DIR", "/data")
 MANIFESTS_DIR = os.getenv("PGCYAN_MANIFESTS_DIR", "/app/deploy/k8s")
@@ -68,6 +94,11 @@ def get_registry() -> Registry:
 def get_source_probe() -> SourceProbe:
     """Best-effort source clash detector. Overridden in tests."""
     return SourceProbe()
+
+
+def get_controller_client() -> ControllerClient:
+    """HTTP client for a migration's in-namespace controller. Overridden in tests."""
+    return ControllerClient()
 
 
 @app.get("/health")
@@ -140,3 +171,82 @@ def create_migration(
         raise HTTPException(status_code=502, detail=f"provisioning failed: {exc}")
 
     return MigrationCreated(**result)
+
+
+def _lookup(registry: Registry, migration_id: str) -> dict:
+    row = registry.get(migration_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"no migration {migration_id!r}")
+    return row
+
+
+@app.post("/migrations/{migration_id}/start", response_model=MigrationStarted)
+def start_migration(
+    migration_id: str,
+    registry: Registry = Depends(get_registry),
+    controller: ControllerClient = Depends(get_controller_client),
+) -> MigrationStarted:
+    """Tell the migration's controller to take the snapshot and walk the DAG.
+
+    Proxies to the controller's ``POST /start`` (idempotent server-side) and
+    advances the registry to the resulting state (#89).
+    """
+    row = _lookup(registry, migration_id)
+    if row["state"] in TERMINAL_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"migration {migration_id} already finished (state={row['state']})")
+
+    ns = row["namespace"]
+    try:
+        code, body = controller.start(ns)
+    except ControllerUnreachable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if code not in (200, 202):
+        raise HTTPException(
+            status_code=502,
+            detail=f"controller rejected start (HTTP {code}): {body}")
+
+    new_state = _registry_state_for(body.get("state", "running"))
+    if new_state != row["state"]:
+        registry.set_state(migration_id, new_state, _now())
+    return MigrationStarted(
+        id=migration_id, namespace=ns, state=new_state,
+        message=body.get("message", "start accepted"))
+
+
+@app.get("/migrations/{migration_id}/status", response_model=MigrationStatus)
+def migration_status(
+    migration_id: str,
+    registry: Registry = Depends(get_registry),
+    controller: ControllerClient = Depends(get_controller_client),
+) -> MigrationStatus:
+    """Aggregate the controller's live ``/status`` with the registry state (#89).
+
+    Best-effort: if the controller can't be reached (e.g. torn down) the registry
+    state is still returned. A controller-reported transition is written back to
+    the registry so it converges -- and a terminal state frees the singleton slot.
+    """
+    row = _lookup(registry, migration_id)
+    state = row["state"]
+
+    controller_body = None
+    reachable = False
+    try:
+        code, body = controller.status(row["namespace"])
+        if code == 200:
+            reachable = True
+            controller_body = body
+            cs = body.get("state")
+            if cs:
+                mapped = _registry_state_for(cs)
+                if mapped != state:
+                    registry.set_state(migration_id, mapped, _now())
+                    state = mapped
+    except ControllerUnreachable:
+        # Leave the registry state as-is; report the controller as unreachable.
+        pass
+
+    return MigrationStatus(
+        id=migration_id, namespace=row["namespace"], state=state,
+        controller_reachable=reachable, controller=controller_body)
