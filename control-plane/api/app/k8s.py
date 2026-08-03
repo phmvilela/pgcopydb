@@ -49,8 +49,15 @@ class K8sApplier:
     # ---------------------------------------------------------- teardown (#90)
 
     def scale_statefulset(self, namespace: str, name: str, replicas: int) -> None:
-        """Set a StatefulSet's replica count (0 = graceful SIGTERM, no respawn)."""
-        self._apps.patch_namespaced_stateful_set_scale(
+        """Set a StatefulSet's replica count (0 = graceful SIGTERM, no respawn).
+
+        Patches the StatefulSet resource directly rather than the ``/scale``
+        subresource: ``statefulsets/scale`` is a *separate* RBAC resource, so
+        using it would need an extra grant -- patching ``spec.replicas`` on the
+        main resource is covered by the ClusterRole's existing ``statefulsets:
+        patch`` and scales just the same.
+        """
+        self._apps.patch_namespaced_stateful_set(
             name, namespace, {"spec": {"replicas": replicas}})
 
     def count_pods(self, namespace: str, label_selector: str) -> int:
