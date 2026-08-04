@@ -530,7 +530,7 @@ def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) ->
 @click.option("--follow-cdc/--no-follow-cdc",
               default=lambda: os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes"),
               show_default="$PGCYAN_FOLLOW_CDC (unset = off)",
-              help="After a full walk, become the CDC consumer (`pgcopydb follow`, issue #26).")
+              help="After a full walk, become the CDC consumer (`pgcopydb follow`).")
 @click.option("--wait-for-start/--no-wait-for-start",
               default=lambda: os.getenv("PGCYAN_WAIT_FOR_START", "").strip().lower() in ("1", "true", "yes"),
               show_default="$PGCYAN_WAIT_FOR_START (unset = off)",

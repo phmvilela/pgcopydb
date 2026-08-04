@@ -437,7 +437,7 @@ class PgCyanDataShard:
             "shard": self.shard_name,
             "message": message,
             "errors": self.errors or ["Unknown error"],
-            "remediation": "The data-copy phase is a hard barrier -- the orchestrator (#40) blocks phase 3 until every shard succeeds. Fix the cause and let k8s retry the Job (the shard resumes on its RWO disk).",
+            "remediation": "The data-copy phase is a hard barrier -- the orchestrator blocks phase 3 until every shard succeeds. Fix the cause and let k8s retry the Job (the shard resumes on its RWO disk).",
         }
 
     def _write_json(self, filename: str, payload: Dict) -> Optional[str]:
@@ -557,7 +557,7 @@ class PgCyanDataShard:
         if not self.snapshot_id:
             self._log_event(
                 "run", "failure", "No snapshot id supplied",
-                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each phase pod, #70)"},
+                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each phase pod)"},
             )
             self.errors.append(
                 "No snapshot id: pass --snapshot=<id> (the holder's snapshot)"
@@ -573,7 +573,7 @@ class PgCyanDataShard:
             self._log_event(
                 "run", "failure", "Shard filter file missing",
                 {"filter_file": self.filter_file, "resolved": filter_path,
-                 "remediation": "The planner (#38) publishes shard-<n>.filters into the pgcyan-plan ConfigMap; ensure it is mounted at --plan-dir and FILTER_FILE names it."},
+                 "remediation": "The planner publishes shard-<n>.filters into the pgcyan-plan ConfigMap; ensure it is mounted at --plan-dir and FILTER_FILE names it."},
             )
             self.errors.append(
                 f"Shard filter file missing: {filter_path or self.filter_file!r}"

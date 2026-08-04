@@ -308,8 +308,7 @@ class PgCyanPreData:
             "message": (
                 "Pre-data schema (tables, sequences, functions) transferred to "
                 "the target; secondary indexes, primary-key/unique constraints, "
-                "foreign keys and triggers are deliberately omitted (post-data, "
-                "issue #28)."
+                "foreign keys and triggers are deliberately omitted (post-data)."
             ),
             "snapshot": self.snapshot_id,
             "not_consistent": self.not_consistent,
@@ -376,7 +375,7 @@ class PgCyanPreData:
             self._log_event(
                 "run", "failure",
                 "No snapshot id supplied and --not-consistent not set",
-                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each phase pod, #70) or --not-consistent"},
+                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each phase pod) or --not-consistent"},
             )
             self.errors.append(
                 "No snapshot id: pass --snapshot=<id> (holder's snapshot) or --not-consistent"

@@ -243,7 +243,7 @@ class PgCyanForeignKeys:
             "status": "failure",
             "message": message,
             "errors": self.errors or ["Unknown error"],
-            "remediation": "Phase 3b is the last post-data step before CDC (#26); fix the cause and let k8s retry (it is idempotent).",
+            "remediation": "Phase 3b is the last post-data step before CDC; fix the cause and let k8s retry (it is idempotent).",
         }
 
     def close(self) -> None:

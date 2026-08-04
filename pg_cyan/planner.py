@@ -344,8 +344,8 @@ class PgCyanPlanner:
                 "status": "deferred",
                 "edges": [],
                 "note": (
-                    "FK edge collection is not yet implemented (issue #38 "
-                    "follow-up). Phase-3b applies all constraints in one "
+                    "FK edge collection is not yet implemented. "
+                    "Phase-3b applies all constraints in one "
                     "non-sharded pass regardless of this graph."
                 ),
             },
