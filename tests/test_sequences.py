@@ -1,5 +1,7 @@
 """
-Unit tests for the sequence sync (`pg_cyan.cli copy-sequences`, #78).
+Unit tests for the sequence sync (`pg_cyan.cli copy-sequences`).
+
+See also: pg_cyan/sequences.py
 
 DB-free: psycopg2 connections are faked. Tests cover source introspection, the
 setval-per-sequence apply (incl. skipping NULL last_value), the introspection-error

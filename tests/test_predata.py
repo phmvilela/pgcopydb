@@ -1,6 +1,7 @@
 """
-Unit tests for the pre-data schema transfer (`pg_cyan.cli restore-predata`,
-issue #24).
+Unit tests for the pre-data schema transfer (`pg_cyan.cli restore-predata`).
+
+See also: pg_cyan/predata.py
 
 DB-free: the pgcopydb child is stubbed via a fake ``subprocess.run``, so nothing
 spawns a real process or touches a database. Tests exercise the command build

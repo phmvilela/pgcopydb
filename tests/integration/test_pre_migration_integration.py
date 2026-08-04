@@ -1,6 +1,6 @@
 """
-Manual integration tests for the pre-migration artifact stages: source-pg-metrics
-(issue #19), source-parameters (issue #4), and source-pg-largeobjects (issue #20).
+Manual integration tests for the pre-migration artifact stages: source-pg-metrics,
+source-parameters, and source-pg-largeobjects.
 
 Run against a real PostgreSQL server -- connection settings come from the
 same ``PG_SOURCE_*`` / ``PG_OUTPUT_DIR`` environment variables the CLI reads
@@ -17,9 +17,9 @@ or via the "Integration: pre-migration artifacts" GitHub Actions workflow
 artifact for human review.
 
 Only the happy path is covered for each stage, and only the *shape* of the
-output is checked -- presence of the documented fields, not their values
-(per issue #19, extended the same way to source-parameters rather than
-adding a second integration test file).
+output is checked -- presence of the documented fields, not their values.
+New stages go here as another test function rather than a second integration
+test file.
 """
 import json
 import os
@@ -90,7 +90,7 @@ def test_collect_writes_source_pg_metrics_with_all_fields(collector):
     with open(summary["output_file"], encoding="utf-8") as fh:
         payload = json.load(fh)
 
-    assert payload  # non-empty (issue #3 acceptance criterion 1)
+    assert payload  # non-empty
 
     for field in ("timestamp", "component", "status", "source", "version",
                   "database_size", "object_counts", "tables", "table_totals"):
@@ -115,8 +115,7 @@ def test_collect_writes_source_pg_metrics_with_all_fields(collector):
 
     for field in _TABLE_TOTALS_FIELDS:
         assert field in payload["table_totals"], f"missing table_totals field: {field}"
-    # heap + index is reported as a distinct split that sums to the total
-    # (issue #37).
+    # heap + index is reported as a distinct split that sums to the total.
     totals = payload["table_totals"]
     assert totals["heap_bytes"] + totals["index_bytes"] == totals["total_bytes"]
 
@@ -130,7 +129,7 @@ def test_export_writes_source_parameters_with_all_fields(exporter):
     with open(summary["output_file"], encoding="utf-8") as fh:
         payload = json.load(fh)
 
-    assert payload  # non-empty (issue #4 acceptance criterion 1)
+    assert payload  # non-empty
 
     for field in ("timestamp", "component", "status", "source",
                   "parameter_count", "parameters"):
@@ -155,7 +154,7 @@ def test_collect_writes_source_lobs_with_all_fields(lobs):
     with open(summary["output_file"], encoding="utf-8") as fh:
         payload = json.load(fh)
 
-    assert payload  # non-empty (issue #20 acceptance criterion)
+    assert payload  # non-empty
 
     for field in ("timestamp", "component", "status", "source",
                   "lob_count"):

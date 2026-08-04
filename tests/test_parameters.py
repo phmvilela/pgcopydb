@@ -2,7 +2,7 @@
 Unit tests for the source-parameters exporter.
 
 DB-free: they exercise guard paths (no connection), the JSON event shape, the
-payload builders, and the output/error file-writing contract from issue #4:
+payload builders, and the output/error file-writing contract:
   1. Happy path  -> a non-empty pg-source-parameters.json
   2. Any failure -> pg-source-parameters-errors.json with an error message
 Tests needing a live PostgreSQL server belong in a separate integration suite.

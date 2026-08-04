@@ -2,7 +2,7 @@
 Unit tests for the source-pg-largeobjects collector.
 
 DB-free: they exercise guard paths (no connection), the JSON event shape, the
-payload builder, and the output/error file-writing contract (issue #20):
+payload builder, and the output/error file-writing contract:
   1. Happy path        -> a non-empty source-pg-largeobjects.json with the count
   2. Zero large objects -> still a success (an empty database is not a failure)
   3. Connection issues  -> source-pg-largeobjects-errors.json with a conn error
@@ -114,7 +114,7 @@ def test_collect_writes_output_file_on_success(tmp_path, monkeypatch):
     assert not (tmp_path / PgCyanLobs.ERROR_FILENAME).exists()
 
     payload = json.loads(output_file.read_text())
-    assert payload  # non-empty (issue #20 acceptance criterion)
+    assert payload  # non-empty
     assert payload["lob_count"] == 7
 
 

@@ -170,14 +170,14 @@ class _StubDataShard(RealDataShard):
 
 
 class _StubController:
-    """Records constructor kwargs and a canned run() result (issue #70).
+    """Records constructor kwargs and a canned run() result.
 
     Does NOT subclass the real controller -- building it would try to load kube
     credentials -- so it stands in wholesale. Success unless namespace is 'bad_ns'.
     """
 
     last_kwargs = None
-    #: Mirror the real class attribute the CLI reads for the default API port (#85).
+    #: Mirror the real class attribute the CLI reads for the default API port.
     DEFAULT_API_PORT = 9999
 
     def __init__(self, **kwargs):
@@ -193,12 +193,12 @@ class _StubController:
         return None  # no-op: real controller blocks until SIGTERM
 
     def serve_and_run(self):
-        # Wait-to-start path (#85): stands in for run()+park() gated by POST /start.
+        # Wait-to-start path: stands in for run()+park() gated by POST /start.
         return self.run()
 
 
 class _StubPostIndex(RealPostIndex):
-    """Records kwargs; success unless target is the 'bad' sentinel (#28, 3a).
+    """Records kwargs; success unless target is the 'bad' sentinel.
 
     Subclasses the real class so the CLI's option defaults (which read
     ``PgCyanPostIndex.DEFAULT_*``) still resolve after monkeypatching.
@@ -215,7 +215,7 @@ class _StubPostIndex(RealPostIndex):
 
 
 class _StubForeignKeys(RealForeignKeys):
-    """Records kwargs; success unless target is the 'bad' sentinel (#28, 3b)."""
+    """Records kwargs; success unless target is the 'bad' sentinel."""
     last_kwargs = None
 
     def __init__(self, **kwargs):
@@ -228,7 +228,7 @@ class _StubForeignKeys(RealForeignKeys):
 
 
 class _StubSequences(RealSequences):
-    """Records kwargs; success unless target is the 'bad' sentinel (#78)."""
+    """Records kwargs; success unless target is the 'bad' sentinel."""
     last_kwargs = None
 
     def __init__(self, **kwargs):
@@ -586,7 +586,7 @@ def test_run_migration_exit_one_on_failure(runner):
 
 def test_run_migration_wait_for_start_uses_serve_and_run(runner):
     # --wait-for-start routes through serve_and_run() (which the stub maps to a
-    # successful run) rather than run()+park() -- issue #85.
+    # successful run) rather than run()+park().
     result = runner.invoke(cli_module.cli,
                            ["run-migration", "--namespace", "ok_ns", "--wait-for-start"])
     assert result.exit_code == 0
@@ -605,7 +605,7 @@ def test_run_migration_stop_after_flows_through(runner):
 
 def test_run_migration_follow_cdc_flows_through(runner):
     # --follow-cdc must reach the controller (the manifest sets PGCYAN_FOLLOW_CDC);
-    # a regression here silently skips CDC (issue #26).
+    # a regression here silently skips CDC.
     result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--follow-cdc"])
     assert result.exit_code == 0
     assert _StubController.last_kwargs["follow_cdc"] is True

@@ -1,5 +1,7 @@
 """
-Unit tests for the post-data FK build (`pg_cyan.cli build-foreign-keys`, #28, 3b).
+Unit tests for the post-data FK build (`pg_cyan.cli build-foreign-keys`).
+
+See also: pg_cyan/postfk.py
 
 DB-free: psycopg2 connections are faked. Tests cover source FK introspection,
 the NOT VALID + VALIDATE apply (happy path, idempotent DuplicateObject, per-FK

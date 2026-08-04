@@ -1,6 +1,8 @@
 """
-Unit tests for the post-data index + PK/unique build (`pg_cyan.cli build-indexes`,
-#28, 3a) -- custom SQL.
+Unit tests for the post-data index + PK/unique build (`pg_cyan.cli build-indexes`)
+-- custom SQL.
+
+See also: pg_cyan/postindex.py
 
 DB-free: psycopg2 connections are faked. Tests cover shard-filter parsing, source
 introspection of secondary indexes + PK/unique, idempotent apply (DuplicateTable /

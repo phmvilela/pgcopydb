@@ -1,5 +1,7 @@
 """
-Unit tests for the migration DAG orchestrator (`pg_cyan.cli orchestrate`, issue #40).
+Unit tests for the migration DAG orchestrator (`pg_cyan.cli orchestrate`).
+
+See also: pg_cyan/orchestrator.py
 
 Cluster-free by nature: every Kubernetes API client (batch/apps/policy/core) is
 injected as a fake, so nothing here needs a real cluster. Tests exercise
@@ -112,12 +114,12 @@ class FakeCoreApi:
         #: list of (name, image) tuples for read_namespaced_pod, used by the
         #: image-resolution tests that clear the PGCYAN_IMAGE override.
         self._pod_containers = pod_containers or [("orchestrator", TEST_IMAGE)]
-        #: PVCs the orchestrator creates (issue #58 per-shard RWO work disks).
+        #: PVCs the orchestrator creates (per-shard RWO work disks).
         self.created_pvcs = []
         self._pvc_conflicts = pvc_conflicts or set()
         #: per-shard copy-log ConfigMaps the shards published: {shard_name: payload}.
         #: Returned (labelled copylog=shard) by list_namespaced_config_map so the
-        #: orchestrator can aggregate them (issue #25).
+        #: orchestrator can aggregate them.
         self._shard_copylogs = shard_copylogs or {}
         #: ConfigMaps the orchestrator create/replaces (name -> data dict).
         self.configmaps = {}
@@ -245,7 +247,7 @@ def test_load_phase_manifests_templated_phase_renders_pvc_and_job_per_shard():
     phase = dict(PgCyanOrchestrator.PHASES[2])  # data-shards
     assert phase["id"] == "2"
     docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
-    # one RWO work-dir PVC + one Job per shard (issue #58), PVC first so it is
+    # one RWO work-dir PVC + one Job per shard, PVC first so it is
     # applied before the Job that mounts it.
     jobs = [d for d in docs if d["kind"] == "Job"]
     pvcs = [d for d in docs if d["kind"] == "PersistentVolumeClaim"]
@@ -269,8 +271,8 @@ def test_load_phase_manifests_index_template_renders_job_per_index_shard():
     assert phase["id"] == "3a"
     docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
     jobs = [d["metadata"]["name"] for d in docs if d["kind"] == "Job"]
-    # #28: phase 3a is pure psycopg2 (custom SQL) -- no pgcopydb catalog, so it uses
-    # emptyDir, NOT a per-shard RWO PVC (unlike the data shards).
+    # Phase 3a is pure psycopg2 (custom SQL), no pgcopydb catalog, so it uses
+    # emptyDir, not a per-shard RWO PVC (unlike the data shards).
     pvcs = [d for d in docs if d["kind"] == "PersistentVolumeClaim"]
     assert jobs == ["pgcyan-index-idx-0", "pgcyan-index-idx-1"]
     assert pvcs == []
@@ -307,8 +309,8 @@ def test_static_manifest_image_placeholder_filled_runtime_vars_preserved():
         {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"}, plan=None
     )[0]
     assert _container_image(predata) == TEST_IMAGE
-    # SNAPSHOT_ID is injected by the controller at apply time (issue #70), not
-    # sourced from a ConfigMap -- the manifest carries no pgcyan-snapshot ref.
+    # SNAPSHOT_ID is injected by the controller at apply time, not sourced from
+    # a ConfigMap -- the manifest carries no pgcyan-snapshot ref.
     assert "pgcyan-snapshot" not in yaml.safe_dump(predata)
 
 
@@ -316,8 +318,8 @@ def test_templated_manifest_image_placeholder_filled():
     orch = make_orchestrator()
     phase = dict(PgCyanOrchestrator.PHASES[2])  # data-shards
     docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
-    # Templated phases are multi-doc now (a per-shard PVC precedes each Job,
-    # issue #58); the image placeholder lives on the Job containers.
+    # Templated phases are multi-doc (a per-shard PVC precedes each Job); the
+    # image placeholder lives on the Job containers.
     jobs = [d for d in docs if d["kind"] == "Job"]
     assert jobs
     for job in jobs:
@@ -490,13 +492,13 @@ def test_run_happy_path_applies_all_phases_in_order():
 
     assert summary["status"] == "success"
     assert summary["run_id"] == "pgcyan-test-run"
-    # NO snapshot-holder phase (controller holds it in-pod, #70) and NO CDC phase:
-    # under Option A (#26) the controller streams CDC itself after the walk. Includes
-    # the sequence-sync phase 2s (#78) between the data copy and the index builds.
+    # No snapshot-holder phase (controller holds it in-pod) and no CDC phase (the
+    # controller streams CDC itself after the walk). The sequence-sync phase 2s
+    # sits between the data copy and the index builds.
     assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "2", "2s", "3a", "3b"]
     assert all(p["success"] for p in summary["phases"])
-    # each DATA shard got its own RWO work-dir PVC stamped (issue #58); the index
-    # shards are pure psycopg2 (#28) and use emptyDir, so they stamp no PVC.
+    # each DATA shard got its own RWO work-dir PVC stamped; the index shards are
+    # pure psycopg2 and use emptyDir, so they stamp no PVC.
     assert {n for _, n, _ in core_api.created_pvcs} == {
         "pgcyan-workdir-shard-0", "pgcyan-workdir-shard-1",
     }
@@ -724,7 +726,7 @@ def test_full_run_aggregates_copy_logs_on_phase_two_success():
     assert PgCyanOrchestrator.COPY_LOG_CONFIGMAP in core.configmaps
 
 
-# ------------------------------------------------- fold: injection / owner / health (#70)
+# ------------------------------------------------- fold: injection / owner / health
 
 def test_inject_snapshot_env_replaces_any_existing():
     orch = make_orchestrator(snapshot_id="SNAP-1")
@@ -786,7 +788,7 @@ def test_wait_for_aborts_when_snapshot_child_dies():
     assert "snapshot" in message.lower()
 
 
-# ---------------------------------------------------------- --stop-after (#70)
+# ---------------------------------------------------------- --stop-after
 
 def test_run_stop_after_phase_two_skips_later_phases():
     batch_api = _all_jobs_complete_batch_api()
@@ -823,13 +825,13 @@ def test_run_stop_after_unknown_phase_fails_fast():
     assert any("stop_after" in e for e in summary["errors"])
 
 
-# ------------------------------------------------ RBAC covers the barrier reads (#70)
+# ------------------------------------------------ RBAC covers the barrier reads
 
 def test_orchestrator_rbac_grants_status_subresources():
     """The orchestrator polls each phase barrier via read_namespaced_job_status /
     read_namespaced_deployment_status -- the `jobs/status` / `deployments/status`
     SUBRESOURCES, which RBAC does NOT fold into a grant on `jobs`/`deployments`.
-    A missing grant is Forbidden only in-cluster (issue #70), so lock the manifest
+    A missing grant is Forbidden only in-cluster, so lock the manifest
     to the code here."""
     import os
     rbac_path = os.path.join(PgCyanOrchestrator.DEFAULT_MANIFESTS_DIR, "01-rbac.yaml")

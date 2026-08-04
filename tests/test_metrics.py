@@ -2,7 +2,7 @@
 Unit tests for the source-pg-metrics collector.
 
 DB-free: they exercise guard paths (no connection), the JSON event shape, the
-payload builders, and the output/error file-writing contract from issue #3:
+payload builders, and the output/error file-writing contract:
   1. Happy path       -> a non-empty source-pg-metrics.json
   2. Connection issues -> source-pg-metrics-errors.json with a connection error
   3. Other issues      -> source-pg-metrics-errors.json with the source's error
@@ -85,7 +85,7 @@ def test_build_output_is_non_empty_and_well_formed():
 
 def test_table_totals_sum_heap_and_index_separately():
     # Heap and index are summed as distinct figures; total is their sum
-    # (issue #37: heap_bytes + index_bytes == the old conflated total).
+    # (heap_bytes + index_bytes).
     totals = PgCyanMetrics._table_totals(SAMPLE_METRICS["tables"])
     assert totals["heap_bytes"] == 600 + 120
     assert totals["index_bytes"] == 400 + 80
@@ -106,12 +106,12 @@ def test_table_totals_handle_empty_and_missing_values():
 def test_build_output_carries_heap_index_split_and_totals():
     collector = make_collector()
     payload = collector._build_output(SAMPLE_METRICS)
-    # Per-table split is preserved and the conflated size_bytes is gone.
+    # Per-table split is heap_bytes + index_bytes, with no conflated size_bytes.
     widgets = payload["tables"][0]
     assert widgets["heap_bytes"] == 600
     assert widgets["index_bytes"] == 400
     assert "size_bytes" not in widgets
-    # Totals ride along and sum to the old total-relation-size figure.
+    # Totals sum to the total-relation-size figure.
     assert payload["table_totals"]["heap_bytes"] == 720
     assert payload["table_totals"]["index_bytes"] == 480
     assert payload["table_totals"]["total_bytes"] == 1200

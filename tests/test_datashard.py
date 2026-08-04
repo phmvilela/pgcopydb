@@ -1,5 +1,7 @@
 """
-Unit tests for the sharded initial copy (`pg_cyan.cli copy-shard`, issue #25).
+Unit tests for the sharded initial copy (`pg_cyan.cli copy-shard`).
+
+See also: pg_cyan/datashard.py
 
 DB-free and process-free: the pgcopydb child AND the kubectl copy-log publish are
 stubbed via a fake ``subprocess.run``, and the target connection via a fake

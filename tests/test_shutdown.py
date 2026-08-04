@@ -3,7 +3,9 @@ Unit tests for the shared graceful-shutdown helper (``pg_cyan.shutdown``).
 
 DB-free: the pgcopydb child is a fake ``subprocess.Popen``. Covers the no-op
 paths, the clean SIGTERM exit, and the SIGKILL escalation with the reconciled
-(grace, reap) timeouts (issues #66 / #81).
+(grace, reap) timeouts.
+
+See also: pg_cyan/shutdown.py
 """
 import subprocess
 

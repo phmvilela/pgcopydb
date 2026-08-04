@@ -1,5 +1,7 @@
 """
-Unit tests for the migration planner (`pg_cyan.cli plan`, issue #38).
+Unit tests for the migration planner (`pg_cyan.cli plan`).
+
+See also: pg_cyan/planner.py
 
 DB-free by nature: the planner is a pure offline transform of the collected
 source artifacts. Tests exercise the bin-packer, the provable-disjointness
@@ -132,7 +134,7 @@ def test_plan_writes_plan_and_disjoint_filters(tmp_path):
     assert not (output / PgCyanPlanner.ERROR_FILENAME).exists()
 
     plan = json.loads(plan_file.read_text())
-    assert plan  # non-empty (issue #38 acceptance criterion)
+    assert plan  # non-empty
     assert plan["run_id"] == "test-run"
     assert plan["snapshot"]["mode"] == PgCyanPlanner.DEFAULT_SNAPSHOT_MODE
     assert plan["snapshot"]["not_consistent"] is False

@@ -1,5 +1,7 @@
 """
-Unit tests for the folded migration controller (`pg_cyan.cli run-migration`, #70).
+Unit tests for the folded migration controller (`pg_cyan.cli run-migration`).
+
+See also: pg_cyan/controller.py
 
 Cluster-free and process-free: the snapshot sub-component and the orchestrator
 are both injected as fakes, so nothing spawns pgcopydb or touches a cluster.
@@ -33,7 +35,7 @@ class _FakeHolder:
         self._summary = {"status": status, "snapshot_name": snapshot,
                          "slot": "pgcyan_slot", "publication": "pgcyan_pub"}
         self.proc = _FakeProc(proc_alive)
-        # The controller hands these to the orchestrator for the CDC phase (#26).
+        # The controller hands these to the orchestrator for the CDC phase.
         self.slot_name = "pgcyan_slot"
         self.plugin = "pgoutput"
         self.established = False
@@ -86,7 +88,7 @@ class _FakeCore:
 
 
 class _FakeFollow:
-    """Records kwargs; start() succeeds unless slot is the 'bad' sentinel (#26 A)."""
+    """Records kwargs; start() succeeds unless slot is the 'bad' sentinel."""
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.started = False
@@ -243,8 +245,8 @@ def test_no_cdc_by_default_parks_after_walk():
 
 
 def test_full_walk_starts_cdc_on_controller_dir(monkeypatch):
-    # Option A (#26): after a full successful walk, the controller releases the
-    # snapshot and becomes the CDC consumer (streaming on its own --dir).
+    # After a full successful walk, the controller releases the snapshot and
+    # becomes the CDC consumer (streaming on its own --dir).
     capture = {}
     ctl = _make_controller(capture=capture, follow_cdc=True)
     summary = ctl.run()
@@ -256,7 +258,7 @@ def test_full_walk_starts_cdc_on_controller_dir(monkeypatch):
     assert capture["cdc"].kwargs["plugin"] == "pgoutput"
     # the snapshot was released before CDC (freeing the slot)
     assert ctl._released is True
-    # the orchestrator no longer receives slot/release wiring
+    # the orchestrator does not receive slot/release wiring
     assert "slot_name" not in capture["orch"].kwargs
     assert "release_snapshot" not in capture["orch"].kwargs
 
@@ -283,8 +285,8 @@ def test_cdc_skipped_when_walk_stops_before_postdata():
 
 
 def test_release_snapshot_closes_holder_and_marks_healthy():
-    # Releasing the snapshot ahead of CDC (#26) closes the holder, and from then
-    # on the health-check reports healthy (its absence is by design, not failure).
+    # Releasing the snapshot ahead of CDC closes the holder, and from then on the
+    # health-check reports healthy (its absence is by design, not failure).
     ctl = _make_controller()
     holder = ctl.holder
     assert ctl._snapshot_alive() is True          # child alive pre-release
@@ -307,7 +309,7 @@ def test_resolve_owner_reference_shape():
     }
 
 
-# --------------------------------------------------- wait-to-start (issue #85)
+# --------------------------------------------------- wait-to-start
 
 def test_handle_api_status_health_and_unknown_routes(tmp_path):
     ctl = _make_controller(ready_file=str(tmp_path / "ready"))
@@ -342,7 +344,7 @@ def test_post_start_is_idempotent(tmp_path):
 
 
 def test_wait_to_start_holds_snapshot_until_start_signal(tmp_path):
-    """The snapshot is established only AFTER POST /start, not at launch (#85)."""
+    """The snapshot is established only AFTER POST /start, not at launch."""
     import threading
     import time
 

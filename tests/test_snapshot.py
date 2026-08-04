@@ -1,5 +1,7 @@
 """
-Unit tests for the snapshot holder (`pg_cyan.cli snapshot-hold`, issue #23).
+Unit tests for the snapshot holder (`pg_cyan.cli snapshot-hold`).
+
+See also: pg_cyan/snapshot.py
 
 DB-free: psycopg2 and the pgcopydb child are stubbed, so nothing connects or
 spawns a real process. Tests exercise plan overrides, the pgcopydb command
@@ -164,7 +166,7 @@ def test_build_pgcopydb_command_has_follow_plugin_slot_dir(tmp_path):
     assert "--follow" in cmd
     assert cmd[cmd.index("--plugin") + 1] == "pgoutput"
     assert cmd[cmd.index("--slot-name") + 1] == "s"
-    # `pgcopydb snapshot` has NO --publication option (only clone/follow do);
+    # `pgcopydb snapshot` has no --publication option (only clone/follow do);
     # passing it makes pgcopydb print usage and exit. drop_stale_publication
     # handles the slot-named publication pgcopydb auto-creates instead.
     assert "--publication" not in cmd
@@ -321,9 +323,9 @@ def test_drop_stale_slot_refuses_active_slot(tmp_path):
 # ------------------------------------------------------- stale pgcopydb pub
 
 def test_drop_stale_publication_drops_slot_named_pub(tmp_path):
-    # pgcopydb auto-creates a publication named after the SLOT; we clear it (via
-    # DROP ... IF EXISTS) so pgcopydb's non-idempotent CREATE succeeds. It must
-    # target the slot name, NOT the holder's own publication_name.
+    # pgcopydb auto-creates a publication named after the slot; we DROP ... IF
+    # EXISTS it so pgcopydb's non-idempotent CREATE succeeds. It must target the
+    # slot name, not the holder's own publication_name.
     conn = _FakeConn()
     holder = _make_holder(tmp_path, slot_name="pgcyan_slot", publication_name="pgcyan_pub")
     holder.conn = conn
@@ -455,7 +457,7 @@ def test_terminate_child_noop_when_already_exited(tmp_path):
 
 
 def test_terminate_child_escalates_to_sigkill_with_reconciled_timeouts(tmp_path):
-    """#66: a pgcopydb child that ignores SIGTERM is SIGKILLed, and the two waits
+    """A pgcopydb child that ignores SIGTERM is SIGKILLed, and the two waits
     use the SIGTERM grace window then the short reap window -- both bounded so the
     total teardown fits inside the pod's terminationGracePeriodSeconds."""
     import subprocess

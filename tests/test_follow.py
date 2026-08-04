@@ -1,5 +1,7 @@
 """
-Unit tests for the CDC follow component (`PgCyanFollow`, #26, Option A).
+Unit tests for the CDC follow component (`PgCyanFollow`).
+
+See also: pg_cyan/follow.py
 
 DB-free: the pgcopydb child is a fake ``subprocess.Popen`` and the slot-state poll
 is a fake psycopg2 connection. Tests cover the command build (follow on the
@@ -252,9 +254,8 @@ def _monotonic_seq(values):
 
 
 def test_close_escalates_to_sigkill_within_the_pod_grace(tmp_path):
-    """#81: a follow child that ignores SIGTERM is SIGKILLed, using the shared
-    (grace, reap) windows reconciled with the controller pod's 60s grace -- not
-    the old 30s that gave up at the halfway mark."""
+    """A follow child that ignores SIGTERM is SIGKILLed, using the shared
+    (grace, reap) windows reconciled with the controller pod's 60s grace."""
     from pg_cyan.shutdown import GRACEFUL_SHUTDOWN_TIMEOUT, SIGKILL_REAP_TIMEOUT
 
     class _StubbornProc:
