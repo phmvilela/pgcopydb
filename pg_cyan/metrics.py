@@ -5,8 +5,8 @@ Connects to the source database and captures metrics useful for planning the
 migration pipeline: server version, object counts (tables, partitions,
 views, indexes, sequences, functions, procedures, triggers, extensions),
 database size, and per-table sizes -- reported as separate heap and index
-figures, per table and as database-wide totals (issue #37), so the migration
-planner can size the network-bound COPY (heap) apart from the index build.
+figures, per table and as database-wide totals, so the migration planner can
+size the network-bound COPY (heap) apart from the index build.
 
 Follows the ``PgCyanParameters`` / ``PgCyanPreflight`` orchestrator pattern
 (see ``parameters.py``, ``preflight.py``, and ``CLAUDE.md``): one class per
@@ -14,7 +14,7 @@ stage, connection/state on the instance, structured JSON logging via
 ``_log_event``, and graceful degradation -- nothing here raises to the
 caller. On success a non-empty ``source-pg-metrics.json`` is written; on any
 failure a ``source-pg-metrics-errors.json`` with an error message is written
-instead (issue #3).
+instead.
 
 Object counts assume PostgreSQL 11+ (``pg_proc.prokind`` distinguishes
 functions from procedures; stored procedures don't exist before PG11).
@@ -69,11 +69,11 @@ _OBJECT_COUNTS_QUERY = """
         (SELECT count(*) FROM pg_extension) AS extensions;
 """
 
-# Heap and index bytes are reported separately (issue #37): the planner
-# bin-packs copy shards by heap bytes (phase 2, network-bound COPY) but sizes
-# the index-build work (phase 3) by index bytes, so a single conflated size
-# makes both splits wrong. ``pg_table_size`` (heap + TOAST + FSM/VM) plus
-# ``pg_indexes_size`` sum to the old ``pg_total_relation_size`` figure.
+# Heap and index bytes are reported separately: the planner bin-packs copy
+# shards by heap bytes (phase 2, network-bound COPY) but sizes the index-build
+# work (phase 3) by index bytes, so a single conflated size makes both splits
+# wrong. ``pg_table_size`` (heap + TOAST + FSM/VM) plus ``pg_indexes_size`` sum
+# to the ``pg_total_relation_size`` figure.
 _TABLE_SIZES_QUERY = """
     SELECT
         n.nspname AS schema,
@@ -294,11 +294,11 @@ class PgCyanMetrics:
         """
         Sum the per-table heap/index figures into database-wide totals.
 
-        Reported alongside the per-table breakdown (issue #37) so the planner
-        can size the network-bound COPY (phase 2, heap bytes) separately from
-        the index build (phase 3, index bytes). ``heap_bytes + index_bytes``
-        equals ``total_bytes``, which matches the old conflated
-        ``pg_total_relation_size`` sum.
+        Reported alongside the per-table breakdown so the planner can size the
+        network-bound COPY (phase 2, heap bytes) separately from the index build
+        (phase 3, index bytes). ``heap_bytes + index_bytes`` equals
+        ``total_bytes``, which matches the conflated ``pg_total_relation_size``
+        sum.
         """
         heap_bytes = sum(t.get("heap_bytes") or 0 for t in tables)
         index_bytes = sum(t.get("index_bytes") or 0 for t in tables)

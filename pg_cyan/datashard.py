@@ -1,26 +1,24 @@
 """
-Sharded initial copy pinned to the snapshot (issue #25) -- phase ``2``.
+Sharded initial copy pinned to the snapshot -- phase ``2``.
 
 This is the phase ``2`` node in ``deploy/k8s/`` (``60-job-phase2-datashard.template.yaml``):
 one Job per copy shard, all running concurrently, each copying its OWN disjoint
-set of tables (authored by the planner #38 as ``shard-<n>.filters``) so no row is
+set of tables (authored by the planner as ``shard-<n>.filters``) so no row is
 copied twice and none is missed. Scale-out is *more shard Jobs*, not fatter pods
 -- COPY is network-bound (source -> pod -> target).
 
-DATA ONLY -- ``pgcopydb copy table-data``, NOT ``clone``. Phase 0 (#24) already
+DATA ONLY -- ``pgcopydb copy table-data``, NOT ``clone``. Phase 0 already
 created the target schema (pre-data section: tables, sequences, functions) and
-phase 3 (#28) builds the secondary indexes / PK-unique / FK constraints
-afterwards (post-data section). ``pgcopydb clone`` would re-run BOTH schema
-sections around the COPY (see ``notes/migration-phases-lessons-learned.md`` item
-6), colliding with phases 0/3 and re-tripping the Azure extension/ownership walls
-(item 2). ``pgcopydb copy table-data`` copies the HEAP and nothing else -- no
-schema, no indexes, no vacuum -- which is exactly this phase's job.
+phase 3 builds the secondary indexes / PK-unique / FK constraints afterwards
+(post-data section). ``pgcopydb clone`` would re-run BOTH schema sections around
+the COPY (see ``notes/migration-phases-lessons-learned.md`` item 6), colliding
+with phases 0/3 and re-tripping the Azure extension/ownership walls (item 2).
+``pgcopydb copy table-data`` copies the HEAP and nothing else -- no schema, no
+indexes, no vacuum -- which is exactly this phase's job.
 
 CONSISTENCY: every shard is pinned to the SAME ``--snapshot=<id>`` -- the
-consistent point the controller (#70, which folded in the phase-1 holder #23)
-holds in-pod and injects into each phase pod as ``$SNAPSHOT_ID`` -- so all shards
-copy the same instant. (#70 superseded the earlier ``pgcyan-snapshot`` ConfigMap
-handoff, #58.)
+consistent point the controller holds in-pod and injects into each phase pod as
+``$SNAPSHOT_ID`` -- so all shards copy the same instant.
 
 RESUME: each shard has its OWN ReadWriteOnce managed disk mounted at ``--dir``
 (``/work``); ``--resume`` means a killed/backed-off shard pod re-attaches the
@@ -46,12 +44,12 @@ estimate, not rows actually landed). Counting is gated by ``--count-rows`` /
 ``$PGCYAN_COUNT_ROWS`` -- default on, because verifying the copy is the whole
 point of the log, but disableable for very large tables where a full seq-scan
 (indexes are not built until phase 3) is too costly. Sourcing the count from
-pgcopydb's own accounting instead is tracked in issue #69.
+pgcopydb's own accounting instead is a possible future refinement.
 
 The per-shard log is ALSO published into its OWN ``pgcyan-copylog-<shard>``
 ConfigMap (via ``kubectl``, mirroring how the snapshot holder publishes its
 snapshot id): the shard's work dir is a private RWO disk the orchestrator cannot
-mount, so the ConfigMap is the durable, structured handoff the orchestrator (#40)
+mount, so the ConfigMap is the durable, structured handoff the orchestrator
 reads to aggregate the combined ``migration-copy-log.json`` across all shards.
 The shard runs under the ``pgcyan-worker`` SA, which is granted a narrow
 ``configmaps: [create, get, patch]`` for exactly this (see ``01-rbac.yaml``).

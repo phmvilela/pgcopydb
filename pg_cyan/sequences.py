@@ -1,12 +1,12 @@
 """
-Target sequence sync (issue #78) -- run after the data copy, before CDC.
+Target sequence sync -- run after the data copy, before CDC.
 
 The sharded copy loads rows with their EXPLICIT id values (``pgcopydb copy
 table-data`` -> COPY), which never advances the owning identity/serial SEQUENCE.
 So after the copy every target sequence is stuck at its start
 (``pg_sequence_last_value`` is NULL / ``is_called`` false), and the next
 ``nextval`` returns 1. That breaks two things:
-  * CDC (#26): apply sets ``GENERATED ALWAYS AS IDENTITY`` columns to DEFAULT, so a
+  * CDC: apply sets ``GENERATED ALWAYS AS IDENTITY`` columns to DEFAULT, so a
     replicated INSERT draws ``id`` from the sequence -> gets 1 -> COLLIDES with the
     already-copied row id=1; the conflict is swallowed on commit and the change is
     silently dropped.
@@ -18,14 +18,14 @@ it on the target, so target sequences match the source (next ids continue past t
 copied rows).
 
 CUSTOM SQL, not ``pgcopydb copy sequences`` -- pgcopydb's per-object ``copy``
-sub-commands no-op in our standalone per-pod ``--dir`` (lesson from #28). This is a
+sub-commands no-op in our standalone per-pod ``--dir``. This is a
 single coordinated pass (sequences are cheap; not sharded).
 
 CAVEAT (online source): with pgcopydb's transform-to-DEFAULT for identity columns,
 a source that keeps taking writes during the migration can still diverge ids for
 changes in the gap between the snapshot and this sync (and thus break FK
 references). A frozen-source cutover is unaffected. Deeper id preservation is a
-separate concern (see #78).
+separate concern.
 
 Output (to ``--output-dir`` / ``$PG_OUTPUT_DIR``), the usual two-file shape:
   * ``target-pg-sequences-log.json``        -- on success.

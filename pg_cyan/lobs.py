@@ -14,7 +14,7 @@ connection/state on the instance, structured JSON logging via ``_log_event``,
 and graceful degradation -- nothing here raises to the caller. On success a
 non-empty ``source-pg-largeobjects.json`` is written; on any failure
 (connection, query, or write) a ``source-pg-largeobjects-errors.json`` with an
-error message is written instead (issue #20).
+error message is written instead.
 
 Note: a count of **zero** is a valid happy-path result (a database may simply
 have no large objects) -- only connection/query/write problems are failures.

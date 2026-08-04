@@ -275,9 +275,9 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
     Applies planner(-1) -> pre-data(0) -> data shards(2) -> index(3a) -> FK(3b),
     stopping (without applying later phases) at the first phase whose Jobs/
     Deployments do not all succeed/become ready. (CDC is not a DAG phase -- the
-    controller streams it after the walk, #26.) Standalone: the
-    snapshot is NOT held (that is what `run-migration` adds -- issue #70); pass
-    SNAPSHOT_ID some other way if a phase needs it.
+    controller streams it after the walk.) Standalone: the snapshot is NOT held
+    (that is what `run-migration` adds); pass SNAPSHOT_ID some other way if a
+    phase needs it.
     """
     orchestrator = PgCyanOrchestrator(
         namespace=namespace, manifests_dir=manifests_dir, plan_configmap=plan_configmap,
@@ -332,7 +332,7 @@ def restore_predata(source_pguri: str, target_pguri: str, snapshot_id: str,
     pre-data section to the target (``pgcopydb restore pre-data``) -- tables,
     sequences and functions, but deliberately NOT secondary indexes,
     primary-key/unique constraints, foreign keys, or triggers (those are the
-    post-data phase, #28, so the initial COPY is not slowed by index
+    post-data phase, so the initial COPY is not slowed by index
     maintenance). Writes ``target-pg-schema-log.json`` on success, or
     ``target-pg-schema-log-errors.json`` on failure.
     """
@@ -436,12 +436,12 @@ def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_fi
               show_default="$SHARD_NAME", help="This index shard's name (e.g. idx-0), recorded in the log.")
 def build_indexes(source_pguri: str, target_pguri: str,
                   filter_file: str, shard_name: str) -> None:
-    """Build one shard's indexes + PK/unique constraints on the target (phase 3a, #28).
+    """Build one shard's indexes + PK/unique constraints on the target (phase 3a).
 
     Custom SQL (like build-foreign-keys, not pgcopydb): introspect this shard's
     tables' secondary indexes (pg_get_indexdef) and PK/UNIQUE constraints
     (pg_get_constraintdef) from the source and apply them to the target -- CREATE
-    INDEX then ADD CONSTRAINT. The PK/unique piece is what #24 deferred to #28.
+    INDEX then ADD CONSTRAINT. The PK/unique piece is deferred here from pre-data.
     Foreign keys are the separate single pass (``build-foreign-keys``). Writes
     ``target-pg-index-log.json`` (per shard) or ``-errors.json``.
     """
@@ -468,11 +468,11 @@ def build_indexes(source_pguri: str, target_pguri: str,
 @click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
               show_default="$PG_OUTPUT_DIR", help="Directory for target-pg-sequences-log[-errors].json.")
 def copy_sequences(source_pguri: str, target_pguri: str, output_dir: str) -> None:
-    """Sync the target's sequences to the source after the copy (phase 2s, issue #78).
+    """Sync the target's sequences to the source after the copy (phase 2s).
 
     Custom SQL (not pgcopydb): read each source sequence's value and ``setval`` it on
     the target, so target identity/serial sequences continue past the copied rows.
-    The COPY-based data load leaves them at their start, which would make CDC (#26)
+    The COPY-based data load leaves them at their start, which would make CDC
     and post-cutover inserts collide on id=1. Runs once, after the data copy, before
     CDC. Writes ``target-pg-sequences-log.json``.
     """
@@ -496,7 +496,7 @@ def copy_sequences(source_pguri: str, target_pguri: str, output_dir: str) -> Non
 @click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
               show_default="$PG_OUTPUT_DIR", help="Directory for target-pg-postload-log[-errors].json.")
 def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) -> None:
-    """Apply the source's foreign keys to the target (phase 3b, issue #28).
+    """Apply the source's foreign keys to the target (phase 3b).
 
     Custom SQL (not pgcopydb): introspect the source's FK definitions and apply
     each to the target as ``ADD CONSTRAINT ... NOT VALID`` (brief lock) then
@@ -537,14 +537,14 @@ def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) ->
               help="Park pre-snapshot and serve a control API; take the snapshot and walk only on POST /start")
 def run_migration(namespace: str, in_cluster: bool, stop_after: str,
                   follow_cdc: bool, wait_for_start: bool) -> None:
-    """Hold the snapshot in-pod and walk the whole migration DAG (issue #70, #26).
+    """Hold the snapshot in-pod and walk the whole migration DAG.
 
     The folded controller: it establishes and HOLDS the consistent snapshot in
     its own pod (no separate holder Deployment, no `pgcyan-snapshot` ConfigMap),
     walks planner -> pre-data -> data shards -> index -> FK injecting the snapshot
     id into the pods and owning every workload it creates, then -- with
     ``--follow-cdc`` -- releases the snapshot and becomes the CDC consumer itself
-    (`pgcopydb follow` on its own --dir, Option A #26). Single-pod StatefulSet;
+    (`pgcopydb follow` on its own --dir, Option A). Single-pod StatefulSet;
     config is env-driven (the manifest sets it).
 
     With ``--wait-for-start`` it does NOT snapshot on launch: it serves

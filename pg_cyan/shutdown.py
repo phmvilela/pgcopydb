@@ -1,18 +1,15 @@
 """
 Shared graceful-shutdown helper for the long-lived pgcopydb children.
 
-Both the snapshot holder (``snapshot.py``) and the CDC follow stream
-(``follow.py``) run a long-lived ``pgcopydb`` child inside the controller pod and
-must stop it cleanly on SIGTERM -- closing the source replication connection /
-releasing the slot -- before the kubelet force-kills the pod at
-``terminationGracePeriodSeconds`` (60s; see
+Both the snapshot holder (see ``pg_cyan/snapshot.py``) and the CDC follow stream
+(see ``pg_cyan/follow.py``) run a long-lived ``pgcopydb`` child inside the
+controller pod and must stop it cleanly on SIGTERM -- closing the source
+replication connection / releasing the slot -- before the kubelet force-kills the
+pod at ``terminationGracePeriodSeconds`` (60s; see
 ``deploy/k8s/35-statefulset-controller.yaml``).
 
 Centralising the "SIGTERM, wait the grace window, escalate to SIGKILL, reap"
-sequence here keeps the two call sites from drifting: issue #66 fixed the
-snapshot side (the 30s SIGKILL timeout undercut the 60s grace); issue #81 found
-``follow.close()`` still carried the same unreconciled 30s path and folded it
-onto this shared helper.
+sequence here keeps the two call sites reconciled with the 60s grace window.
 """
 
 import subprocess
@@ -21,7 +18,7 @@ from typing import Callable, Optional
 #: SIGTERM grace window (seconds) -- sized just under the controller pod's
 #: ``terminationGracePeriodSeconds: 60`` so the child gets nearly the full window
 #: to exit cleanly, while our own SIGKILL + reap still run *before* the kubelet
-#: force-kills the pod at 60s (issue #66: the old 30s gave up at the halfway mark).
+#: force-kills the pod at 60s.
 GRACEFUL_SHUTDOWN_TIMEOUT = 55
 
 #: Seconds to reap the child after SIGKILL. SIGKILL is uninterruptible so the reap

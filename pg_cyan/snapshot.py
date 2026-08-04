@@ -1,34 +1,31 @@
 """
-Snapshot holder for the sharded pgcopydb topology (issue #23).
+Snapshot holder for the sharded pgcopydb topology.
 
-The single most safety-critical piece of the migration. Since issue #70 this is
-the **snapshot sub-component of the folded controller** (``pg_cyan/controller.py``
-holds it in-pod) -- NOT a standalone Deployment anymore (the old
-``50-deployment-snapshot-holder.yaml`` + ``snapshot-hold`` command were retired).
-It establishes -- and then **holds** -- the consistent logical-replication setup
-on the *source* database in one coordinated step, so every downstream copy phase
-pins the exact same instant:
+The single most safety-critical piece of the migration -- the snapshot
+sub-component of the folded controller (``pg_cyan/controller.py`` holds it
+in-pod). It establishes -- and then **holds** -- the consistent
+logical-replication setup on the *source* database in one coordinated step, so
+every downstream copy phase pins the exact same instant:
 
   1. create the publication ``FOR ALL TABLES`` (idempotent),
   2. create the ``pgoutput`` logical replication slot and export its
      **consistent snapshot**,
   3. keep the exporting connection open so the snapshot stays valid for the
-     pre-data (#24) and sharded copy (#25) phases.
+     pre-data and sharded copy phases.
 
 WHY a long-lived holder: a PostgreSQL exported snapshot is only valid while the
-transaction that exported it stays open. The moment that connection closes,
-``SET TRANSACTION SNAPSHOT`` in the shards fails and each shard would otherwise
-fall back to its OWN point in time -> silent cross-shard inconsistency. Because
-the shards are shared-nothing separate pods, none of them can own the snapshot
-on behalf of the others; this pod does. It runs as a Deployment (replicas=1 +
-PDB): if it dies the snapshot is gone and the in-flight initial copy must
+transaction that exported it stays open. Once that connection closes, ``SET
+TRANSACTION SNAPSHOT`` in the shards fails and each shard falls back to its OWN
+point in time -> silent cross-shard inconsistency. The shards are shared-nothing
+separate pods, so none can own the snapshot on behalf of the others; this pod
+does. If it dies the snapshot is gone and the in-flight initial copy must
 ``--restart`` from a new snapshot.
 
 Prefer driving pgcopydb (a thin wrapper) over hand-rolled ``CREATE_REPLICATION
 _SLOT`` SQL: the slot + snapshot are created and held by ``pgcopydb snapshot
 --follow --plugin pgoutput --slot-name <slot>`` as a child process, which writes
 the snapshot id to ``<work-dir>/snapshot`` on a **node-local** ``--dir`` (SQLite
-WAL cannot run on Azure Files/SMB -- issue #58) and closes the replication
+WAL cannot run on Azure Files/SMB) and closes the replication
 connection cleanly when signalled -- so a graceful pod exit leaves no stale
 connection behind. The holder creates its own publication ``FOR ALL TABLES``.
 Separately, pgcopydb's ``snapshot --follow --plugin pgoutput`` auto-manages a
@@ -39,10 +36,10 @@ run so pgcopydb can recreate it. The holder's own publication is a single
 ``CREATE PUBLICATION``, not the discouraged hand-rolled slot SQL) before starting
 the child.
 
-The snapshot id is then **published to the ``pgcyan-snapshot`` ConfigMap** (issue
-#58) via ``kubectl``, mirroring how the planner Job publishes ``plan.json``; the
-data shards read it via ``configMapKeyRef``. This replaces the old shared-RWX
-``/work`` handoff, so the holder needs no shared volume at all.
+The snapshot id is then **published to the ``pgcyan-snapshot`` ConfigMap** via
+``kubectl``, mirroring how the planner Job publishes ``plan.json``; the data
+shards read it via ``configMapKeyRef``, so the holder needs no shared volume at
+all.
 
 This node does NOT create or advance any replication origin -- that is the
 follow-CDC phase's job.
@@ -105,7 +102,7 @@ class PgCyanSnapshot:
     SNAPSHOT_FILENAME = "snapshot"
 
     #: ConfigMap key the exported snapshot id is published under, read by the
-    #: data shards via ``configMapKeyRef`` (issue #58).
+    #: data shards via ``configMapKeyRef``.
     SNAPSHOT_CONFIGMAP_KEY = "snapshot"
 
     #: Defaults kept in lock-step with ``PgCyanPlanner`` so the holder and the
@@ -121,8 +118,8 @@ class PgCyanSnapshot:
     DEFAULT_SNAPSHOT_TIMEOUT = 120
     #: The SIGTERM grace window / post-SIGKILL reap for the pgcopydb child on a
     #: graceful stop, sourced from the shared ``shutdown`` helper so the snapshot
-    #: and follow (#81) call sites stay reconciled with the pod's
-    #: ``terminationGracePeriodSeconds: 60`` (issue #66; see ``shutdown.py``).
+    #: and follow call sites stay reconciled with the pod's
+    #: ``terminationGracePeriodSeconds: 60`` (see ``pg_cyan/shutdown.py``).
     DEFAULT_SHUTDOWN_TIMEOUT = GRACEFUL_SHUTDOWN_TIMEOUT
     SIGKILL_REAP_TIMEOUT = _SIGKILL_REAP_TIMEOUT
 
@@ -170,9 +167,9 @@ class PgCyanSnapshot:
             snapshot_timeout: seconds to wait for the child to export the snapshot.
             shutdown_timeout: the SIGTERM grace window (seconds) before escalating
                 to SIGKILL; sized just under the pod's terminationGracePeriodSeconds
-                (see DEFAULT_SHUTDOWN_TIMEOUT, issue #66).
+                (see DEFAULT_SHUTDOWN_TIMEOUT).
             snapshot_configmap: name of the ConfigMap to publish the snapshot id
-                into for the shards (issue #58). ``None``/empty skips publishing
+                into for the shards. ``None``/empty skips publishing
                 (local runs without a cluster); in-cluster the holder sets it.
             configmap_namespace: namespace for that ConfigMap; ``None`` lets
                 ``kubectl`` use the pod's own (in-cluster) namespace.
@@ -230,7 +227,7 @@ class PgCyanSnapshot:
         """
         Override publication/slot/mode from ``plan.json`` when one is supplied.
 
-        The planner (#38) is the authority for these names and the snapshot
+        The planner is the authority for these names and the snapshot
         mode; when the orchestrator hands the holder the plan, prefer its values
         over the option/env defaults. Missing/unreadable plan is a silent no-op
         (the defaults still apply) -- never raises.
@@ -280,8 +277,8 @@ class PgCyanSnapshot:
         Absolute path pgcopydb writes the exported snapshot id to.
 
         This is under ``work_dir`` -- pgcopydb's private ``--dir``, a node-local
-        ``emptyDir`` in the pod (SQLite/WAL cannot run on Azure Files/SMB, issue
-        #58). The id is then *published* to the ``pgcyan-snapshot`` ConfigMap via
+        ``emptyDir`` in the pod (SQLite/WAL cannot run on Azure Files/SMB). The
+        id is then *published* to the ``pgcyan-snapshot`` ConfigMap via
         :meth:`publish_snapshot_configmap` for the downstream shards to read.
         """
         return os.path.join(self.work_dir, self.SNAPSHOT_FILENAME)
@@ -296,7 +293,7 @@ class PgCyanSnapshot:
         pod, but the shared ``output_dir`` on the ``/work`` PVC persists across
         runs. A leftover pgcopydb catalog would push pgcopydb into *resume* mode
         and -- because a consistent snapshot cannot be resumed -- abort with
-        ``Option --resume requires option --not-consistent`` (issue #23). The
+        ``Option --resume requires option --not-consistent``. The
         holder is authoritative and non-resumable by design (a restart == a
         brand-new snapshot), so it must always start from a clean dir.
 
@@ -670,8 +667,8 @@ class PgCyanSnapshot:
         """
         Publish the exported snapshot id into the ``pgcyan-snapshot`` ConfigMap.
 
-        pgcopydb writes the id to its private node-local ``--dir`` (issue #58:
-        the SQLite/WAL catalog cannot live on Azure Files/SMB). Rather than mirror
+        pgcopydb writes the id to its private node-local ``--dir`` (the
+        SQLite/WAL catalog cannot live on Azure Files/SMB). Rather than mirror
         it onto a shared volume, the holder publishes it to a ConfigMap -- the
         data shards then read it via ``configMapKeyRef`` (60-*.template.yaml).
         This mirrors how the planner Job publishes ``plan.json`` to the
@@ -840,7 +837,7 @@ class PgCyanSnapshot:
         # Start from a clean slate: the /work PVC persists across runs, and the
         # holder is non-resumable by design (a restart == a new snapshot). A
         # leftover pgcopydb catalog here would push pgcopydb into resume mode and
-        # abort the consistent snapshot (issue #23); a leftover slot file would
+        # abort the consistent snapshot; a leftover slot file would
         # trip the readiness probe prematurely.
         self.reset_work_dir()
         summary = {
@@ -1037,9 +1034,9 @@ class PgCyanSnapshot:
     def _terminate_child(self) -> None:
         """SIGTERM the pgcopydb child and reap it, escalating to SIGKILL.
 
-        Delegates to the shared ``graceful_terminate`` (``shutdown.py``) so the
-        snapshot and follow (#81) shutdowns stay reconciled with the pod grace
-        period (#66).
+        Delegates to the shared ``graceful_terminate`` (see
+        ``pg_cyan/shutdown.py``) so the snapshot and follow shutdowns stay
+        reconciled with the pod grace period.
         """
         graceful_terminate(
             self.proc,

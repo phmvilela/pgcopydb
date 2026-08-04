@@ -1,5 +1,5 @@
 """
-Post-data foreign-key constraints for the sharded topology (issue #28) -- phase ``3b``.
+Post-data foreign-key constraints for the sharded topology -- phase ``3b``.
 
 This is the phase ``3b`` node in ``deploy/k8s/`` (``71-job-phase3-fk.yaml``): a
 **single** coordinated pass, run after every index shard (phase ``3a``) succeeds.

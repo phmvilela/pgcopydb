@@ -1,31 +1,15 @@
 """
-Migration DAG orchestrator (issue #40).
+Migration DAG orchestrator.
 
-**Design decision (the ticket's open question): custom Python, not Argo
-Workflows.** Rationale:
-
-  * ``01-rbac.yaml`` already scopes a plain ``pgcyan-orchestrator``
-    ServiceAccount with Job/Deployment/ConfigMap verbs -- exactly what the
-    official ``kubernetes`` Python client needs (in-cluster config + that
-    ServiceAccount's token), with zero new CRDs, controllers, or
-    cluster-admin bootstrap. Argo Workflows would require installing and
-    RBAC-ing its own controller + CRDs (``Workflow``/``WorkflowTemplate``)
-    before a single pgcyan Job could run.
-  * Every other pgcyan stage (preflight, parameters, metrics, lobs, planner)
-    is already a ``PgCyan<Stage>`` class driven by ``pg_cyan.cli``, sharing
-    one container image and one ``_log_event`` structured-logging
-    convention (see ``CLAUDE.md``). This orchestrator is the same pattern's
-    eighth instance rather than a second orchestration paradigm bolted on
-    alongside it.
-  * The barriers this ticket needs are simple: "wait for N Jobs to reach
-    ``Complete``" and "wait for a Deployment to become Ready". The
-    Kubernetes client's status APIs are sufficient for that; it does not
-    need Argo's retry/artifact/DSL machinery, and operators keep debugging
-    with ``kubectl`` against these same ``deploy/k8s/`` files instead of
-    learning a second workflow language.
-  * Argo remains a fine drop-in later -- the node objects/YAML do not
-    change (see ``deploy/k8s/README.md``) -- if the DAG grows real
-    conditional/fan-in complexity beyond linear phase barriers.
+Custom Python, not Argo Workflows: ``01-rbac.yaml`` already scopes a
+``pgcyan-orchestrator`` ServiceAccount with the Job/Deployment/ConfigMap verbs
+the ``kubernetes`` Python client needs, with no new CRDs or controllers; every
+other pgcyan stage is already a ``PgCyan<Stage>`` class sharing one image and
+``_log_event`` convention; and the barriers here are simple ("wait for N Jobs to
+Complete", "wait for a Deployment to become Ready"), which the client's status
+APIs cover without Argo's DSL -- operators keep debugging with ``kubectl``
+against the same ``deploy/k8s/`` files. Argo stays a drop-in later since the
+node objects/YAML do not change (see ``deploy/k8s/README.md``).
 
 Implements the phase walk from ``deploy/k8s/README.md`` /
 ``notes/k8s-sharded-migration-topology.md``::
@@ -33,16 +17,16 @@ Implements the phase walk from ``deploy/k8s/README.md`` /
     planner(-1) -> pre-data(0) -> data shards(2, xN)
     -> index(3a, xM) -> FK(3b)
 
-There is NO CDC phase: under Option A (issue #26) the controller streams CDC
-itself after the walk (see ``pg_cyan/controller.py`` / ``pg_cyan/follow.py``).
-There is NO snapshot-holder phase: under the folded model (issue #70) the
-CONTROLLER that drives this orchestrator (``pg_cyan/controller.py``) holds the
-consistent snapshot in its OWN pod and passes the id in via ``snapshot_id``,
-which the orchestrator injects as ``SNAPSHOT_ID`` into the ``needs_snapshot``
-phases (pre-data pins its schema dump to it; the shards copy it). The controller
-also passes its StatefulSet as ``owner_reference``, stamped onto every workload
-so deleting the controller cascade-deletes the whole migration, and a
-``health_check`` the barrier loop polls so a dropped snapshot aborts the walk.
+There is no CDC phase: under Option A the controller streams CDC itself after
+the walk (see ``pg_cyan/controller.py`` / ``pg_cyan/follow.py``). There is no
+snapshot-holder phase: the CONTROLLER that drives this orchestrator
+(``pg_cyan/controller.py``) holds the consistent snapshot in its OWN pod and
+passes the id in via ``snapshot_id``, which the orchestrator injects as
+``SNAPSHOT_ID`` into the ``needs_snapshot`` phases (pre-data pins its schema dump
+to it; the shards copy it). The controller also passes its StatefulSet as
+``owner_reference``, stamped onto every workload so deleting the controller
+cascade-deletes the whole migration, and a ``health_check`` the barrier loop
+polls so a dropped snapshot aborts the walk.
 
 Each phase is applied from the ``deploy/k8s/`` manifests -- templated phases
 (data shards, index shards) are stamped out once per ``plan.json`` entry,
@@ -54,8 +38,8 @@ that phase's barrier before moving on:
   * Deployment phases block until the Deployment has its desired ready replica
     count -- a long-running Deployment never "completes", so its barrier means
     *ready*, not *completed*. (No current phase is a Deployment: CDC/follow is
-    now streamed in-pod by the controller, #26/#70, not a phase Deployment. The
-    handling is retained as generic capability for any future Deployment phase.)
+    streamed in-pod by the controller, not a phase Deployment. The handling is
+    retained as generic capability for any future Deployment phase.)
 
 Fails fast: the first phase whose barrier does not resolve to success stops
 the walk immediately (``run()`` returns without applying later phases).
@@ -153,7 +137,7 @@ class PgCyanOrchestrator:
     #: per-shard selector below never reads it back in.
     COPY_LOG_CONFIGMAP = "pgcyan-copylog"
     COPY_LOG_KEY = PgCyanDataShard.COPY_LOG_CONFIGMAP_KEY
-    #: Label selector for the per-shard copy-log ConfigMaps each data shard (#25)
+    #: Label selector for the per-shard copy-log ConfigMaps each data shard
     #: publishes (pgcyan-copylog-<shard>). The orchestrator lists these and merges
     #: them -- the shards run under an API-less-except-configmaps SA and write to
     #: private RWO disks, so the ConfigMap is the durable handoff.
@@ -162,7 +146,7 @@ class PgCyanOrchestrator:
     DEFAULT_JOB_TIMEOUT = 3600
     #: Placeholder every manifest carries in place of a concrete image; the
     #: orchestrator fills it with its OWN running image so every phase pod it
-    #: launches matches its tag (issue: single image per migration run).
+    #: launches matches its tag (single image per migration run).
     IMAGE_PLACEHOLDER = "PGCYAN_IMAGE"
     IMAGE_TOKEN = "${" + IMAGE_PLACEHOLDER + "}"
     #: Container names that identify the pgcyan app container in the pod spec.
@@ -171,9 +155,9 @@ class PgCyanOrchestrator:
     #: The DAG, in apply order. Static phases carry "manifest"; templated
     #: phases (stamped out once per plan.json entry) carry "template" +
     #: "plan_key" + "substitutions".
-    #: NOTE: there is NO snapshot-holder phase here anymore. Under the folded
-    #: model (issue #70) the CONTROLLER that runs this orchestrator holds the
-    #: consistent snapshot in its OWN pod and passes the id in via ``snapshot_id``;
+    #: There is no snapshot-holder phase here: the CONTROLLER that runs this
+    #: orchestrator holds the consistent snapshot in its OWN pod and passes the
+    #: id in via ``snapshot_id``;
     #: the orchestrator injects it as ``SNAPSHOT_ID`` into the phases flagged
     #: ``needs_snapshot`` (pre-data pins its schema dump to it; the data shards
     #: copy it), so no separate holder Deployment and no ``pgcyan-snapshot``
@@ -190,18 +174,18 @@ class PgCyanOrchestrator:
         },
         # Sequence sync right after the copy: the COPY-based load leaves target
         # identity/serial sequences at their start, so CDC/post-cutover inserts would
-        # collide on id=1 (issue #78). Custom psycopg2 (source pg_sequences ->
+        # collide on id=1. Custom psycopg2 (source pg_sequences ->
         # target setval); no snapshot (sequences are not MVCC).
         {"id": "2s", "name": "sequences", "manifest": "62-job-sequences.yaml"},
         {
             "id": "3a", "name": "index", "template": "70-job-phase3-index.template.yaml",
             "plan_key": "index_shards", "needs_plan": True, "substitutions": _index_shard_substitutions,
-            # Phases 3a (index/PK/unique) and 3b (FK) are both pure psycopg2 (#28):
+            # Phases 3a (index/PK/unique) and 3b (FK) are both pure psycopg2:
             # they read the source's DDL definitions directly, so -- like the other
             # collectors -- they need no injected snapshot.
         },
         {"id": "3b", "name": "fk", "manifest": "71-job-phase3-fk.yaml"},
-        # Phase 4 (CDC) is NOT an orchestrator phase: under Option A (issue #26) the
+        # Phase 4 (CDC) is NOT an orchestrator phase: under Option A the
         # controller itself becomes the CDC consumer after the walk, streaming
         # `pgcopydb follow` on its own --dir (the slot-creator and the streamer must
         # share a --dir; a separate pod cannot reuse the slot). See controller.py.
@@ -234,14 +218,14 @@ class PgCyanOrchestrator:
             poll_interval: Seconds between Job/Deployment status polls.
             job_timeout: Seconds to wait for a phase barrier before failing it.
             in_cluster: Load in-cluster ServiceAccount credentials (else local kubeconfig).
-            snapshot_id: The consistent snapshot id the controller holds in-pod
-                (issue #70). When set, injected as ``SNAPSHOT_ID`` into every
+            snapshot_id: The consistent snapshot id the controller holds in-pod.
+                When set, injected as ``SNAPSHOT_ID`` into every
                 ``needs_snapshot`` phase pod (replacing any manifest env of that
                 name). ``None`` -> no injection (standalone runs).
             owner_reference: A ``V1OwnerReference``-shaped dict (the controller's
                 StatefulSet). When set, stamped onto every object this orchestrator
                 creates, so deleting the StatefulSet cascade-deletes the whole
-                migration (issue #70). ``None`` -> unowned (standalone runs).
+                migration. ``None`` -> unowned (standalone runs).
             health_check: Optional ``() -> bool`` the barrier loop calls each poll;
                 returning ``False`` (the controller's snapshot child died) aborts
                 the wait -- a lost snapshot invalidates the in-flight copy.
@@ -378,7 +362,7 @@ class PgCyanOrchestrator:
         ``${KEY}`` in its string values, returning one dict per document.
 
         Templated phase files carry MORE than one document -- each per-shard Job
-        is preceded by its own ReadWriteOnce work-dir PVC (issue #58) -- so this
+        is preceded by its own ReadWriteOnce work-dir PVC -- so this
         returns a list. Parses BEFORE substituting (rather than regex-replacing
         the raw text) so that YAML comments -- which mention placeholders like
         ``${SNAPSHOT_ID}`` purely as prose -- are already stripped by the parser
@@ -420,7 +404,7 @@ class PgCyanOrchestrator:
                 subs = dict(phase["substitutions"](entry, plan or {}))
                 subs[self.IMAGE_PLACEHOLDER] = image  # strict _substitute fills the image too
                 # Templated phase files carry MORE than one document -- a per-shard
-                # RWO work-dir PVC precedes each Job (issue #58) -- so extend.
+                # RWO work-dir PVC precedes each Job -- so extend.
                 docs.extend(self._render_yaml(template_text, subs))
             return docs
 
@@ -444,10 +428,10 @@ class PgCyanOrchestrator:
         namespace = metadata["namespace"]
         name = metadata.get("name")
 
-        # Stamp the controller's StatefulSet as owner (issue #70) so that deleting
-        # the controller cascade-deletes every workload the migration created --
-        # correct semantics now that the snapshot lives in the controller (a lost
-        # controller == a lost snapshot == a run that must restart from scratch).
+        # Stamp the controller's StatefulSet as owner so that deleting the
+        # controller cascade-deletes every workload the migration created -- the
+        # snapshot lives in the controller (a lost controller == a lost snapshot
+        # == a run that must restart from scratch).
         if self.owner_reference is not None:
             metadata.setdefault("ownerReferences", []).append(self.owner_reference)
 
@@ -460,7 +444,7 @@ class PgCyanOrchestrator:
                 self.policy_api.create_namespaced_pod_disruption_budget(namespace=namespace, body=doc)
             elif kind == "PersistentVolumeClaim":
                 # Per-shard RWO work-dir disks stamped alongside the data-shard
-                # Jobs (issue #58; the index/FK phases are pure psycopg2 and use
+                # Jobs (the index/FK phases are pure psycopg2 and use
                 # emptyDir). Applied, not awaited -- binding happens when the shard
                 # pod schedules.
                 self.core_api.create_namespaced_persistent_volume_claim(namespace=namespace, body=doc)
@@ -514,7 +498,7 @@ class PgCyanOrchestrator:
         start = time.monotonic()
         while True:
             # Abort the wait if the controller's in-pod snapshot child has died
-            # (issue #70): the consistent point is gone, so anything copying
+            # the consistent point is gone, so anything copying
             # against it is now invalid -- fail fast rather than let the barrier
             # "succeed" against a dead snapshot.
             if self.health_check is not None and not self.health_check():
@@ -569,7 +553,7 @@ class PgCyanOrchestrator:
         """
         Read every per-shard copy-log ConfigMap and return the parsed dicts.
 
-        Each data shard (#25) publishes its ``migration-copy-log.json`` to a
+        Each data shard publishes its ``migration-copy-log.json`` to a
         labelled ``pgcyan-copylog-<shard>`` ConfigMap (the shard's work dir is a
         private RWO disk the orchestrator cannot mount, so the ConfigMap is the
         durable, structured handoff). We list them by label and parse the one key.
@@ -617,7 +601,7 @@ class PgCyanOrchestrator:
         """
         Merge the per-shard copy logs into one combined migration-copy-log.json.
 
-        Shard filter sets are disjoint by construction (planner #38), so the
+        Shard filter sets are disjoint by construction (the planner), so the
         combined ``tables`` map is their union; ``row_count_total`` sums the
         counted rows. Slot/publication/snapshot are one-per-run, so a shard
         disagreement is surfaced as a warning but does not fail aggregation.
@@ -732,7 +716,7 @@ class PgCyanOrchestrator:
         """
         Set ``SNAPSHOT_ID`` on every container of ``doc``'s pod template.
 
-        The folded controller (issue #70) holds the snapshot in its own pod and
+        The folded controller holds the snapshot in its own pod and
         knows the id directly, so it injects it here instead of the shards reading
         a ``pgcyan-snapshot`` ConfigMap. Any pre-existing ``SNAPSHOT_ID`` env entry
         (e.g. a leftover ``configMapKeyRef``) is REPLACED, so there is never a
@@ -822,7 +806,7 @@ class PgCyanOrchestrator:
 
             # Once a phase whose shards emit copy logs has cleared its barrier,
             # aggregate the per-shard logs into the combined migration-copy-log.json
-            # (issue #25). Best-effort: never flips a passed barrier to failure.
+            # Best-effort: never flips a passed barrier to failure.
             if result["success"] and phase.get("aggregate_copy_logs"):
                 try:
                     result["copy_log"] = self._aggregate_copy_logs()

@@ -1,28 +1,28 @@
 """
-Change Data Capture / follow -- the controller's CDC consumer (issue #26, Option A).
+Change Data Capture / follow -- the controller's CDC consumer (Option A).
 
 After the controller's DAG walk finishes (copy + post-data), the controller releases
 its held snapshot and then streams changes with ``pgcopydb follow`` -- the ongoing
 replication tail that applies everything written since the copy's snapshot to the
-target, until an operator flips the endpoint (cutover, #27/#29).
+target, until an operator flips the endpoint (cutover).
 
 WHY THE CONTROLLER STREAMS (not a separate pod). pgcopydb's CDC state -- the slot
 record, the ``sentinel`` (resume coordinates), and the received/transformed change
-stores -- lives in the ``--dir`` SQLite catalog. ``pgcopydb follow`` also creates
-its slot NON-idempotently (no flag reuses a pre-existing one); its sole reuse path
+stores -- lives in the ``--dir`` SQLite catalog. ``pgcopydb follow`` creates its
+slot NON-idempotently (no flag reuses a pre-existing one); its sole reuse path
 requires the slot's lsn+snapshot to already be present in the ``--dir`` ``source.db``
 catalog. So the slot-creator and the streamer MUST share one ``--dir``. The
 controller already created the slot (via ``pgcopydb snapshot --follow`` on its own
 ``--dir``); running ``follow`` on that SAME ``--dir`` finds the slot record and
-reuses it instead of colliding -- pgcopydb's native ``clone --follow`` lineage.
-A separate pod with a fresh ``--dir`` cannot do this (it would re-create the slot ->
-"already exists"). This is why CDC is a controller-owned step, not a k8s phase.
+reuses it instead of colliding. A separate pod with a fresh ``--dir`` cannot do
+this (it would re-create the slot -> "already exists"). This is why CDC is a
+controller-owned step, not a k8s phase.
 
 Consequently the controller's ``--dir`` is a PERSISTENT volume (not the fold's
 node-local emptyDir): CDC state (the sentinel + prefetch stores) must survive a
-controller restart. Note ``follow`` runs WITHOUT ``--resume`` here (see
+controller restart. ``follow`` runs WITHOUT ``--resume`` here (see
 ``build_follow_command`` -- ``--resume`` would skip creating the sentinel that
-``snapshot --follow`` never wrote); a future controller-restart resume would add it.
+``snapshot --follow`` never wrote).
 
 WHY NOT A SHARD: logical decoding is ONE slot with ONE consumer -- an ordered stream
 that cannot be fanned out. So CDC is exactly one consumer; the sharded model is an
@@ -34,8 +34,8 @@ which ``clone --follow`` flips after its base copy but our separate copy does no
 so ``start()`` enables it explicitly (``enable_apply`` -> ``stream sentinel set
 apply``) once attached, else follow would prefetch forever (``replay_lsn 0/0``).
 
-SCOPE (this issue): start CDC and confirm a single consumer is attached to the slot,
-then keep streaming until signalled. The cutover itself is #27/#29.
+SCOPE: start CDC and confirm a single consumer is attached to the slot, then keep
+streaming until signalled. The cutover itself is a separate step.
 
 Composed into ``PgCyanController`` like ``PgCyanSnapshot``: ``start()`` launches the
 ``follow`` child and blocks (polling the source) until the slot shows an active
@@ -44,7 +44,7 @@ consumer, writes ``migration-cdc-log.json`` + the shared readiness file, and ret
 signal, clearing readiness. ``close()`` terminates the child.
 
 LOB caveat (``notes/PostgreSQL Logical Replication Limitations ... LOBs.md``):
-pgoutput does not replicate large objects; the planner (#38) aborts on LOB sources,
+pgoutput does not replicate large objects; the planner aborts on LOB sources,
 so a stream that reaches here is LOB-free.
 """
 import json
@@ -167,7 +167,7 @@ class PgCyanFollow:
             (rc=12). Running without ``--resume`` reuses the slot AND creates the
             sentinel (startpos = the slot's LSN = the copy's snapshot point), which
             is exactly a first CDC start after the copy. (A future controller-restart
-            resume WOULD add ``--resume``, once refuse-to-resume is relaxed -- #76.)
+            resume WOULD add ``--resume``, once refuse-to-resume is relaxed.)
         """
         cmd = [
             self.PGCOPYDB_BIN, "follow",
@@ -329,9 +329,9 @@ class PgCyanFollow:
         released mid-flow before CDC started), so it must stop cleanly -- flush
         in-flight changes and release the source replication connection -- within
         the pod grace window. Uses the shared ``graceful_terminate``
-        (``shutdown.py``): SIGTERM, wait the ~grace window, then SIGKILL + short
-        reap, reconciled with ``terminationGracePeriodSeconds: 60`` (issue #81;
-        this used to give up after only 30s, half the grace window -- #66).
+        (see ``pg_cyan/shutdown.py``): SIGTERM, wait the ~grace window, then
+        SIGKILL + short reap, reconciled with ``terminationGracePeriodSeconds:
+        60``.
         """
         graceful_terminate(self.proc, log_event=self._log_event)
 

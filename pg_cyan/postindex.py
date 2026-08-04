@@ -1,22 +1,22 @@
 """
-Post-data index + PK/unique-constraint build for the sharded topology (issue #28)
+Post-data index + PK/unique-constraint build for the sharded topology
 -- phase ``3a``.
 
 This is the phase ``3a`` node in ``deploy/k8s/`` (``70-job-phase3-index.template.yaml``):
 one Job per index shard, all concurrent, each building the **secondary indexes AND
 the primary-key / unique constraints** for its OWN disjoint set of tables (the
-planner's ``shard-<n>.filters``, issue #38). Index builds are independent, so they
-shard the same way the copy does; foreign keys -- which can span shards -- are a
-separate single pass (phase ``3b``, ``pg_cyan/postfk.py``).
+planner's ``shard-<n>.filters``). Index builds are independent, so they shard the
+same way the copy does; foreign keys -- which can span shards -- are a separate
+single pass (phase ``3b``, ``pg_cyan/postfk.py``).
 
-WHY PK/UNIQUE LIVE HERE. #24 (pre-data) deliberately created tables with **no**
-indexes or constraints of any kind -- a primary key is backed by an index, and
-building it during pre-data would slow the COPY. So PK/unique constraints were
-descoped to #28, alongside the secondary indexes, and this phase builds both.
+WHY PK/UNIQUE LIVE HERE. Pre-data creates tables with **no** indexes or
+constraints of any kind -- a primary key is backed by an index, and building it
+during pre-data would slow the COPY. So PK/unique constraints land here alongside
+the secondary indexes, and this phase builds both.
 
 WHY CUSTOM SQL, NOT pgcopydb (like phase 3b). pgcopydb's per-object ``copy indexes``
-/ ``copy constraints`` are built for the shared ``--dir`` clone workflow and did
-nothing in our standalone per-shard pods (they exited 0 having built no indexes).
+/ ``copy constraints`` are built for the shared ``--dir`` clone workflow and do
+nothing in our standalone per-shard pods (they exit 0 having built no indexes).
 Rather than fight that coupling, this phase introspects the source's index and
 PK/unique definitions directly and applies them to the target over psycopg2 --
 the exact pattern phase 3b uses for foreign keys. No pgcopydb, no ``--dir``

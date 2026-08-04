@@ -1,5 +1,5 @@
 """
-Migration controller -- the folded snapshot-holder + DAG orchestrator (issue #70).
+Migration controller -- the folded snapshot-holder + DAG orchestrator.
 
 Runs as a **single-pod StatefulSet** (``replicas: 1``, under the
 ``pgcyan-orchestrator`` SA). One process both:
@@ -11,21 +11,21 @@ Runs as a **single-pod StatefulSet** (``replicas: 1``, under the
      the snapshot id straight into the pre-data / data-shard pods (no
      ``pgcyan-snapshot`` ConfigMap handoff) and owning every workload it creates.
 
-WHY FOLD (see #70): a separate holder Deployment can never be owned by a finite
+WHY FOLD: a separate holder Deployment can never be owned by a finite
 orchestrator (owner-refs would GC it mid-copy), so it leaks -- and a leaked
-holder is a **held replication slot = unbounded WAL growth on the source**. The
-key realization: **a lost snapshot is already fatal** (a consistent snapshot is
-only valid while its transaction is open; lose it and every shard was copying an
-instant that no longer exists -> full re-copy). So binding the snapshot's
-lifetime to this process, and letting it **own** its children (cascade-delete on
-death), just makes the blast radius match a failure that was always total.
+holder is a **held replication slot = unbounded WAL growth on the source**. And
+**a lost snapshot is already fatal**: a consistent snapshot is only valid while
+its transaction is open; lose it and every shard was copying an instant that no
+longer exists -> full re-copy. So binding the snapshot's lifetime to this
+process, and letting it **own** its children (cascade-delete on death), makes the
+blast radius match a failure that was always total.
 
 COMPOSITION, not merge: ``PgCyanSnapshot`` and ``PgCyanOrchestrator`` stay intact
 and separately unit-tested; this controller only wires them together. The
 snapshot child is a real subprocess, so a caught exception in the DAG walk cannot
 drop the connection -- only a full process/container restart can.
 
-REFUSE-TO-RESUME (issue #70): because any restart loses the in-pod snapshot (a
+REFUSE-TO-RESUME: because any restart loses the in-pod snapshot (a
 StatefulSet does not pin the pod -- eviction/OOM/node-drain kill it, and a
 same-node container restart kills the subprocess too), a fresh pod must **not**
 silently re-snapshot and restart a run that was already underway. On boot the
@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 
 
 class PgCyanController:
-    """Holds the snapshot in-pod and walks the migration DAG (issue #70)."""
+    """Holds the snapshot in-pod and walks the migration DAG."""
 
     #: The run-state marker. Created (claimed) atomically on boot; its existence
     #: on a fresh pod means a prior run already began -> refuse-to-resume.
@@ -124,7 +124,7 @@ class PgCyanController:
                 controller is healthy, absent when parked/failed.
             follow_cdc: After a full successful walk, become the CDC consumer --
                 release the snapshot then stream ``pgcopydb follow`` on this pod's
-                own ``--dir`` (Option A, issue #26). ``False`` -> park after the
+                own ``--dir`` (Option A). ``False`` -> park after the
                 walk (no CDC). Skipped when ``stop_after`` halts before post-data.
             core_api: Injectable CoreV1Api (own pod + state ConfigMap); built if omitted.
             orchestrator_factory: Injectable builder ``(**kwargs) -> orchestrator``
@@ -142,7 +142,7 @@ class PgCyanController:
         self.api_port = api_port
         self.follow_factory = follow_factory or self._default_follow
         self.cdc: Optional[PgCyanFollow] = None       # the streaming CDC child, once started
-        self._released = False       # snapshot deliberately released ahead of CDC (#26)
+        self._released = False       # snapshot deliberately released ahead of CDC
         self.errors = []
 
         #: Lifecycle state for the control API's ``GET /status``:
@@ -213,7 +213,7 @@ class PgCyanController:
         The controller pod is created by its StatefulSet, so the StatefulSet is in
         this pod's ``ownerReferences``. Stamping it onto every workload the
         orchestrator creates means ``kubectl delete statefulset pgcyan-controller``
-        cascade-deletes the whole migration (issue #70). Returns ``None`` (unowned)
+        cascade-deletes the whole migration. Returns ``None`` (unowned)
         if the pod or its StatefulSet owner cannot be resolved (e.g. a local run).
         """
         try:
@@ -250,7 +250,7 @@ class PgCyanController:
         ``True`` when the child is running -- or when there is no child at all
         (a ``--not-consistent`` run holds nothing), so we never spuriously abort.
         Also ``True`` once we have DELIBERATELY released the snapshot before CDC
-        (issue #26): from that point its absence is by design, not a failure.
+        from that point its absence is by design, not a failure.
         """
         if self._released:
             return True
@@ -290,7 +290,7 @@ class PgCyanController:
 
     def _release_snapshot(self) -> None:
         """
-        Close the held snapshot so its slot frees up for CDC (issue #26).
+        Close the held snapshot so its slot frees up for CDC.
 
         The controller's ``pgcopydb snapshot --follow`` child keeps the slot
         acquired while its exported-snapshot connection is open, so a second
@@ -387,7 +387,7 @@ class PgCyanController:
         and observable (Ready iff the migration is healthy) rather than exiting
         and letting the StatefulSet crash-loop it. A signal tears it down cleanly.
         """
-        # If CDC is streaming (Option A, #26), supervise the follow child: block
+        # If CDC is streaming (Option A), supervise the follow child: block
         # while it streams, and if it exits on its own, drop readiness and stay
         # parked not-ready (observable, no crash-loop) rather than exiting.
         if self.cdc is not None:
@@ -620,7 +620,7 @@ class PgCyanController:
             summary["status"] = result.get("status", "failure")
             walk_ok = summary["status"] == "success"
 
-            # 4) CDC (Option A, issue #26): after a FULL successful walk, become the
+            # 4) CDC (Option A): after a FULL successful walk, become the
             #    CDC consumer -- release the snapshot (freeing the slot) then stream
             #    `pgcopydb follow` on THIS pod's --dir, where the slot record lives
             #    so follow reuses it. Skipped when stopped before post-data.

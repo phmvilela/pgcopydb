@@ -7,11 +7,11 @@ emits the migration *plan* every downstream Kubernetes phase consumes --
 ``plan.json`` plus one ``shard-<n>.filters`` file per copy shard (pgcopydb
 ``--filters`` format with a disjoint ``[include-only-table]`` list). It never
 connects to a database; it only reads the JSON already produced by the
-pre-migration stages (issue #38).
+pre-migration stages.
 
 Inputs (read from ``--inputs-dir`` / ``$PG_INPUTS_DIR``):
-  * ``source-pg-metrics.json``      -- per-table heap/index bytes (issue #37); required.
-  * ``source-pg-largeobjects.json`` -- large-object count (issue #20); required for the abort gate.
+  * ``source-pg-metrics.json``      -- per-table heap/index bytes; required.
+  * ``source-pg-largeobjects.json`` -- large-object count; required for the abort gate.
   * ``pg-source-parameters.json``   -- instance parameters; optional.
   * ``constraints.json``            -- operator-supplied ceilings/overrides; optional.
 
@@ -26,7 +26,7 @@ Responsibilities (this ticket, per the resolved scope):
     ``notes/PostgreSQL Logical Replication Limitations & Workarounds for LOBs.md``).
   * Record ``snapshot.mode``, publication name, and slot name for downstream phases.
 
-Deferred to follow-up tickets (resolved open questions in issue #38):
+Deferred to follow-up work:
   * **FK graph** is emitted as ``"status": "deferred"`` -- FK edges are not yet
     collected by any artifact, and phase-3b applies all constraints in one
     non-sharded pass regardless. Real FK collection is a follow-up.
@@ -72,7 +72,7 @@ class PgCyanPlanner:
     PARAMETERS_FILENAME = "pg-source-parameters.json"
     CONSTRAINTS_FILENAME = "constraints.json"
 
-    #: Fixed for this ticket (issue #38); smarter sizing is deferred.
+    #: Fixed default; smarter sizing is deferred.
     DEFAULT_SHARDS = 4
     #: pgcopydb --table-jobs ceiling per shard.
     DEFAULT_TABLE_JOBS = 8

@@ -1,5 +1,5 @@
 """
-Pre-data schema transfer for the sharded pgcopydb topology (issue #24).
+Pre-data schema transfer for the sharded pgcopydb topology.
 
 This is the phase ``0`` node in ``deploy/k8s/`` (``40-job-phase0-predata.yaml``):
 a single coordinator Job that creates the *target* schema **before** any data
@@ -9,7 +9,7 @@ deliberately NOT secondary indexes, primary-key/unique constraints, foreign
 keys, or triggers. Those all live in Postgres' **post-data** section (per
 ``pg_dump``/``pgcopydb``: primary keys and unique constraints are backed by
 indexes and are created *after* the data lands, see ``pgcopydb`` clone steps
-6-10) and are built by the post-data phase (#28), which is dramatically faster
+6-10) and are built by the post-data phase, which is dramatically faster
 than maintaining them during the COPY.
 
 Rather than hand-building the DDL transfer, this is a thin wrapper over pgcopydb
@@ -18,17 +18,15 @@ restores from a custom-format dump file in ``--dir``, so there is no such file i
 this pod's own (empty) work dir -- the wrapper runs two steps:
 
   1. ``pgcopydb dump schema --snapshot=<id> --dir=<work>`` -- pins the schema
-     dump to the **exact snapshot exported by the phase-1 holder** (#23) so the
+     dump to the **exact snapshot exported by the phase-1 holder** so the
      schema matches the instant the shards copy, then
   2. ``pgcopydb restore pre-data --dir=<work> --target=<uri>`` -- applies ONLY
      the pre-data section to the target.
 
 The snapshot id arrives as ``$SNAPSHOT_ID``, injected into this Job's env at
-apply time by the controller (#70, which folded in the phase-1 holder #23) --
-which holds the consistent snapshot in-pod and orders this phase after it (see
-``orchestrator.py``). (#70 superseded the earlier ``pgcyan-snapshot`` ConfigMap
-handoff, #58 -- there is no separate holder Job and no ``configMapKeyRef``.)
-Consistency can be waived with
+apply time by the controller -- which holds the consistent snapshot in-pod and
+orders this phase after it (see ``pg_cyan/orchestrator.py``). There is no
+separate holder Job and no ``configMapKeyRef``. Consistency can be waived with
 ``--not-consistent`` (the dump then takes its own snapshot) only if the source
 schema is stable for the migration window.
 
@@ -162,7 +160,7 @@ class PgCyanPreData:
         Clear the work dir so every run starts from a clean slate.
 
         The pre-data pod's ``--dir`` is a ReadWriteOnce managed disk that
-        PERSISTS across pod restarts (issue #58). A leftover dump from a prior
+        PERSISTS across pod restarts. A leftover dump from a prior
         (failed) run would make ``pgcopydb dump schema`` abort, and a stale
         catalog would confuse the restore -- so wipe it. Pre-data is cheap to
         redo, so a clean run is preferable to resuming a partial one.
