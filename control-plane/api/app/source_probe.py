@@ -1,5 +1,5 @@
 """
-Best-effort clash detection on the source database (issue #88).
+Best-effort clash detection on the source database.
 
 Before provisioning, we check whether the source already carries the pgcyan
 logical-replication artifacts (the ``pgcyan_slot`` replication slot / ``pgcyan_pub``

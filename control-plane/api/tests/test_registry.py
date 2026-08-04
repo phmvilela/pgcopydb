@@ -1,4 +1,4 @@
-"""SQLite registry tests (issue #88)."""
+"""SQLite registry tests."""
 import sqlite3
 
 import pytest

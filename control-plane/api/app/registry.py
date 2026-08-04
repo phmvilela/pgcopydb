@@ -1,9 +1,9 @@
 """
-Node-local SQLite registry of control-plane migrations (issue #88).
+Node-local SQLite registry of control-plane migrations.
 
-The control plane provisions per-migration namespaces (#87); this records each one
-in a SQLite database on the ReadWriteOnce PVC (#86) so the state survives API pod
-restarts and so we can enforce **one active control-plane migration at a time**.
+Records each provisioned per-migration namespace in a SQLite database on the
+ReadWriteOnce PVC so state survives API pod restarts and one active migration at
+a time can be enforced.
 
 Only non-sensitive endpoint *labels* (``host:port/db``) are stored -- never
 credentials. The connection URIs live solely in the per-migration Kubernetes
@@ -13,13 +13,15 @@ A row's ``state`` mirrors the controller lifecycle
 (``waiting-to-start`` -> ``running`` -> ``succeeded`` | ``failed`` | ``halted``);
 the first two are *active*, the rest terminal.
 
-**Singleton enforcement is delegated to SQLite.** A partial unique index over a
-constant expression, restricted to the active states, makes it physically
-impossible to have more than one active row. ``reserve`` inserts a parked row and
-returns ``False`` when that constraint fires -- the loser of a race, decided by
-the database, not by application-level check-then-act. When a migration reaches a
-terminal state it drops out of the index, freeing the slot automatically (no
-explicit release, so a crashed pod can't wedge the control plane).
+Singleton enforcement is delegated to SQLite: a partial unique index over a
+constant expression, restricted to the active states, makes more than one active
+row physically impossible. ``reserve`` inserts a parked row and returns ``False``
+when that constraint fires -- the database, not application-level check-then-act,
+picks the race winner. A terminal state drops out of the index and frees the slot
+automatically (no explicit release, so a crashed pod can't wedge the control
+plane).
+
+See also: control-plane/api/app/provisioner.py, control-plane/api/app/main.py.
 """
 import sqlite3
 from contextlib import closing

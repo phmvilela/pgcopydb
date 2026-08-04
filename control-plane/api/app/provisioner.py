@@ -1,14 +1,13 @@
 """
-Per-migration namespace provisioning (issue #87).
+Per-migration namespace provisioning.
 
-`POST /migrations` hands a source+target here; this creates a fresh namespace and
-applies the SAME deploy/k8s manifests the integration test uses (RBAC, work-dir
-PVC, DB Secret, the controller in ``PGCYAN_WAIT_FOR_START`` mode) so the pod comes
-up parked pre-snapshot. It does NOT start the migration.
+``POST /migrations`` hands a source+target here; this creates a fresh namespace
+and applies the shared ``deploy/k8s`` manifests (RBAC, work-dir PVC, DB Secret,
+the controller in ``PGCYAN_WAIT_FOR_START`` mode) so the pod comes up parked
+pre-snapshot. It does NOT start the migration.
 
-No drift: the manifests are read from ``deploy/k8s`` (baked into the image),
-never re-declared here. Two apply-time transforms mirror what
-``integration-tests.yml`` does with ``kubectl -n`` + ``envsubst``:
+The manifests are read from ``deploy/k8s`` (baked into the image), never
+re-declared here, so there is no drift. Two apply-time transforms:
 
 * **namespace retarget** — the manifests hardcode the fixed ``pgcyan-migration``
   namespace (including RoleBinding subject namespaces), so every ``namespace:``
@@ -18,6 +17,8 @@ never re-declared here. Two apply-time transforms mirror what
 
 Kubernetes I/O goes through an injected ``applier`` so the provisioning logic
 (ordering, retarget, fill, secret contents) is unit-testable without a cluster.
+
+See also: control-plane/api/app/k8s.py.
 """
 import uuid
 from pathlib import Path
@@ -144,7 +145,7 @@ class Provisioner:
         for doc in self._docs(CONTROLLER_MANIFEST, subs):
             retarget_namespace(doc, ns)
             # Capture the requested shard count on the controller pod. Full
-            # propagation to the planner Job is completed with start (#89).
+            # propagation to the planner Job is completed with start.
             if req.shards and doc.get("kind") == "StatefulSet":
                 _inject_env(doc, "PGCYAN_SHARDS", str(req.shards))
             self.applier.apply_doc(doc)

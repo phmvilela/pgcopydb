@@ -1,9 +1,11 @@
 """
-In-cluster Kubernetes applier (issue #87).
+In-cluster Kubernetes applier.
 
 Thin I/O layer over the official client so `Provisioner` can stay pure and
-unit-testable (tests inject a fake with the same three methods). Imports of the
+unit-testable (tests inject a fake with the same methods). Imports of the
 `kubernetes` package are local so the module loads without cluster config.
+
+See also: control-plane/api/app/provisioner.py, control-plane/api/app/teardown.py.
 """
 from typing import Dict, Optional
 
@@ -46,7 +48,7 @@ class K8sApplier:
 
         utils.create_from_dict(self._api_client, doc)
 
-    # ---------------------------------------------------------- teardown (#90)
+    # ---------------------------------------------------------- teardown
 
     def scale_statefulset(self, namespace: str, name: str, replicas: int) -> None:
         """Set a StatefulSet's replica count (0 = graceful SIGTERM, no respawn).

@@ -1,24 +1,26 @@
 """
-Tester-driven teardown of a migration (issue #90).
+Tester-driven teardown of a migration.
 
 ``POST /migrations/{id}/done`` ends a migration cleanly:
 
 1. **Graceful CDC stop** -- scale the controller StatefulSet to 0 replicas. That
    is a real SIGTERM to the controller pod (with the pod's grace period) which,
    unlike deleting the pod, does *not* respawn it. The controller catches SIGTERM
-   in ``park()`` and stops ``pgcopydb follow`` cleanly (no SIGKILL -- the window
-   is reconciled with the grace period in #81/#83); the slot's consumer detaches.
+   in ``park()`` and stops ``pgcopydb follow`` cleanly (the grace timeout leaves
+   room to avoid SIGKILL); the slot's consumer detaches.
 2. **Wait** for the controller pod to terminate -- the observable proxy for "CDC
    stopped and the consumer detached" (the control plane holds no source creds to
-   probe the slot directly; the slot itself persists with 0 consumers for cutover
-   #27, asserted cluster-side by #83).
+   probe the slot directly; the slot itself persists with 0 consumers for
+   cutover).
 3. **Delete the namespace** (cascade) -- removes the Secret, PVC, Service, RBAC,
    and the now-idle StatefulSet.
 
-The caller then marks the registry entry ``done``, freeing the singleton (#88).
+The caller then marks the registry entry ``done``, freeing the singleton.
 
 Kubernetes I/O is injected (same pattern as the provisioner) so the ordering and
 wait logic are unit-testable without a cluster.
+
+See also: control-plane/api/app/k8s.py, control-plane/api/app/provisioner.py.
 """
 import time
 from typing import Dict

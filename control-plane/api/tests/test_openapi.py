@@ -1,4 +1,4 @@
-"""OpenAPI / Swagger enrichment tests (issue #107)."""
+"""OpenAPI / Swagger enrichment tests."""
 
 _MIGRATION_PATHS = [
     ("/migrations", "get"),

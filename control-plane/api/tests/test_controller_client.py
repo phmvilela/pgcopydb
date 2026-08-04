@@ -1,4 +1,4 @@
-"""ControllerClient tests (issue #89) -- stdlib urllib, no real network."""
+"""ControllerClient tests -- stdlib urllib, no real network."""
 import io
 import urllib.error
 

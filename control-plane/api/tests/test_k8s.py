@@ -1,10 +1,11 @@
-"""K8sApplier I/O tests (issue #90 regression).
+"""K8sApplier I/O tests.
 
 Guards the one behaviour that RBAC depends on: scaling the controller must patch
 the StatefulSet *resource*, never the ``statefulsets/scale`` subresource (a
-separate RBAC resource the control-plane ClusterRole does not grant). This was a
-real teardown failure caught only on-cluster -- unit tests use a fake applier, so
-this test pins the real applier's call.
+separate RBAC resource the control-plane ClusterRole does not grant). Unit tests
+elsewhere use a fake applier, so this test pins the real applier's call.
+
+See also: control-plane/api/app/k8s.py.
 """
 
 

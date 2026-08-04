@@ -1,28 +1,30 @@
 """
-pgcyan control-plane API (issues #86-#90; rich OpenAPI/Swagger #107).
+pgcyan control-plane API: a long-lived FastAPI service in the fixed
+``pgcyan-system`` namespace that provisions and drives per-migration sandboxes.
 
-The control plane is a single, long-lived FastAPI service in the fixed
-``pgcyan-system`` namespace. It provisions a per-migration namespace with the
-full migration scaffolding (RBAC, work-dir PVC, DB Secret, the controller in
-wait-to-start mode) and will (later tickets) drive start/status/teardown. A
-node-local SQLite registry on a ReadWriteOnce volume tracks migrations and
-enforces one active control-plane migration at a time.
+Each migration gets its own namespace with the controller parked in
+wait-to-start mode; this API provisions it, starts it, reports aggregated
+status, and tears it down. A node-local SQLite registry on a ReadWriteOnce
+volume tracks migrations and enforces one active migration at a time.
 
-Endpoints so far:
+Endpoints:
 * ``GET /health``      -- liveness/readiness.
-* ``POST /migrations`` -- provision a parked per-migration namespace (#87),
-  gated by the singleton + source-clash rules (#88).
-* ``GET /migrations``  -- list tracked migrations from the registry (#88).
-* ``POST /migrations/{id}/start``  -- proxy the controller's ``POST /start`` (#89).
-* ``GET /migrations/{id}/status``  -- aggregate the controller's ``/status`` with
-  the registry state (#89).
+* ``POST /migrations`` -- provision a parked per-migration namespace, gated by
+  the singleton + source-clash rules.
+* ``GET /migrations``  -- list tracked migrations from the registry.
+* ``POST /migrations/{id}/start``  -- proxy the controller's ``POST /start``.
+* ``GET /migrations/{id}/status``  -- aggregate the controller's ``/status``
+  with the registry state.
 * ``POST /migrations/{id}/done``   -- stop CDC gracefully, delete the namespace,
-  free the singleton (#90).
+  free the singleton.
 
 ``PGCYAN_DATA_DIR`` (default ``/data``) is the mounted RWO volume that holds the
 SQLite registry; ``PGCYAN_MANIFESTS_DIR`` (default ``/app/deploy/k8s``) is where
 the shared migration manifests are baked; ``PGCYAN_MIGRATION_IMAGE`` is the
 pgcyan image the provisioned controller runs.
+
+See also: control-plane/api/app/provisioner.py, control-plane/api/app/registry.py,
+control-plane/api/app/controller_client.py, control-plane/api/app/teardown.py.
 """
 import os
 from datetime import datetime, timezone
@@ -71,7 +73,7 @@ REGISTRY_PATH = os.path.join(DATA_DIR, "registry.db")
 
 API_DESCRIPTION = """\
 The **pgcyan control plane** provisions and drives per-migration PostgreSQL
-migration sandboxes on demand (design #84).
+migration sandboxes on demand.
 
 Each migration gets its **own Kubernetes namespace** with the folded controller
 parked pre-snapshot; this API starts it, reports aggregated status, and tears it
@@ -157,7 +159,7 @@ def get_teardown() -> Teardown:
 
 @app.get("/health", tags=["health"], summary="Liveness / readiness probe")
 def health() -> dict:
-    """Liveness/readiness probe target (see #86)."""
+    """Liveness/readiness probe target."""
     return {
         "status": "ok",
         "service": "pgcyan-control-plane",
@@ -201,7 +203,9 @@ def create_migration(
     """Provision a fresh per-migration namespace with the controller parked
     pre-snapshot (wait-to-start), after enforcing the singleton + clash rules.
 
-    Does NOT start the migration (start is a later ticket).
+    Does NOT start the migration.
+
+    See also: control-plane/api/app/provisioner.py.
     """
     mid = new_migration_id()
     namespace = namespace_for(mid)
@@ -274,7 +278,9 @@ def start_migration(
     """Tell the migration's controller to take the snapshot and walk the DAG.
 
     Proxies to the controller's ``POST /start`` (idempotent server-side) and
-    advances the registry to the resulting state (#89).
+    advances the registry to the resulting state.
+
+    See also: control-plane/api/app/controller_client.py.
     """
     row = _lookup(registry, migration_id)
     if row["state"] in TERMINAL_STATES:
@@ -310,11 +316,13 @@ def migration_status(
     registry: Registry = Depends(get_registry),
     controller: ControllerClient = Depends(get_controller_client),
 ) -> MigrationStatus:
-    """Aggregate the controller's live ``/status`` with the registry state (#89).
+    """Aggregate the controller's live ``/status`` with the registry state.
 
     Best-effort: if the controller can't be reached (e.g. torn down) the registry
     state is still returned. A controller-reported transition is written back to
     the registry so it converges -- and a terminal state frees the singleton slot.
+
+    See also: control-plane/api/app/controller_client.py.
     """
     row = _lookup(registry, migration_id)
     state = row["state"]
@@ -356,10 +364,12 @@ def done_migration(
     teardown: Teardown = Depends(get_teardown),
 ) -> MigrationDone:
     """Tester-driven teardown: stop CDC gracefully, delete the namespace, and
-    mark the migration ``done`` -- freeing the singleton slot (#90).
+    mark the migration ``done`` -- freeing the singleton slot.
 
     Idempotent: a migration already torn down returns 200 without touching the
     cluster.
+
+    See also: control-plane/api/app/teardown.py.
     """
     row = _lookup(registry, migration_id)
     if row["state"] == "done":

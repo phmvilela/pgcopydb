@@ -1,4 +1,4 @@
-"""Skeleton control-plane API tests (issue #86).
+"""Skeleton control-plane API tests.
 
 Run from ``control-plane/api``:  ``python -m pytest``
 (These live outside the top-level ``tests/`` tree that the pg_cyan suite

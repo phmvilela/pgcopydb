@@ -1,4 +1,4 @@
-"""Request-model tests (issue #87)."""
+"""Request-model tests."""
 import pytest
 from pydantic import ValidationError
 

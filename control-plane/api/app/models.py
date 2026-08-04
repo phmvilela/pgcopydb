@@ -1,4 +1,4 @@
-"""Request/response models for the control-plane API (issues #87, #88, #107)."""
+"""Request/response models for the control-plane API."""
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
@@ -107,7 +107,7 @@ class MigrationStarted(BaseModel):
 
 
 class MigrationDone(BaseModel):
-    """Response of ``POST /migrations/{id}/done`` (issue #90)."""
+    """Response of ``POST /migrations/{id}/done``."""
     id: str
     namespace: str
     state: str = "done"
@@ -120,7 +120,7 @@ class MigrationDone(BaseModel):
 
 
 class MigrationStatus(BaseModel):
-    """Response of ``GET /migrations/{id}/status`` (issue #89).
+    """Response of ``GET /migrations/{id}/status``.
 
     ``state`` is the registry's view (authoritative for the singleton). The
     controller's live ``/status`` payload is nested under ``controller`` when the

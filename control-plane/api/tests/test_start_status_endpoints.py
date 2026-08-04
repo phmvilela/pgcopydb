@@ -1,4 +1,4 @@
-"""start + status proxy endpoint tests (issue #89)."""
+"""start + status proxy endpoint tests."""
 
 _SRC = {"host": "src", "user": "su", "password": "sp", "database": "sdb"}
 _TGT = {"uri": "postgres://tu:tp@tgt:5432/tdb?sslmode=require"}

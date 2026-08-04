@@ -1,4 +1,4 @@
-"""Teardown-logic tests (issue #90), exercised against a fake k8s applier."""
+"""Teardown-logic tests, exercised against a fake k8s applier."""
 from app.teardown import (
     CONTROLLER_POD_SELECTOR,
     CONTROLLER_STATEFULSET,

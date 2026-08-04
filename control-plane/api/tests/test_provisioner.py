@@ -1,4 +1,4 @@
-"""Provisioning-logic tests (issue #87), exercised against the real manifests."""
+"""Provisioning-logic tests, exercised against the real manifests."""
 import yaml
 import pytest
 

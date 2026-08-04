@@ -1,15 +1,17 @@
 """
-Talk to a migration's in-namespace controller control API (issue #89).
+Talk to a migration's in-namespace controller control API.
 
-Each provisioned migration (#87) runs the folded controller (#85) with a control
-API on port 9999, fronted by a **headless Service** ``pgcyan-controller`` in the
-migration's namespace. The controller makes itself Ready while parked in
-wait-to-start, so the Service routes to it before the migration begins.
+Each provisioned migration runs the folded controller with a control API on port
+9999, fronted by a **headless Service** ``pgcyan-controller`` in the migration's
+namespace. The controller makes itself Ready while parked in wait-to-start, so
+the Service routes to it before the migration begins.
 
-From the control-plane pod we reach it by cross-namespace DNS:
+From the control-plane pod it is reached by cross-namespace DNS:
 ``http://pgcyan-controller.<namespace>.svc.cluster.local:9999``. This is a thin,
 injectable HTTP client (stdlib ``urllib`` -- no new runtime dep) so the API's
 start/status logic stays unit-testable with a fake.
+
+See also: control-plane/api/app/main.py.
 """
 import json
 import urllib.error
