@@ -236,6 +236,11 @@ sandboxes on demand — distinct from a single migration run. Two new trees:
   (Args/Returns). Match the surrounding code — don't reformat unrelated lines.
 - Prefer standard library + the already-pinned deps; discuss before adding a
   new dependency.
+- **Comments:** follow the `comments` skill (`.claude/skills/`) — no historical
+  or "changed X" notes, no issue/PR numbers, keep them plain and sparse, use
+  "see also" links to related files.
+- **Commits:** follow the `commit` skill (`.claude/skills/`) — ≤600 chars, no
+  trailers, reference the main GitHub issue only.
 
 ## Terraform
 
