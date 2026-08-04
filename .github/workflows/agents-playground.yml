@@ -4,7 +4,7 @@ name: Secure Agents Playground
 # REAL AKS cluster, BEFORE promoting them to the production workflows (which need
 # a human-approved PR). The actual test steps live in the local composite action
 # ./agent-workflow-steps (action.yml) so the agent iterates there and re-runs
-# this workflow. Currently it exercises the controller wait-to-start mode (#85).
+# this workflow. Currently it exercises the controller wait-to-start mode.
 
 on:
   workflow_dispatch:

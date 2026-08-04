@@ -1,51 +1,39 @@
 name: Integration tests
 
-# Manual, cluster-backed integration tests -- issue #50. Runs on the AKS cluster
-# against a real source database, so it is `workflow_dispatch` only and never on
-# push/PR. It picks the image up by the COMMIT SHORT SHA (built + pushed by
-# build.yml for the same commit) and fills the `image: "${PGCYAN_IMAGE}"`
-# placeholder in the deploy/k8s manifests via `envsubst` before `kubectl apply`.
-# `envsubst '${PGCYAN_IMAGE}'` substitutes ONLY that variable, leaving the
-# manifests' runtime `$(SNAPSHOT_ID)` / `${RESTORE_JOBS}` refs intact.
+# Manual, cluster-backed integration tests. Runs on the AKS cluster against a
+# real source database, so it is `workflow_dispatch` only and never on push/PR.
+# It picks the image up by the COMMIT SHORT SHA (built + pushed by build.yml for
+# the same commit) and fills the `image: "${PGCYAN_IMAGE}"` placeholder in the
+# deploy/k8s manifests via `envsubst '${PGCYAN_IMAGE}'` before `kubectl apply`
+# (only that variable is substituted, leaving runtime `$(SNAPSHOT_ID)` /
+# `${RESTORE_JOBS}` refs intact).
 #
 # ONE job, `migration`, runs the whole implemented pipeline end-to-end via the
-# folded controller (#70) -- no per-phase jobs, no parallelism, no shared-object
-# race. It runs the phase -2 collector (barrier), then stands up the controller
+# folded controller -- no per-phase jobs, no parallelism, no shared-object race.
+# It runs the phase -2 collector (barrier), then stands up the controller
 # StatefulSet with PGCYAN_FOLLOW_CDC=true: the controller holds the consistent
-# snapshot IN-POD and walks planner(-1) -> pre-data(0) -> data shards(2) ->
-# index(3a) -> FK(3b), injecting the snapshot id into the phase pods and owning
-# every workload (delete the StatefulSet -> owner-ref cascade). THEN, under Option
-# A (#26), the controller itself becomes the CDC consumer: it releases the snapshot
-# and runs `pgcopydb follow --resume` on its OWN --dir (where the slot record lives,
-# so follow reuses it -- no separate pod, no cross-pod --dir handoff). It waits on
-# the run-state marker, then asserts (a) the combined pgcyan-copylog ConfigMap -- a
-# `completed` copy with per-table row counts (#25); (b) the target now has tables +
-# data + secondary indexes + PK/unique constraints (#24 descope) + ALL foreign keys
-# validated (#28); (c) CDC is streaming -- exactly one active consumer on the slot
-# (the controller pod); and (d) CDC actually REPLICATES -- a sentinel row inserted
-# on the source appears on the target (the full receive->transform->apply loop);
-# and (e) the controller shuts down GRACEFULLY on SIGTERM -- it stops the CDC
-# follow child cleanly (no SIGKILL) within the pod grace window and leaves no
-# active consumer on the source slot (#81).
-# (d) landing depends on the sequence-sync phase 2s (#78): the COPY load leaves
-# target identity sequences at their start, so without 2s the CDC INSERT draws id=1,
-# collides with the copied row, and the change is silently dropped.
-#
-# The planner->post-data path is validated green on AKS (7 tables / ~4.8M rows
-# across 4 disjoint shards); controller-owned CDC (#26 Option A) is first exercised
-# end-to-end here. NOTE: cluster-backed; the
-# source DB must contain tables (with FKs) for the copy + post-data to be meaningful.
+# snapshot in-pod and walks planner -> pre-data -> data shards -> index -> FK,
+# then itself becomes the CDC consumer (`pgcopydb follow --resume` on its own
+# --dir, so follow reuses the slot). It then asserts: the combined pgcyan-copylog
+# ConfigMap is a `completed` copy with per-table row counts; the target has
+# tables + data + secondary indexes + PK/unique constraints + validated FKs; CDC
+# streams with exactly one active consumer on the slot; a source insert actually
+# replicates to the target; and the controller shuts down gracefully on SIGTERM
+# (no SIGKILL, source slot released). See also: pg_cyan/controller.py,
+# pg_cyan/follow.py.
 #
 # ---------------------------------------------------------------------------
-# PREREQUISITES (all one-time, see issue #50):
+# PREREQUISITES (all one-time):
 #   * terraform/aks applied (cluster + ACR + workload identities).
 #   * build.yml has published pgcyan:<short-sha> for the commit being tested.
-#   * The controller holds the snapshot in a node-local emptyDir (no PVC). The
-#     data shards need a dynamic RWO managed-disk StorageClass (managed-csi on
-#     AKS) -- issue #58.
+#   * The controller holds the snapshot in a node-local emptyDir (no PVC); the
+#     data shards need a dynamic RWO managed-disk StorageClass (managed-csi).
 #   * The SOURCE server allows logical replication (wal_level=logical), the login
 #     role can CREATE PUBLICATION FOR ALL TABLES + a replication slot, and the
 #     source actually CONTAINS TABLES (with data) for the copy to be meaningful.
+#   * A REAL TARGET Postgres the controller can write schema + data to, with the
+#     target roles pre-created (so `--no-owner` applies) and the login role
+#     allowed to CREATE tables/sequences.
 #   * GitHub config:
 #       secrets:  AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
 #                 PG_SOURCE_USER / PG_SOURCE_PASSWORD
@@ -55,9 +43,6 @@ name: Integration tests
 #                  PG_TARGET_HOST / PG_TARGET_PORT / PG_TARGET_DATABASE
 #                  ACR_NAME (optional; defaults to pgcyanacr)
 #     (Credentials are secrets; non-sensitive host/port/db are plain variables.)
-#   * A REAL TARGET Postgres the controller can write schema + data to, with the
-#     target roles pre-created (so `--no-owner` applies -- issue #24) and the
-#     login role allowed to CREATE tables/sequences.
 #
 # SECRETS POLICY: source-DB credentials live ONLY as GitHub secrets and are
 # materialized into an in-cluster Secret at apply time -- no vault, nothing in
@@ -78,7 +63,7 @@ env:
 
 jobs:
   migration:
-    name: End-to-end migration via the folded controller, walk + controller-owned CDC (#70/#25/#28/#26)
+    name: End-to-end migration via the folded controller, walk + controller-owned CDC
     runs-on: ubuntu-latest
     environment: azure
     # ONE job, no parallelism -- the folded controller walks the WHOLE implemented
@@ -90,7 +75,7 @@ jobs:
       AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
       # Run the WHOLE walk (planner -> post-data; PGCYAN_STOP_AFTER empty) and then
       # stream CDC: after the walk the controller releases the snapshot and becomes
-      # the `pgcopydb follow` consumer on its own --dir (Option A, #26), staying Ready.
+      # the `pgcopydb follow` consumer on its own --dir, staying Ready.
       PGCYAN_STOP_AFTER: ""
       PGCYAN_FOLLOW_CDC: "true"
     steps:
@@ -140,7 +125,7 @@ jobs:
 
       # The image is tagged by the branch's HEAD short SHA, but build.yml only
       # publishes on push-to-main / manual dispatch -- so a feature-branch commit
-      # has NO image until we build one (lessons-learned #3). Ensure it exists
+      # has NO image until we build one. Ensure it exists
       # BEFORE the controller pod tries to pull it (else ImagePullBackOff): if the
       # tag is absent, dispatch build.yml on THIS branch (its publish job tags by
       # the same `git rev-parse --short HEAD`) and wait for the tag to appear.
@@ -275,7 +260,7 @@ jobs:
             sleep 15; elapsed=$((elapsed + 15))
           done
 
-      # ACCEPTANCE (#25): the orchestrator aggregated the per-shard copy logs into
+      # ACCEPTANCE: the orchestrator aggregated the per-shard copy logs into
       # the combined pgcyan-copylog ConfigMap -- a `completed` copy with the slot
       # name and per-table row counts.
       - name: Assert the combined copy log (pgcyan-copylog)
@@ -306,9 +291,9 @@ jobs:
                 f"{log['row_count_total']} rows, slot={log['slot']}")
           PY
 
-      # ACCEPTANCE (#28): after phase 3 the target has tables + data + secondary
-      # indexes + PK/unique constraints (the #24 descope, built by phase 3a
-      # build-indexes) + ALL foreign keys VALIDATED (NOT VALID then VALIDATE).
+      # ACCEPTANCE: after phase 3 the target has tables + data + secondary
+      # indexes + PK/unique constraints (built by phase 3a build-indexes) + ALL
+      # foreign keys VALIDATED (NOT VALID then VALIDATE).
       # Checked in-cluster (target unreachable from the runner) with the target URI.
       - name: Verify target post-data shape (indexes + PK/unique + validated FKs)
         run: |
@@ -351,13 +336,13 @@ jobs:
           fail=0
           [ "${tables:-0}" -gt 0 ]      || { echo "::error::expected tables > 0, got ${tables:-}"; fail=1; }
           [ "${indexes:-0}" -gt 0 ]     || { echo "::error::expected secondary indexes > 0 (phase 3a), got ${indexes:-}"; fail=1; }
-          [ "${pkuq:-0}" -gt 0 ]        || { echo "::error::expected PK/unique constraints > 0 (phase 3a build-indexes; #24 descope), got ${pkuq:-}"; fail=1; }
+          [ "${pkuq:-0}" -gt 0 ]        || { echo "::error::expected PK/unique constraints > 0 (phase 3a build-indexes), got ${pkuq:-}"; fail=1; }
           [ "${fks:-0}" -gt 0 ]         || { echo "::error::expected FKs > 0 (phase 3b; source must have FKs), got ${fks:-}"; fail=1; }
           [ "${fksvalid:-0}" = "${fks:-1}" ] || { echo "::error::expected ALL FKs validated, got ${fksvalid:-}/${fks:-}"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
           echo "target post-data OK: $tables tables, $indexes indexes, $pkuq PK/unique, $fks FKs ($fksvalid validated)"
 
-      # ACCEPTANCE (#26): after phase 4 the CDC consumer is streaming -- exactly ONE
+      # ACCEPTANCE: after phase 4 the CDC consumer is streaming -- exactly ONE
       # active consumer on the SOURCE slot (the controller released its snapshot so
       # `pgcopydb follow` could attach), and migration-cdc-log.json says `streaming`.
       # Checked in-cluster (source URI from the secret).
@@ -399,12 +384,12 @@ jobs:
           fail=0
           [ "${slots:-0}" -ge 1 ]  || { echo "::error::expected a logical slot, got ${slots:-}"; fail=1; }
           [ "${active:-0}" -eq 1 ] || { echo "::error::expected exactly 1 ACTIVE consumer on the slot (the controller's follow), got ${active:-}"; fail=1; }
-          # The consumer is the CONTROLLER pod itself (Option A, #26) -- its follow
+          # The consumer is the CONTROLLER pod itself -- its follow
           # events + migration-cdc-log.json land in the collected controller.log.
           [ "$fail" -eq 0 ] || exit 1
           echo "CDC OK: $slots logical slot(s), $active active consumer -- streaming"
 
-      # ACCEPTANCE (#26, the strong one): prove CDC actually REPLICATES a live
+      # ACCEPTANCE (the strong one): prove CDC actually REPLICATES a live
       # change end-to-end, not just that a consumer is attached. Insert a uniquely
       # marked sentinel row on the SOURCE, then poll the TARGET until it appears --
       # exercising the full receive -> transform -> apply loop (the apply half is the
@@ -465,11 +450,11 @@ jobs:
           EOF
           # FATAL: the sequence-sync phase (2s) advances the target identity
           # sequences after the copy, and the pgcopydb fork flushes the apply
-          # pipeline on drain (#26/#78), so a live source insert must appear on
-          # the target within the window. If it does not, that is a real
-          # regression -- dump the controller CDC log for diagnosis.
+          # pipeline on drain, so a live source insert must appear on the target
+          # within the window. If it does not, that is a real regression -- dump
+          # the controller CDC log for diagnosis.
           if ! kubectl wait --for=condition=complete job/pgcyan-cdc-roundtrip -n "$NS" --timeout=90s; then
-            echo "::error::CDC did not replicate the probe row within 30s (regression? check the apply pipeline flush #26 and the sequence sync #78)"
+            echo "::error::CDC did not replicate the probe row within 30s (regression? check the apply pipeline flush and the sequence sync)"
             kubectl logs job/pgcyan-cdc-roundtrip -n "$NS" --tail=-1 || true
             echo "--- controller CDC log (last 200) ---"
             kubectl logs -l pgcyan.dev/component=controller -n "$NS" --tail=200 || true
@@ -492,15 +477,15 @@ jobs:
           kubectl get configmap pgcyan-copylog -n "$NS" -o jsonpath='{.data.migration-copy-log\.json}' > migration-output/migration-copy-log.json 2>/dev/null || true
           ls -la migration-output
 
-      # ACCEPTANCE (#81): the controller must shut down GRACEFULLY -- on SIGTERM it
+      # ACCEPTANCE: the controller must shut down GRACEFULLY -- on SIGTERM it
       # stops the CDC `follow` child cleanly (releasing the source replication
       # connection) within the pod grace window, NOT get SIGKILLed. We scale the
       # StatefulSet to 0 (a real graceful SIGTERM, and -- unlike deleting the pod --
       # it will not respawn), capturing the pod's logs AS IT TERMINATES (they vanish
-      # once the pod is gone -- the #66 lesson). Then assert the clean-stop line is
-      # present, the SIGKILL-escalation line is ABSENT, and the source slot has no
-      # lingering active consumer. Gating (hard fail), happy-path only.
-      - name: Assert graceful controller shutdown (no SIGKILL, slot released) -- #81
+      # once the pod is gone). Then assert the clean-stop line is present, the
+      # SIGKILL-escalation line is ABSENT, and the source slot has no lingering
+      # active consumer. Gating (hard fail), happy-path only.
+      - name: Assert graceful controller shutdown (no SIGKILL, slot released)
         run: |
           set -euo pipefail
           mkdir -p migration-output
@@ -531,12 +516,12 @@ jobs:
 
           # (2) the SIGKILL-escalation line MUST NOT appear (shared shutdown.py warning).
           if grep -q "pgcopydb did not exit in time; sending SIGKILL" migration-output/controller-shutdown.log; then
-            echo "::error::controller SIGKILLed its pgcopydb child -- shutdown was not graceful (#81)"
+            echo "::error::controller SIGKILLed its pgcopydb child -- shutdown was not graceful"
             exit 1
           fi
           echo "graceful shutdown confirmed: clean stop, no SIGKILL"
 
-          # (3) the source slot persists (for cutover #27) but has NO active consumer
+          # (3) the source slot persists (for cutover) but has NO active consumer
           # now the controller is gone. CDC deactivation can lag a beat, so poll.
           kubectl delete job pgcyan-slot-release-check -n "$NS" --ignore-not-found --wait=true
           cat <<'EOF' | envsubst '${PGCYAN_IMAGE}' | kubectl apply -n "$NS" -f -
@@ -579,7 +564,7 @@ jobs:
           active=$(echo "$line" | sed -E 's/.*active=([0-9]+).*/\1/')
           fail=0
           [ "${slots:-0}" -ge 1 ]  || { echo "::error::the logical slot should persist for cutover, got slots=${slots:-}"; fail=1; }
-          [ "${active:-1}" -eq 0 ] || { echo "::error::slot still has an active consumer after teardown -- source connection not released (#81), got active=${active:-}"; fail=1; }
+          [ "${active:-1}" -eq 0 ] || { echo "::error::slot still has an active consumer after teardown -- source connection not released, got active=${active:-}"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
           echo "slot released cleanly: $slots slot(s) persist, 0 active consumers"
 

@@ -2,10 +2,11 @@ name: Deploy control plane
 
 # Builds the control-plane API image and applies the control-plane manifests to
 # the fixed `pgcyan-system` namespace on AKS -- the repeatable, one-dispatch form
-# of the manual apply in issue #86 (this is issue #91). Distinct from build.yml
+# of the manual apply. Distinct from build.yml
 # (which builds the *migration* image) and integration-tests.yml (which stands up
 # a one-off migration in `pgcyan-migration`): here we deploy the long-lived
-# control plane that provisions per-migration namespaces on demand (#87-#90).
+# control plane that provisions per-migration namespaces on demand.
+# See also: deploy/control-plane/README.md
 #
 #   deploy : `az acr build` the control-plane image (REPO-ROOT context + the
 #            control-plane Dockerfile, so `deploy/k8s` is baked in), tagged by the
@@ -16,7 +17,7 @@ name: Deploy control plane
 # Two image placeholders are filled at apply time (same convention as deploy/k8s):
 #   ${PGCYAN_CONTROL_PLANE_IMAGE} -- the API image built by THIS run (short SHA).
 #   ${PGCYAN_MIGRATION_IMAGE}     -- the `pgcyan:<tag>` the API stamps into each
-#                                    provisioned controller (#87). Override via the
+#                                    provisioned controller. Override via the
 #                                    `migration_image_tag` dispatch input (used
 #                                    as-is), else it defaults to this commit's short
 #                                    SHA and is BUILT (dispatch build.yml) if the

@@ -1,13 +1,13 @@
 name: Build
 
 # Builds the single migration image (pgcopydb + kubectl + pg_cyan CLI) that
-# backs every deploy/k8s/ pod (issue #39), and publishes it to the ACR tagged by
+# backs every deploy/k8s/ pod, and publishes it to the ACR tagged by
 # the COMMIT SHORT SHA -- the one identifier that ties an image back to its exact
 # source. No `latest`, no version tag: integration-tests.yml picks the image up
 # by that same short SHA, and the k8s manifests carry an `image: "${PGCYAN_IMAGE}"`
 # placeholder filled at apply time (never a concrete digest committed to git).
 #
-#   build-verify : builds the image and runs the issue-#39 acceptance commands
+#   build-verify : builds the image and runs the acceptance commands
 #                  (`pgcopydb --version`, `python -m pg_cyan.cli --help`,
 #                  `kubectl version --client`). Runs on every push/PR -- no Azure
 #                  needed. Proof the image actually runs.
@@ -63,7 +63,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Issue #39 acceptance criteria, executed against the built image.
+      # Acceptance criteria, executed against the built image.
       - name: Acceptance -- pgcopydb --version
         run: docker run --rm pgcyan:ci pgcopydb --version
 

@@ -1,7 +1,7 @@
 name: "Terraform: AKS cluster (validate)"
 
 # Lint/validate the AKS cluster module (terraform/aks) that runs the deploy/k8s
-# sharded pgcopydb migration -- issue #50.
+# sharded pgcopydb migration.
 #
 #   validate : fmt -check + init -backend=false + validate. Runs on PRs that
 #              touch terraform/aks/**, and on manual dispatch. No Azure needed,
