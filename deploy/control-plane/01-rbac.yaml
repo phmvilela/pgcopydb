@@ -1,14 +1,11 @@
-# 01-rbac.yaml (control plane -- issue #86)
-# ---------------------------------------------------------------------------
 # The control-plane identity. One ServiceAccount in pgcyan-system, bound to a
 # CLUSTER-scoped role because it must create/delete WHOLE namespaces and the
-# resources inside each per-migration namespace it provisions (later tickets).
+# resources inside each per-migration namespace it provisions.
 #
-# Broad by design (issue #84: no per-user auth on the control plane yet). It is
-# NOT cluster-admin: it can manage only the specific resource kinds a migration
+# Broad by design (no per-user auth on the control plane yet). It is NOT
+# cluster-admin: it can manage only the specific resource kinds a migration
 # namespace needs -- no nodes, no cluster-scoped RBAC beyond what it needs to
 # bind namespaced Roles, no arbitrary CRDs.
-# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -44,7 +41,7 @@ rules:
     resources: ["jobs"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
   # The controller manifest carries a PodDisruptionBudget (and the orchestrator
-  # may apply more), so the control plane must be able to create them (#87).
+  # may apply more), so the control plane must be able to create them.
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]

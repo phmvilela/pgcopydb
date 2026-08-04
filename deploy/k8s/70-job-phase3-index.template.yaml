@@ -22,8 +22,8 @@
 # STORAGE: none. Phase 3a is pure psycopg2 (custom SQL -- introspect the source's
 # index/constraint defs, apply to the target); it holds no pgcopydb catalog, so it
 # only needs a scratch dir for the one small output JSON. An emptyDir suffices --
-# no managed-disk PVC, no fsGroup (cf. #58, which only bit the pgcopydb phases).
-# ---------------------------------------------------------------------------
+# no managed-disk PVC, no fsGroup (only the pgcopydb phases need those).
+# See also: pg_cyan/postindex.py
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -52,11 +52,11 @@ spec:
       containers:
         - name: pgcyan-index
           image: "${PGCYAN_IMAGE}"
-          # The pg_cyan `build-indexes` wrapper (PgCyanPostIndex, #28) builds this
+          # The pg_cyan `build-indexes` wrapper (PgCyanPostIndex) builds this
           # shard's secondary indexes AND its PK/unique constraints via custom SQL:
           # introspect the source's pg_get_indexdef / pg_get_constraintdef for this
           # shard's --filters tables and apply CREATE INDEX + ADD CONSTRAINT on the
-          # target (the PK/unique piece is what #24 deferred to #28). Idempotent.
+          # target. Idempotent.
           # FKs cross shard boundaries and are the separate single pass in 71.
           command: ["python", "-m", "pg_cyan.cli", "build-indexes"]
           envFrom:

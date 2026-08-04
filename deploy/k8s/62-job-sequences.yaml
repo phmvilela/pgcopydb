@@ -1,7 +1,7 @@
 # 62-job-sequences.yaml
 # ---------------------------------------------------------------------------
 # PHASE 2s: SEQUENCE SYNC -- a single coordinated pass, run after the data copy
-# (phase 2) and before CDC (issue #78).
+# (phase 2) and before CDC.
 #
 # WHY IT EXISTS: the sharded copy loads rows with their EXPLICIT id values
 # (`pgcopydb copy table-data` -> COPY), which never advances the owning
@@ -12,10 +12,10 @@
 # its "STEP 9: reset sequences"; our custom copy skips it, so this phase does it.
 #
 # WHY CUSTOM SQL (not `pgcopydb copy sequences`): pgcopydb's per-object `copy`
-# sub-commands no-op in our standalone per-pod --dir (lesson from #28). This is
-# pure psycopg2 (read source pg_sequences, setval on the target) -- no pgcopydb
-# catalog, so an emptyDir for the one small output JSON suffices.
-# ---------------------------------------------------------------------------
+# sub-commands no-op in our standalone per-pod --dir. This is pure psycopg2 (read
+# source pg_sequences, setval on the target) -- no pgcopydb catalog, so an
+# emptyDir for the one small output JSON suffices.
+# See also: pg_cyan/sequences.py
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -42,7 +42,7 @@ spec:
       containers:
         - name: pgcyan-sequences
           image: "${PGCYAN_IMAGE}"
-          # The pg_cyan `copy-sequences` wrapper (PgCyanSequences, #78): read each
+          # The pg_cyan `copy-sequences` wrapper (PgCyanSequences): read each
           # source sequence's value and setval it on the target, so target ids
           # continue past the copied rows (else CDC/post-cutover inserts collide).
           command: ["python", "-m", "pg_cyan.cli", "copy-sequences"]

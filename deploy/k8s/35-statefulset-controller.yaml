@@ -1,43 +1,34 @@
-# 35-statefulset-controller.yaml
-# ---------------------------------------------------------------------------
-# THE MIGRATION CONTROLLER (issue #70, #26) -- the folded snapshot-holder + DAG
-# orchestrator + CDC consumer, run as a SINGLE-POD StatefulSet. This one pod HOLDS
-# the consistent snapshot in-process (`pgcopydb snapshot --follow`), WALKS the
-# migration DAG (planner -> pre-data -> data shards -> index -> FK), injecting the
-# snapshot id into the phase pods and owning every workload it creates, and THEN --
-# under Option A (#26) -- releases the snapshot and becomes the CDC consumer itself
-# (`pgcopydb follow --resume` on its OWN --dir, where the slot record lives so
-# follow reuses it). CDC is a controller-owned step, not a separate pod, because
-# the slot-creator and the streamer must share one pgcopydb --dir.
+# The migration controller: a single-pod StatefulSet that holds the consistent
+# snapshot in-process, walks the DAG (planner -> pre-data -> data shards -> index
+# -> FK) injecting the snapshot id into each phase pod and owning every workload
+# it creates, then releases the snapshot and becomes the CDC consumer itself
+# (`pgcopydb follow --resume` on its OWN --dir, where the slot record lives).
+# CDC is controller-owned, not a separate pod, because the slot-creator and the
+# streamer must share one pgcopydb --dir.
+# See also: pg_cyan/controller.py, notes/k8s-sharded-migration-topology.md
 #
-# WHY A STATEFULSET (not a Deployment/Job):
-#   * AT-MOST-ONE. A StatefulSet(1) never runs two pods at once -- it won't start
-#     the replacement until the old pod is confirmed gone. Two controllers would
-#     mean two snapshots / a split brain; a `Deployment(1)` can transiently run
-#     two during a rollout (the two-holders race, lessons-learned #7 / #66).
-#   * It is NOT chosen for "reschedule protection" -- it has none. A node
-#     drain/eviction/preemption still kills the pod, and the in-pod snapshot dies
-#     with it. That is acceptable *because a lost snapshot is already fatal* (the
-#     in-flight copy was pinned to an instant that no longer exists -> full
-#     re-copy). See #70. Refuse-to-resume handling for that restart is PR-B.
+# WHY A STATEFULSET (not a Deployment/Job): at-most-one. A StatefulSet(1) never
+# runs two pods at once -- it won't start the replacement until the old pod is
+# gone. Two controllers would mean two snapshots / split brain; a Deployment(1)
+# can transiently run two during a rollout. It gives no reschedule protection --
+# a node drain/eviction still kills the pod and its in-pod snapshot, which is
+# acceptable because a lost snapshot is already fatal (the in-flight copy was
+# pinned to an instant that no longer exists -> full re-copy).
 #
 # OWNERSHIP: the controller stamps THIS StatefulSet as the ownerReference on every
 # Job/Deployment/PVC it creates, so `kubectl delete statefulset pgcyan-controller`
-# cascade-deletes the whole migration. Correct now that the snapshot lives here.
+# cascade-deletes the whole migration.
 #
 # --dir ON A MANAGED-DISK PVC (volumeClaimTemplate): pgcopydb keeps a SQLite
 # catalog in WAL mode under --dir, which needs locking Azure Files (SMB) cannot
-# provide (issue #57) -- a managed-csi RWO disk gives real POSIX locking (like the
-# data shards, #58). Unlike the snapshot (non-resumable), the CDC phase writes a
-# prefetch/replay store here that can grow during a long catch-up, so it needs
-# bounded, dedicated capacity rather than node-ephemeral emptyDir. The StatefulSet
-# reattaches the same PVC by ordinal on restart (foundation for future CDC
-# restart-resume; today refuse-to-resume still parks such a restart, issue #70).
+# provide -- a managed-csi RWO disk gives real POSIX locking. The CDC phase also
+# writes a prefetch/replay store here that can grow during a long catch-up, so it
+# needs bounded, dedicated capacity rather than node-ephemeral emptyDir. The
+# StatefulSet reattaches the same PVC by ordinal on restart.
 #
-# TODO(#70 PR-B): the refuse-to-resume readiness probe (park in a not-ready state
-# on a lost-snapshot restart, rather than crash-loop) and node-pool pinning
-# (non-spot, excluded from scale-down) land with the eviction-hardening work.
-# ---------------------------------------------------------------------------
+# TODO: refuse-to-resume readiness probe (park not-ready on a lost-snapshot
+# restart, rather than crash-loop) and node-pool pinning (non-spot, excluded from
+# scale-down) with the eviction-hardening work.
 apiVersion: v1
 kind: Service
 metadata:
@@ -49,8 +40,8 @@ spec:
   clusterIP: None            # headless -- StatefulSet governing Service
   selector:
     pgcyan.dev/component: "controller"
-  # The controller's control API (issue #85): GET /status, POST /start. The
-  # control-plane API reaches it here to start/observe a wait-to-start migration.
+  # The controller's control API: GET /status, POST /start. The control-plane
+  # API reaches it here to start/observe a wait-to-start migration.
   ports:
     - name: control-api
       port: 9999
@@ -95,9 +86,9 @@ spec:
       # (close the source connection) before SIGKILL. The wrapper's SIGTERM
       # window (PgCyanSnapshot.DEFAULT_SHUTDOWN_TIMEOUT = 55s) is sized just
       # under this grace period so it can escalate to its own SIGKILL + reap
-      # before the kubelet force-kills the pod at 60s (issue #66).
+      # before the kubelet force-kills the pod at 60s.
       terminationGracePeriodSeconds: 60
-      # EVICTION = FULL RESTART (issue #70): a lost pod loses the in-pod snapshot.
+      # EVICTION = FULL RESTART: a lost pod loses the in-pod snapshot.
       # Pin the controller to a STABLE node pool -- non-spot and excluded from
       # cluster-autoscaler scale-down -- to minimize voluntary disruption. The PDB
       # below covers voluntary evictions; this covers scheduling. Uncomment and set
@@ -110,7 +101,7 @@ spec:
           image: "${PGCYAN_IMAGE}"
           command: ["python", "-m", "pg_cyan.cli", "run-migration"]
           env:
-            # pgcopydb's snapshot --dir on node-local scratch (WAL-on-SMB, #57).
+            # pgcopydb's snapshot --dir (WAL needs POSIX locking, not SMB).
             - name: PGCYAN_WORK_DIR
               value: "/pgcopydb"
             - name: PG_OUTPUT_DIR
@@ -136,7 +127,7 @@ spec:
             # integration test to stop before the unbuilt phases 3/4.
             - name: PGCYAN_STOP_AFTER
               value: "${PGCYAN_STOP_AFTER}"
-            # After a full successful walk, become the CDC consumer (Option A, #26):
+            # After a full successful walk, become the CDC consumer:
             # release the snapshot then `pgcopydb follow` on this --dir. Filled by
             # envsubst; EMPTY (default) = park after the walk, no CDC. Set "true" to
             # run change data capture through to cutover.
@@ -146,18 +137,18 @@ spec:
             # applied change. Filled by envsubst; EMPTY (default) = normal logging.
             - name: PGCYAN_FOLLOW_VERBOSE
               value: "${PGCYAN_FOLLOW_VERBOSE}"
-            # Wait-to-start (issue #85): when "true", the controller serves its
-            # control API and parks BEFORE taking the snapshot, establishing it +
-            # walking only on `POST /start`. Filled by envsubst; EMPTY (default) =
-            # snapshot + walk immediately on launch (the integration-test default).
-            # The control-plane API (#87) sets this "true" when it provisions.
+            # Wait-to-start: when "true", the controller serves its control API
+            # and parks BEFORE taking the snapshot, establishing it + walking only
+            # on `POST /start`. Filled by envsubst; EMPTY (default) = snapshot +
+            # walk immediately on launch (the integration-test default). The
+            # control-plane API sets this "true" when it provisions.
             - name: PGCYAN_WAIT_FOR_START
               value: "${PGCYAN_WAIT_FOR_START}"
           envFrom:
             - secretRef:
                 name: pgcyan-db-uris    # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI
           ports:
-            - name: control-api        # GET /status, POST /start (issue #85)
+            - name: control-api        # GET /status, POST /start
               containerPort: 9999
           volumeMounts:
             - name: pgcopydb-workdir
@@ -169,7 +160,7 @@ spec:
             limits:   { cpu: "500m", memory: "512Mi" }
           # Readiness reflects the controller's health: the app writes /pgcopydb/ready
           # once the snapshot is established and the walk is underway, and REMOVES it
-          # when it fails or PARKS (refuse-to-resume, issue #70). So a restart that
+          # when it fails or PARKS (refuse-to-resume). So a restart that
           # refuses to resume shows NotReady -- visibly halted, not silently redoing
           # the copy. (No livenessProbe: a parked pod is intentionally alive; we do
           # NOT want the kubelet to restart it into a crash-loop.)
@@ -180,9 +171,9 @@ spec:
             periodSeconds: 15
             failureThreshold: 2
   # The controller's own pgcopydb --dir: a managed-disk RWO PVC (POSIX locking +
-  # persistence/capacity for the CDC store, #57/#58/#26). Reattached by ordinal on
-  # restart. Owner-ref cascade doesn't reach a StatefulSet's own PVCs, so teardown
-  # deletes it explicitly (see the integration test / a slot-reaper, #29).
+  # persistence/capacity for the CDC store). Reattached by ordinal on restart.
+  # Owner-ref cascade doesn't reach a StatefulSet's own PVCs, so teardown deletes
+  # it explicitly.
   volumeClaimTemplates:
     - metadata:
         name: pgcopydb-workdir
@@ -198,7 +189,7 @@ spec:
 # Resist VOLUNTARY disruption (node drain / autoscaler) of the singleton while a
 # migration is in flight -- an eviction loses the snapshot and forces a full
 # re-copy. (Involuntary disruption, e.g. node failure, is not covered by a PDB;
-# node-pool pinning for that is #70 PR-B.)
+# node-pool pinning for that is a separate hardening step.)
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

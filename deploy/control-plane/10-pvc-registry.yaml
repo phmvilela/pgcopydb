@@ -1,8 +1,7 @@
-# 10-pvc-registry.yaml (control plane -- issue #86)
-# ---------------------------------------------------------------------------
-# Node-local ReadWriteOnce disk for the SQLite registry (mounted at /data),
-# same pattern as the copy-shard work dirs (#58): SQLite needs real POSIX
-# locking, which a managed disk gives and Azure Files does not.
+# Node-local ReadWriteOnce disk for the SQLite registry (mounted at /data), same
+# pattern as the copy-shard work dirs: SQLite needs real POSIX locking, which a
+# managed disk gives and Azure Files does not.
+# See also: deploy/k8s/20-pvc-workdir.yaml
 #
 # RWO means a single writer -- fine for the single-replica API. The Deployment
 # uses the `Recreate` strategy so a rollout never briefly runs two pods that
@@ -10,7 +9,6 @@
 #
 # ASSUMPTION: a dynamic RWO managed-disk StorageClass exists (AKS: `managed-csi`).
 # 1Gi is ample for a SQLite registry of migration rows.
-# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

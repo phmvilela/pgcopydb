@@ -7,23 +7,23 @@
 # KEY / UNIQUE constraints, foreign keys, or triggers. In Postgres' dump model
 # all of those live in the POST-DATA section (a primary key is backed by an
 # index, built after the data lands), which is dramatically faster than
-# maintaining them during COPY. They are built by the post-data phase (#28).
+# maintaining them during COPY. They are built by the post-data phase.
 #
 # This runs BEFORE any data shard so every shard finds its target tables already
 # present. It is a hard barrier: no shard may start until this succeeds.
 #
-# MECHANISM: a thin wrapper (`pg_cyan.cli restore-predata`, issue #24) over
-# pgcopydb. `pgcopydb restore pre-data` restores from a custom-format dump file
+# MECHANISM: a thin wrapper (`pg_cyan.cli restore-predata`) over pgcopydb.
+# `pgcopydb restore pre-data` restores from a custom-format dump file
 # in `--dir`, and this pod's `--dir` starts empty, so the wrapper runs two
 # steps: `pgcopydb dump schema --snapshot=<id>` (pinned to the phase-1 holder's
 # snapshot so the schema matches the instant the shards copy) then
 # `pgcopydb restore pre-data --no-owner` (pre-data section only).
 #
-# ORDERING: this phase depends on the consistent snapshot. Under issue #70 the
-# CONTROLLER holds that snapshot in its own pod and INJECTS `SNAPSHOT_ID` into
-# this Job's env at apply time (no `pgcyan-snapshot` ConfigMap). The wrapper pins
-# `dump schema` to it, exactly like the data shards.
-# ---------------------------------------------------------------------------
+# ORDERING: this phase depends on the consistent snapshot. The CONTROLLER holds
+# that snapshot in its own pod and INJECTS `SNAPSHOT_ID` into this Job's env at
+# apply time (no `pgcyan-snapshot` ConfigMap). The wrapper pins `dump schema` to
+# it, exactly like the data shards.
+# See also: pg_cyan/predata.py
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -65,8 +65,8 @@ spec:
           # carried in a schema dump -- so pre-data skips them by design.
           command: ["python", "-m", "pg_cyan.cli", "restore-predata", "--skip-extensions"]
           env:
-            # SNAPSHOT_ID is injected at apply time by the controller (issue #70),
-            # which holds the consistent snapshot in-pod and knows the id directly
+            # SNAPSHOT_ID is injected at apply time by the controller, which holds
+            # the consistent snapshot in-pod and knows the id directly
             # -- no `pgcyan-snapshot` ConfigMap. The wrapper pins `dump schema` to
             # it so the schema matches the instant the shards copy. (A standalone
             # `kubectl apply` of this Job must set SNAPSHOT_ID in the env itself.)
@@ -87,8 +87,8 @@ spec:
             requests: { cpu: "100m", memory: "256Mi" }
             limits:   { cpu: "1",    memory: "1Gi" }
       volumes:
-        # Pre-data's own ReadWriteOnce work disk (SQLite/WAL off Azure Files --
-        # issue #58). Pre-applied from 20-pvc-workdir.yaml.
+        # Pre-data's own ReadWriteOnce work disk (SQLite/WAL off Azure Files).
+        # Pre-applied from 20-pvc-workdir.yaml.
         - name: workdir
           persistentVolumeClaim:
             claimName: pgcyan-workdir-predata

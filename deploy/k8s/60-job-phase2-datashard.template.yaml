@@ -20,10 +20,10 @@
 # snapshot (phase 1) so all shards copy the same instant.
 #
 # DATA ONLY: the pod runs `pg_cyan.cli copy-shard`, which drives `pgcopydb copy
-# table-data` -- NOT `pgcopydb clone`. Phase 0 (#24) already restored the schema
-# and phase 3 (#28) builds the indexes/constraints, so this phase copies the HEAP
-# and nothing else. `clone` would re-run both schema sections and collide with
-# phases 0/3 (see notes/migration-phases-lessons-learned.md item 6).
+# table-data` -- NOT `pgcopydb clone`. Phase 0 restores the schema and phase 3
+# builds the indexes/constraints, so this phase copies the HEAP and nothing else.
+# `clone` would re-run both schema sections and collide with phases 0/3.
+# See also: pg_cyan/datashard.py, notes/migration-phases-lessons-learned.md
 #
 # INTRA-TABLE SPLIT: `--split-tables-larger-than` lets a single shard further
 # parallelise a giant table across `--table-jobs` processes via integer-range or
@@ -38,25 +38,25 @@
 # continues at per-table / per-part granularity, never redoing a completed table
 # -- backoffLimit lets k8s do that restart automatically. The disk is RWO (one
 # pod at a time) and local ext4, so pgcopydb's SQLite/WAL catalog gets the file
-# locking Azure Files (SMB) cannot provide (issue #58).
+# locking Azure Files (SMB) cannot provide. See also: deploy/k8s/20-pvc-workdir.yaml
 #
-# SNAPSHOT: `--snapshot="$SNAPSHOT_ID"` -- the controller (issue #70) holds the
-# consistent snapshot in its own pod and INJECTS SNAPSHOT_ID into this env at
-# apply time (no `pgcyan-snapshot` ConfigMap, no shared volume, no initContainer).
-# All shards get the same id, so they copy the same instant.
+# SNAPSHOT: `--snapshot="$SNAPSHOT_ID"` -- the controller holds the consistent
+# snapshot in its own pod and INJECTS SNAPSHOT_ID into this env at apply time (no
+# `pgcyan-snapshot` ConfigMap, no shared volume, no initContainer). All shards get
+# the same id, so they copy the same instant.
 #
 # OUTPUT: the wrapper writes migration-copy-log.json (slot/publication/snapshot +
 # per-table row counts landed on the target) to /work AND publishes it to a
-# per-shard `pgcyan-copylog-${SHARD_NAME}` ConfigMap. The orchestrator (#40) lists
-# those by label and merges them into the combined migration-copy-log.json. The
+# per-shard `pgcyan-copylog-${SHARD_NAME}` ConfigMap. The orchestrator lists those
+# by label and merges them into the combined migration-copy-log.json. The
 # work dir is a private RWO disk the orchestrator cannot mount, so the ConfigMap
 # is the durable handoff -- the shard's SA has a narrow configmaps grant for it
 # (01-rbac.yaml).
 # ---------------------------------------------------------------------------
 # The per-shard work disk. The orchestrator stamps one of these per
 # plan.json > data_shards entry (same ${SHARD_NAME} substitution as the Job).
-# ReadWriteOnce: exactly one shard pod uses it at a time. See 20-pvc-workdir.yaml
-# for the full rationale (issue #58).
+# ReadWriteOnce: exactly one shard pod uses it at a time.
+# See also: deploy/k8s/20-pvc-workdir.yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -109,7 +109,7 @@ spec:
       containers:
         - name: pgcopydb-copy
           image: "${PGCYAN_IMAGE}"
-          # The pg_cyan `copy-shard` wrapper (PgCyanDataShard, issue #25) drives
+          # The pg_cyan `copy-shard` wrapper (PgCyanDataShard) drives
           # `pgcopydb copy table-data` -- DATA ONLY, restricted to this shard's
           # [include-only-table] filter set and pinned to the holder's snapshot --
           # then counts the rows landed on the target, writes
@@ -123,8 +123,8 @@ spec:
           # schema sections and collide with phases 0/3 (re-tripping the Azure
           # extension/ownership walls). --skip-vacuum + no index build fall out of
           # `copy table-data`; the wrapper adds --resume so a
-          # backed-off pod continues on its RWO disk. See
-          # notes/migration-phases-lessons-learned.md items 2 and 6.
+          # backed-off pod continues on its RWO disk.
+          # See also: pg_cyan/datashard.py, notes/migration-phases-lessons-learned.md
           command: ["python", "-m", "pg_cyan.cli", "copy-shard"]
           envFrom:
             - secretRef:
@@ -132,8 +132,8 @@ spec:
           # TODO(orchestrator): substitute these from plan.json (top-level
           # slot/publication) and plan.json > data_shards[i].
           env:
-            # SNAPSHOT_ID is injected at apply time by the controller (issue #70),
-            # which holds the consistent snapshot in-pod -- no `pgcyan-snapshot`
+            # SNAPSHOT_ID is injected at apply time by the controller, which holds
+            # the consistent snapshot in-pod -- no `pgcyan-snapshot`
             # ConfigMap. Every shard gets the same id, so they copy the same
             # instant. (A standalone apply must set SNAPSHOT_ID in the env itself.)
             - name: SHARD_NAME

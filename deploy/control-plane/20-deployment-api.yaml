@@ -1,5 +1,3 @@
-# 20-deployment-api.yaml (control plane -- issue #86)
-# ---------------------------------------------------------------------------
 # The control-plane API Deployment. Single replica with the `Recreate` strategy
 # because it mounts the RWO SQLite registry PVC -- a rolling update would try to
 # run two pods on the same ReadWriteOnce volume and wedge.
@@ -9,8 +7,6 @@
 # For a manual apply:
 #   export PGCYAN_CONTROL_PLANE_IMAGE=<acr>.azurecr.io/pgcyan-control-plane:<tag>
 #   envsubst '${PGCYAN_CONTROL_PLANE_IMAGE}' < 20-deployment-api.yaml | kubectl apply -f -
-# (The automated build/deploy is issue #91.)
-# ---------------------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,7 +45,7 @@ spec:
           env:
             - name: PGCYAN_DATA_DIR
               value: "/data"
-            # The pgcyan migration image the provisioned controllers run (#87).
+            # The pgcyan migration image the provisioned controllers run.
             # Filled by envsubst at apply time, same convention as the API image
             # above; a plain apply without it leaves provisioning unconfigured
             # (POST /migrations -> 503 until set).

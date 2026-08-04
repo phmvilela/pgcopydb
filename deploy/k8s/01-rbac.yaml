@@ -1,33 +1,28 @@
-# 01-rbac.yaml
-# ---------------------------------------------------------------------------
 # Three identities:
 #
-#   1. pgcyan-orchestrator -- the control plane. It (and only it) is allowed to
-#      create/patch/delete the per-phase Jobs and to read their status so it can
-#      enforce the DAG barriers (wait for phase N to fully succeed before
-#      applying phase N+1). This is the imperative glue that plain YAML cannot
-#      express on its own.
+#   1. pgcyan-orchestrator -- the control plane. It (and only it) creates/patches/
+#      deletes the per-phase Jobs and reads their status to enforce the DAG
+#      barriers (wait for phase N to fully succeed before applying N+1). This is
+#      the imperative glue that plain YAML cannot express on its own.
+#      See also: pg_cyan/controller.py, pg_cyan/orchestrator.py
 #
-#   2. pgcyan-worker -- the data-plane identity used by every pgcopydb Job/pod
-#      (pre-data, snapshot holder, data shards, index/FK, CDC). Workers mostly
-#      just talk to Postgres, and get a ServiceAccount primarily so we can bind
-#      Azure Workload Identity (federated) credentials to it instead of shipping
-#      static DB passwords. The ONE Kubernetes API grant they need is a narrow
-#      configmaps create/get/patch: a data shard (#25) writes its per-table copy
+#   2. pgcyan-worker -- the data-plane identity used by every pgcopydb Job/pod.
+#      Workers mostly just talk to Postgres, and get a ServiceAccount primarily so
+#      Azure Workload Identity (federated) credentials can bind to it instead of
+#      shipping static DB passwords. The ONE Kubernetes API grant they need is a
+#      narrow configmaps create/get/patch: a data shard writes its per-table copy
 #      log to a pgcyan-copylog-<shard> ConfigMap (its work dir is a private RWO
 #      disk the orchestrator cannot mount, so the ConfigMap is the durable handoff
-#      the orchestrator reads to aggregate the combined migration-copy-log.json).
-#      Nothing else -- no jobs/pods/secrets/deployments.
+#      the orchestrator reads to aggregate migration-copy-log.json). Nothing else.
 #
-#   3. pgcyan-viewer -- a read-only *observer* identity. It runs no workload; it
+#   3. pgcyan-viewer -- a read-only observer identity. It runs no workload; it
 #      exists so an out-of-cluster operator can watch the migration -- pods, logs,
-#      jobs, the plan/snapshot ConfigMaps. It does so *without* cluster-admin reach
+#      jobs, the plan ConfigMaps -- without cluster-admin reach.
 #
 # ASSUMPTION: cluster is AKS with OIDC + Workload Identity enabled, so DB auth
 # can be Entra-token based. If that is not available, fall back to the Secret in
-# 10-secrets.example.yaml. Per pgcyan CLAUDE.md we prefer managed identity /
-# DefaultAzureCredential over static credentials.
-# ---------------------------------------------------------------------------
+# 10-secrets.example.yaml. We prefer managed identity / DefaultAzureCredential
+# over static credentials.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -59,16 +54,14 @@ rules:
   # polls each phase's barrier via read_namespaced_job_status /
   # read_namespaced_deployment_status (the `jobs/status` / `deployments/status`
   # subresources), which a grant on `jobs`/`deployments` alone does NOT cover --
-  # without them the barrier read is Forbidden even though create/get succeed
-  # (issue #70: the folded controller is the first thing to run these reads under
-  # this SA rather than the runner's kubeconfig).
+  # without them the barrier read is Forbidden even though create/get succeed.
   - apiGroups: ["batch"]
     resources: ["jobs", "jobs/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments", "deployments/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
-  # PodDisruptionBudgets ship with the controller StatefulSet (35) -- and the
+  # PodDisruptionBudgets ship with the controller StatefulSet, and the
   # orchestrator applies whatever a phase manifest contains, so it keeps the
   # verbs for any future Deployment/PDB phase too.
   - apiGroups: ["policy"]
@@ -80,13 +73,14 @@ rules:
     verbs: ["get", "list", "watch"]
   # Publish the generated plan + the aggregated copy log, and read the collected
   # inputs. (The controller holds the snapshot in-pod and injects SNAPSHOT_ID
-  # directly, #70 -- no pgcyan-snapshot ConfigMap; the planner Job publishes
-  # pgcyan-plan -- see issue #58 / #38.)
+  # directly -- no pgcyan-snapshot ConfigMap; the planner Job publishes
+  # pgcyan-plan.)
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create", "get", "list", "watch", "patch", "update"]
   # Stamp one ReadWriteOnce work-dir PVC per data/index shard so pgcopydb's
-  # SQLite/WAL catalog runs on a local managed disk, not Azure Files (issue #58).
+  # SQLite/WAL catalog runs on a local managed disk, not Azure Files.
+  # See also: deploy/k8s/20-pvc-workdir.yaml
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
@@ -106,7 +100,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ---
 # --- pgcyan-worker: one narrow grant so a data shard can publish its copy log --
-# The data shards (#25) write their per-table copy log to a pgcyan-copylog-<shard>
+# The data shards write their per-table copy log to a pgcyan-copylog-<shard>
 # ConfigMap, which the orchestrator reads to build the combined
 # migration-copy-log.json. That is the ONLY Kubernetes API a worker touches --
 # no jobs, pods, secrets, or deployments. (`create` cannot be scoped to a name in
@@ -150,8 +144,8 @@ metadata:
   namespace: pgcyan-migration
 rules:
   # Observe the migration DAG: pods (+ their logs), the phase Jobs and the
-  # controller StatefulSet (which holds the snapshot in-pod and streams CDC,
-  # #70/#26). Deployment/ReplicaSet verbs are kept for any future Deployment phase.
+  # controller StatefulSet (which holds the snapshot in-pod and streams CDC).
+  # Deployment/ReplicaSet verbs are kept for any future Deployment phase.
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch"]

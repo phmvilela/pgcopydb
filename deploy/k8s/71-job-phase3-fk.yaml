@@ -8,7 +8,7 @@
 #   them coordinating locks. So FKs are applied in ONE coordinated pass, after ALL
 #   data (phase 2) AND all indexes (phase 3a) are in place.
 #
-# WHY CUSTOM SQL, NOT pgcopydb (#28): the wrapper (`build-foreign-keys`,
+# WHY CUSTOM SQL, NOT pgcopydb: the wrapper (`build-foreign-keys`,
 # PgCyanForeignKeys) introspects the source's FK definitions and applies each to
 # the target as `ADD CONSTRAINT ... NOT VALID` (brief lock) then `VALIDATE
 # CONSTRAINT` (scans under a weak lock). `pgcopydb restore constraints` validates
@@ -24,7 +24,7 @@
 #
 # This is the last hard barrier before the source and target are schema- and
 # data-equivalent (modulo any CDC still catching up in phase 4).
-# ---------------------------------------------------------------------------
+# See also: pg_cyan/postfk.py
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -52,7 +52,7 @@ spec:
       containers:
         - name: pgcyan-fk
           image: "${PGCYAN_IMAGE}"
-          # The pg_cyan `build-foreign-keys` wrapper (PgCyanForeignKeys, #28):
+          # The pg_cyan `build-foreign-keys` wrapper (PgCyanForeignKeys):
           # introspect the source's FKs, apply each to the target NOT VALID then
           # VALIDATE CONSTRAINT, and write target-pg-postload-log.json. Idempotent.
           command: ["python", "-m", "pg_cyan.cli", "build-foreign-keys"]
