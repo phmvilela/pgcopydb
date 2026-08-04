@@ -4,7 +4,7 @@ description: >
   changes against the REAL AKS cluster before promoting them to the production
   workflows (which need a human-approved PR). The agent edits this file freely
   and re-triggers the playground to iterate. It currently exercises the
-  controller wait-to-start mode (issue #85): provision the controller PARKED
+  controller wait-to-start mode: provision the controller PARKED
   pre-snapshot, assert `GET /status` shows `waiting-to-start` with no snapshot,
   `POST /start`, then assert the snapshot is established and the (planner-only,
   fast) walk succeeds -- then tear everything down.
@@ -102,8 +102,8 @@ runs:
 
     # Apply the controller in WAIT-TO-START mode. PGCYAN_STOP_AFTER=-1 stops the
     # walk right after the planner, so the test is quick but still proves the
-    # snapshot is established + the walk runs once /start arrives (issue #85).
-    - name: Apply the controller in WAIT-TO-START mode (#85)
+    # snapshot is established + the walk runs once /start arrives.
+    - name: Apply the controller in WAIT-TO-START mode
       shell: bash
       env:
         PGCYAN_WAIT_FOR_START: "true"
@@ -153,7 +153,7 @@ runs:
         done
         [ "$state" = "succeeded" ] || { echo "::error::did not reach 'succeeded' after /start"; kubectl logs "$POD" -n "$NS" --tail=120 || true; exit 1; }
         { [ "$snap" != "None" ] && [ -n "$snap" ]; } || { echo "::error::no snapshot was established"; exit 1; }
-        echo "OK (#85): snapshot established ONLY after /start ($snap); planner walk succeeded"
+        echo "OK: snapshot established ONLY after /start ($snap); planner walk succeeded"
 
     - name: Teardown
       if: always()

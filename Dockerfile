@@ -1,4 +1,4 @@
-# pgcyan migration image (issue #39)
+# pgcyan migration image
 # ---------------------------------------------------------------------------
 # One image serves every deploy/k8s/ pod: the planner Job, the pgcopydb phase
 # Jobs/Deployments, and the custom-Python phases. It therefore bundles three
@@ -8,21 +8,16 @@
 #   * python + pg_cyan CLI -- planner/monitoring/cutover (`python -m pg_cyan.cli`)
 #
 # Tool versions are set via build ARGs. kubectl is fully pinned + checksum
-# verified; pgcopydb is COMPILED from the phmvilela/pgcopydb fork pinned to an
+# verified; pgcopydb is compiled from the phmvilela/pgcopydb fork pinned to an
 # exact commit (PGCOPYDB_GIT_REF) in a multi-stage builder -- see the pgcopydb
 # section below for why we build from source rather than apt-install PGDG.
-#
-# Acceptance (issue #39):
-#   docker run <image> pgcopydb --version           -> succeeds
-#   docker run <image> python -m pg_cyan.cli --help  -> succeeds
 # ---------------------------------------------------------------------------
 
 # --- pgcopydb: compiled from the phmvilela/pgcopydb fork (multi-stage) -------
-# We build pgcopydb from source rather than apt-installing the PGDG package
-# because the migration depends on a fork patch to the SQLite CDC apply path
-# (flush the libpq pipeline when the replay queue drains, so a trailing CDC
-# change actually lands on the target -- PGDG's stock 0.18 does not have it).
-# Pin PGCOPYDB_GIT_REF to the exact fork commit so the image is reproducible.
+# Built from source rather than apt-installing PGDG because the migration needs
+# a fork patch to the SQLite CDC apply path: flush the libpq pipeline when the
+# replay queue drains, so a trailing CDC change lands on the target (stock 0.18
+# does not). Pin PGCOPYDB_GIT_REF to the fork commit for a reproducible image.
 #   PGVERSION -- the postgresql-server-dev / libpq major the binary links.
 ARG PGVERSION=16
 ARG PGCOPYDB_GIT_URL=https://github.com/phmvilela/pgcopydb.git
@@ -117,9 +112,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY pg_cyan/ ./pg_cyan/
-# The orchestrator (pg_cyan.cli orchestrate, issue #40) applies these manifests
-# from PgCyanOrchestrator.DEFAULT_MANIFESTS_DIR, which resolves to ./deploy/k8s
+# The orchestrator (pg_cyan.cli orchestrate) applies these manifests from
+# PgCyanOrchestrator.DEFAULT_MANIFESTS_DIR, which resolves to ./deploy/k8s
 # next to ./pg_cyan -- keep this path in sync with that default.
+# See also: pg_cyan/orchestrator.py
 COPY deploy/k8s/ ./deploy/k8s/
 
 # Create non-root user for security
@@ -132,7 +128,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import sys; sys.exit(0)" || exit 1
 
 # No hardcoded ENTRYPOINT on purpose. Every deploy/k8s/ pod sets its own
-# `command:` (pgcopydb / kubectl / sh), and issue #39's acceptance runs the
+# `command:` (pgcopydb / kubectl / sh), and the acceptance checks run the
 # tools directly -- `docker run <img> pgcopydb --version`,
 # `docker run <img> python -m pg_cyan.cli --help`. A hardcoded entrypoint would
 # swallow those into `python -m pg_cyan.cli <args>`. With only a default CMD,
