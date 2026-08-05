@@ -603,7 +603,10 @@ class PgCyanSnapshot:
             {"command": " ".join(cmd)},
         )
         try:
-            self.proc = subprocess.Popen(cmd)  # noqa: S603 -- fixed argv, no shell
+            # start_new_session isolates this child's process group so
+            # shutdown.py's graceful_terminate can signal it (and any workers
+            # it forks) without touching our own process group.
+            self.proc = subprocess.Popen(cmd, start_new_session=True)  # noqa: S603 -- fixed argv, no shell
             return True
         except (OSError, ValueError) as e:
             self._log_event(

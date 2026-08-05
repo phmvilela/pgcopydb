@@ -12,6 +12,8 @@ Centralising the "SIGTERM, wait the grace window, escalate to SIGKILL, reap"
 sequence here keeps the two call sites reconciled with the 60s grace window.
 """
 
+import os
+import signal
 import subprocess
 from typing import Callable, Optional
 
@@ -27,6 +29,34 @@ GRACEFUL_SHUTDOWN_TIMEOUT = 55
 SIGKILL_REAP_TIMEOUT = 5
 
 
+def _signal_group_or_proc(proc: "subprocess.Popen", sig: int) -> None:
+    """Send ``sig`` to ``proc``'s whole OS process group; fall back to just ``proc``.
+
+    ``pgcopydb follow`` forks its ``prefetch``/``catchup`` workers with a plain
+    ``fork()`` (no ``setsid``), so they share its process group. Its own
+    top-level SIGTERM handling only takes effect *between* blocking waits on
+    those workers -- while they're actively streaming it never observes the
+    signal, so the workers (which DO each check for SIGTERM in their own
+    loops) must be signalled directly. Callers launch the child with
+    ``start_new_session=True`` precisely so this group is isolated to the
+    child + its forks, not shared with our own process.
+
+    Falls back to signalling just ``proc`` (matches prior behaviour) when the
+    child has no real OS pid (e.g. a test double) or the group lookup fails.
+    """
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int):
+        try:
+            os.killpg(os.getpgid(pid), sig)
+            return
+        except OSError:
+            pass
+    if sig == signal.SIGKILL:
+        proc.kill()
+    else:
+        proc.terminate()
+
+
 def graceful_terminate(
     proc: "Optional[subprocess.Popen]",
     *,
@@ -34,12 +64,14 @@ def graceful_terminate(
     reap_timeout: int = SIGKILL_REAP_TIMEOUT,
     log_event: Optional[Callable[..., None]] = None,
 ) -> None:
-    """SIGTERM ``proc`` and reap it, escalating to SIGKILL if it overruns.
+    """SIGTERM ``proc``'s process group and reap it, escalating to SIGKILL if it overruns.
 
-    No-op when ``proc`` is ``None`` or has already exited. The child is sent
-    SIGTERM and given ``grace_timeout`` seconds to exit; if it does not, it is
-    SIGKILLed and reaped within ``reap_timeout`` seconds (both bounded so the
-    total stays inside the pod's termination grace period).
+    No-op when ``proc`` is ``None`` or has already exited. The child (and any
+    workers it forked into its own process group -- see
+    ``_signal_group_or_proc``) is sent SIGTERM and given ``grace_timeout``
+    seconds to exit; if it does not, it is SIGKILLed and reaped within
+    ``reap_timeout`` seconds (both bounded so the total stays inside the
+    pod's termination grace period).
 
     Args:
         proc: the pgcopydb child, or ``None``.
@@ -51,7 +83,7 @@ def graceful_terminate(
     if proc is None or proc.poll() is not None:
         return
     try:
-        proc.terminate()
+        _signal_group_or_proc(proc, signal.SIGTERM)
     except OSError:
         return
     try:
@@ -64,7 +96,7 @@ def graceful_terminate(
                 {"timeout": grace_timeout},
             )
         try:
-            proc.kill()
+            _signal_group_or_proc(proc, signal.SIGKILL)
             proc.wait(timeout=reap_timeout)
         except (OSError, subprocess.TimeoutExpired):
             pass

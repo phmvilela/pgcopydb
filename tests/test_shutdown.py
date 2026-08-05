@@ -7,7 +7,9 @@ paths, the clean SIGTERM exit, and the SIGKILL escalation with the reconciled
 
 See also: pg_cyan/shutdown.py
 """
+import signal
 import subprocess
+from unittest.mock import patch
 
 from pg_cyan.shutdown import (
     graceful_terminate,
@@ -97,3 +99,54 @@ def test_oserror_on_terminate_is_swallowed():
     proc = _Raises(alive=True)
     graceful_terminate(proc)  # must not raise
     assert proc.killed is False
+
+
+class _FakeProcWithPid(_FakeProc):
+    """A real-pid stand-in: exercises the process-group signalling path.
+
+    ``pgcopydb follow`` forks prefetch/catchup workers that share its process
+    group and only THEY check for SIGTERM while actively streaming (see
+    ``pg_cyan/follow.py`` and ``shutdown._signal_group_or_proc``) -- so the
+    fix signals the whole group, not just this one pid.
+    """
+
+    def __init__(self, pid=4242, **kwargs):
+        super().__init__(**kwargs)
+        self.pid = pid
+
+
+def test_clean_exit_signals_the_process_group_not_just_the_pid():
+    proc = _FakeProcWithPid(alive=True)
+
+    def _killpg(pgid, sig):
+        if sig == signal.SIGTERM:
+            proc.returncode = 0  # simulate the group exiting cleanly
+
+    with patch("pg_cyan.shutdown.os.getpgid", return_value=777) as getpgid, \
+            patch("pg_cyan.shutdown.os.killpg", side_effect=_killpg) as killpg:
+        graceful_terminate(proc)
+    getpgid.assert_called_once_with(4242)
+    killpg.assert_called_once_with(777, signal.SIGTERM)
+    # The group signal path is used instead of the direct proc.terminate().
+    assert proc.terminated is False
+
+
+def test_sigkill_escalation_also_targets_the_process_group():
+    proc = _FakeProcWithPid(alive=True)  # never responds to the group SIGTERM
+    with patch("pg_cyan.shutdown.os.getpgid", return_value=777), \
+            patch("pg_cyan.shutdown.os.killpg") as killpg:
+        graceful_terminate(proc)
+    assert killpg.call_args_list == [
+        ((777, signal.SIGTERM),),
+        ((777, signal.SIGKILL),),
+    ]
+    assert proc.killed is False  # group signal used, not the direct proc.kill()
+
+
+def test_falls_back_to_direct_signal_when_process_group_lookup_fails():
+    """No real pgcopydb process behind this pid (already reaped) -- degrade
+    to signalling the pid directly rather than raising."""
+    proc = _FakeProcWithPid(alive=True, sigterm_exits=True)
+    with patch("pg_cyan.shutdown.os.getpgid", side_effect=OSError("no such process")):
+        graceful_terminate(proc)
+    assert proc.terminated is True

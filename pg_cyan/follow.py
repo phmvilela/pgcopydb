@@ -368,7 +368,11 @@ class PgCyanFollow:
             cmd = self.build_follow_command()
             self._log_event("start", "success", "Starting pgcopydb follow",
                             {"command": " ".join(cmd)})
-            self.proc = subprocess.Popen(cmd)  # noqa: S603 -- fixed argv, no shell
+            # start_new_session isolates pgcopydb's process group (it forks
+            # prefetch/catchup workers with a plain fork(), sharing whatever
+            # group it starts in) so shutdown.py can SIGTERM/SIGKILL the whole
+            # tree without touching our own process group -- see shutdown.py.
+            self.proc = subprocess.Popen(cmd, start_new_session=True)  # noqa: S603 -- fixed argv, no shell
         except (OSError, ValueError) as e:
             self.errors.append(f"Failed to launch pgcopydb follow: {str(e)}")
             self._log_event("start", "failure", "Failed to launch pgcopydb follow",
