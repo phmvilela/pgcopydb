@@ -220,6 +220,9 @@ def test_start_attach_timeout_terminates_child(tmp_path, monkeypatch):
                         lambda dsn: _SlotConn(_SlotCursor(active_after=999)))
     monkeypatch.setattr(follow_module.time, "monotonic",
                         _monotonic_seq([0, 1, 2, 100]))   # blow past the deadline
+    # The child never attached, so the endpos graceful stop can't apply; make
+    # it fail so close() falls back to signalling the (never-healthy) child.
+    _run_recorder(monkeypatch, returncode=1)
     summary = _make(tmp_path, attach_timeout=10).start()
     assert summary["status"] == "failure"
     assert proc.terminated is True
@@ -253,37 +256,117 @@ def _monotonic_seq(values):
     return _fn
 
 
-def test_close_escalates_to_sigkill_within_the_pod_grace(tmp_path):
-    """A follow child that ignores SIGTERM is SIGKILLed, using the shared
-    (grace, reap) windows reconciled with the controller pod's 60s grace."""
-    from pg_cyan.shutdown import GRACEFUL_SHUTDOWN_TIMEOUT, SIGKILL_REAP_TIMEOUT
+class _CloseProc:
+    """Fake follow child for close(): alive until ``wait`` is allowed to return.
 
-    class _StubbornProc:
-        def __init__(self):
-            self.returncode = None
-            self.killed = False
-            self.wait_timeouts = []
+    ``exits_on_wait`` models the graceful endpos stop -- the child reaches
+    endpos and exits, so ``wait`` returns; otherwise ``wait`` times out and the
+    signal fallback kicks in.
+    """
+    def __init__(self, exits_on_wait=True, rc=0):
+        self.returncode = None
+        self._exits_on_wait = exits_on_wait
+        self._rc = rc
+        self.terminated = False
+        self.killed = False
+        self.wait_timeouts = []
 
-        def poll(self):
-            return self.returncode
+    def poll(self):
+        return self.returncode
 
-        def terminate(self):
-            pass  # ignores SIGTERM
+    def terminate(self):
+        self.terminated = True
 
-        def kill(self):
-            self.killed = True
-            self.returncode = -9
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
 
-        def wait(self, timeout=None):
-            self.wait_timeouts.append(timeout)
-            if self.returncode is None:
-                raise subprocess.TimeoutExpired(cmd="pgcopydb", timeout=timeout)
-            return self.returncode
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if self._exits_on_wait:
+            self.returncode = self._rc
+            return self._rc
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(cmd="pgcopydb", timeout=timeout)
+        return self.returncode
 
-    proc = _StubbornProc()
+
+def _run_recorder(monkeypatch, returncode=0):
+    """Patch subprocess.run and record the argv it was called with."""
+    calls = []
+
+    def _run(cmd, *a, **k):
+        calls.append(cmd)
+        return _Completed(returncode=returncode, stdout="0/ABC")
+    monkeypatch.setattr(follow_module.subprocess, "run", _run)
+    return calls
+
+
+def test_close_requests_endpos_and_exits_without_sigkill(tmp_path, monkeypatch):
+    """The graceful path: close() sets the sentinel endpos --current and the
+    follow child exits on its own -- no SIGTERM, no SIGKILL."""
+    calls = _run_recorder(monkeypatch, returncode=0)
+    proc = _CloseProc(exits_on_wait=True)
+    follower = _make(tmp_path)
+    follower.proc = proc
+    follower.close()
+
+    # endpos was requested against this follow's --dir + source, not a signal.
+    assert calls == [[
+        "pgcopydb", "stream", "sentinel", "set", "endpos", "--current",
+        "--dir", str(tmp_path), "--source", "postgres://src/db",
+    ]]
+    assert proc.wait_timeouts == [follower.stop_timeout]
+    assert proc.terminated is False
+    assert proc.killed is False
+
+
+def test_close_falls_back_to_signal_when_endpos_request_fails(tmp_path, monkeypatch):
+    """If the endpos can't be set, close() escalates to the bounded signal
+    fallback (short grace + reap, kept inside the 60s pod grace)."""
+    _run_recorder(monkeypatch, returncode=1)  # sentinel set endpos fails
+    proc = _CloseProc(exits_on_wait=False)    # and the child never exits on its own
     follower = _make(tmp_path)
     follower.proc = proc
     follower.close()
 
     assert proc.killed is True
-    assert proc.wait_timeouts == [GRACEFUL_SHUTDOWN_TIMEOUT, SIGKILL_REAP_TIMEOUT]
+    assert proc.wait_timeouts == [
+        follower.FALLBACK_GRACE_TIMEOUT, follower.FALLBACK_REAP_TIMEOUT]
+
+
+def test_close_falls_back_to_signal_when_endpos_does_not_stop_in_time(tmp_path, monkeypatch):
+    """endpos was set but the child overran stop_timeout -> bounded fallback."""
+    _run_recorder(monkeypatch, returncode=0)  # endpos set OK
+    proc = _CloseProc(exits_on_wait=False)    # but it doesn't reach endpos in time
+    follower = _make(tmp_path)
+    follower.proc = proc
+    follower.close()
+
+    assert proc.killed is True
+    # First wait is the endpos grace window, then the fallback (grace, reap).
+    assert proc.wait_timeouts == [
+        follower.stop_timeout,
+        follower.FALLBACK_GRACE_TIMEOUT,
+        follower.FALLBACK_REAP_TIMEOUT,
+    ]
+
+
+def test_close_is_noop_when_child_already_gone(tmp_path, monkeypatch):
+    calls = _run_recorder(monkeypatch, returncode=0)
+    proc = _CloseProc()
+    proc.returncode = 0  # already exited
+    follower = _make(tmp_path)
+    follower.proc = proc
+    follower.close()
+    assert calls == []            # no endpos request
+    assert proc.wait_timeouts == []
+
+
+def test_fallback_timeouts_fit_the_pod_grace_window(tmp_path):
+    """The whole teardown (endpos command + wait + signal fallback) must stay
+    inside terminationGracePeriodSeconds: 60."""
+    f = PgCyanFollow()
+    total = (f.STOP_REQUEST_TIMEOUT + f.DEFAULT_STOP_TIMEOUT
+             + f.FALLBACK_GRACE_TIMEOUT + f.FALLBACK_REAP_TIMEOUT)
+    assert total < 60

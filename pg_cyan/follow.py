@@ -41,7 +41,9 @@ Composed into ``PgCyanController`` like ``PgCyanSnapshot``: ``start()`` launches
 ``follow`` child and blocks (polling the source) until the slot shows an active
 consumer, writes ``migration-cdc-log.json`` + the shared readiness file, and returns
 (non-blocking; never raises). ``supervise()`` then blocks until the child exits or a
-signal, clearing readiness. ``close()`` terminates the child.
+signal, clearing readiness. ``close()`` stops the child gracefully by setting
+the sentinel endpos (a plain SIGTERM does not stop ``follow``'s receive worker;
+see ``close`` / ``request_stop``).
 
 LOB caveat (``notes/PostgreSQL Logical Replication Limitations ... LOBs.md``):
 pgoutput does not replicate large objects; the planner aborts on LOB sources,
@@ -85,6 +87,22 @@ class PgCyanFollow:
     #: How long to wait for the consumer to attach to the slot before failing.
     DEFAULT_ATTACH_TIMEOUT = 300      # 5min
     DEFAULT_POLL_INTERVAL = 3
+    #: Seconds to wait for the follow child to reach the requested endpos and
+    #: exit on its own after ``close()`` sets it -- the graceful stop. The child
+    #: syncs the sentinel each feedback cycle (~10s) then streams the small CDC
+    #: tail to endpos, so this only needs to cover a couple of those cycles.
+    #: Sized (with the endpos command + signal fallback below) to fit inside the
+    #: controller pod's ``terminationGracePeriodSeconds: 60``.
+    DEFAULT_STOP_TIMEOUT = 35
+    #: Seconds for the ``stream sentinel set endpos`` command itself (connect to
+    #: source, read current LSN, write the sentinel).
+    STOP_REQUEST_TIMEOUT = 10
+    #: Bounded signal fallback used only if the endpos stop overruns
+    #: ``DEFAULT_STOP_TIMEOUT`` (SIGTERM does not stop follow's receive worker,
+    #: so this is essentially a direct SIGKILL + reap); kept short so the whole
+    #: teardown still fits the 60s pod grace.
+    FALLBACK_GRACE_TIMEOUT = 5
+    FALLBACK_REAP_TIMEOUT = 3
 
     def __init__(
         self,
@@ -98,6 +116,7 @@ class PgCyanFollow:
         ready_file: Optional[str] = None,
         attach_timeout: int = DEFAULT_ATTACH_TIMEOUT,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
+        stop_timeout: int = DEFAULT_STOP_TIMEOUT,
         verbose: bool = False,
     ) -> None:
         """
@@ -118,6 +137,9 @@ class PgCyanFollow:
                 readiness file managed here (the caller owns it).
             attach_timeout: Seconds to wait for the consumer to attach.
             poll_interval: Seconds between slot-state polls.
+            stop_timeout: Seconds to wait for the follow child to reach the
+                requested endpos and exit on ``close()`` before the signal
+                fallback (see ``close``).
             verbose: Run ``pgcopydb follow --verbose`` (logs each applied change) --
                 an optional CDC debug knob; off by default.
         """
@@ -131,6 +153,7 @@ class PgCyanFollow:
         self.ready_file = ready_file
         self.attach_timeout = attach_timeout
         self.poll_interval = poll_interval
+        self.stop_timeout = stop_timeout
         self.verbose = verbose
 
         self.proc: Optional[subprocess.Popen] = None
@@ -322,18 +345,88 @@ class PgCyanFollow:
             self._log_event("ready", "warning", "Could not update the readiness file",
                             {"path": self.ready_file, "error": str(e)})
 
+    def request_stop(self) -> bool:
+        """Ask the running ``follow`` to stop at the source's current LSN.
+
+        This is pgcopydb's documented graceful stop for a live ``follow``:
+        ``stream sentinel set endpos --current`` records
+        ``pg_current_wal_flush_lsn()`` as the sentinel endpos (direct-mode
+        against the SAME ``--dir`` ``source.db``, like ``enable_apply``). The
+        receive worker re-reads the sentinel every feedback cycle
+        (``ld_stream.c`` ``stream_sync_sentinel``), streams the small CDC tail
+        up to that LSN, then exits; the apply worker catches up and exits; and
+        the top ``follow`` process reaps both and exits 0 -- no SIGKILL.
+
+        A SIGTERM alone does NOT stop ``follow``: only its apply/top processes
+        act on it, while the receive worker's loop just reconnects
+        (``ld_stream.c`` retries unless endpos is set) and gets force-killed at
+        the grace deadline. So endpos, not a signal, is the graceful path.
+
+        Best-effort: returns ``True`` if the endpos was set, ``False`` on any
+        error (the caller then falls back to signalling). ``--current`` needs a
+        source connection, taken from ``--source`` / ``PGCOPYDB_SOURCE_PGURI``.
+        """
+        if self.proc is None or self.proc.poll() is not None:
+            return False
+        cmd = [self.PGCOPYDB_BIN, "stream", "sentinel", "set", "endpos",
+               "--current", "--dir", self.work_dir]
+        if self.source_pguri:
+            cmd += ["--source", self.source_pguri]
+        try:
+            result = subprocess.run(  # noqa: S603 -- fixed argv, no shell
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=self.STOP_REQUEST_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self._log_event("request_stop", "warning",
+                            "Could not set the sentinel endpos to stop follow",
+                            {"error": str(e)})
+            return False
+        if result.returncode == 0:
+            self._log_event("request_stop", "success",
+                            "Set sentinel endpos to current LSN; follow will stop cleanly",
+                            {"output_tail": (result.stdout or "").strip()[-200:]})
+            return True
+        self._log_event("request_stop", "warning",
+                        f"stream sentinel set endpos rc={result.returncode}",
+                        {"output_tail": (result.stdout or "")[-500:]})
+        return False
+
     def close(self) -> None:
-        """Terminate the follow child cleanly (best-effort).
+        """Stop the follow child cleanly, preferring the sentinel endpos.
 
         ``follow`` is the live child at controller teardown (the snapshot was
         released mid-flow before CDC started), so it must stop cleanly -- flush
-        in-flight changes and release the source replication connection -- within
-        the pod grace window. Uses the shared ``graceful_terminate``
-        (see ``pg_cyan/shutdown.py``): SIGTERM, wait the ~grace window, then
-        SIGKILL + short reap, reconciled with ``terminationGracePeriodSeconds:
-        60``.
+        in-flight changes and release the source replication connection --
+        within the pod grace window (``terminationGracePeriodSeconds: 60``).
+
+        A plain SIGTERM does not achieve that: ``follow``'s receive worker
+        reconnects through the signal and is only SIGKILLed at the deadline
+        (see ``request_stop``). So first request a graceful stop via the
+        sentinel endpos and wait ``stop_timeout`` for the child to exit on its
+        own. Only if that overruns (or the endpos could not be set) do we fall
+        back to the shared ``graceful_terminate`` (see ``pg_cyan/shutdown.py``)
+        with a short window -- essentially a bounded SIGKILL + reap, kept small
+        so the whole teardown still fits the 60s grace.
         """
-        graceful_terminate(self.proc, log_event=self._log_event)
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        if self.request_stop():
+            try:
+                self.proc.wait(timeout=self.stop_timeout)
+                self._log_event("close", "success",
+                                "follow reached endpos and exited cleanly",
+                                {"returncode": self.proc.returncode})
+                return
+            except subprocess.TimeoutExpired:
+                self._log_event("close", "warning",
+                                "follow did not reach endpos in time; escalating to signal",
+                                {"timeout": self.stop_timeout})
+        graceful_terminate(
+            self.proc,
+            grace_timeout=self.FALLBACK_GRACE_TIMEOUT,
+            reap_timeout=self.FALLBACK_REAP_TIMEOUT,
+            log_event=self._log_event,
+        )
 
     # --------------------------------------------------------------- start
 
