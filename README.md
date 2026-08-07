@@ -199,6 +199,66 @@ See `deploy/k8s/` (the manifests are the nodes) and
 `notes/k8s-sharded-migration-topology.md` (the engine one-pager) for the full
 picture, and the `run-integration-test` skill to exercise it on a cluster.
 
+### The migration DAG
+
+The pre-migration collectors feed the planner, and the controller walks the
+resulting plan phase by phase. Nodes are `deploy/k8s/` manifests; edges are the
+controller/orchestrator (barriers between fan-out phases are noted on the edges).
+
+```mermaid
+%% pg_cyan migration pipeline. Read top-to-bottom.
+%% NODES  = deploy/k8s/ manifests (a CLI stage each); EDGES = the controller/orchestrator.
+%% The controller (run-migration) holds ONE consistent snapshot in-pod for the entire walk,
+%% and injects its SNAPSHOT_ID into every phase so all phases see the same point-in-time.
+flowchart TD
+    %% ---- Pre-migration: collectors run against the SOURCE, each writes a JSON artifact ----
+    subgraph PRE["Pre-migration collectors (run against source; no cluster)"]
+        direction TB
+        PF["preflight<br/>source readiness gate"]
+        PARAM["source-parameters<br/>pg_settings inventory"]
+        MET["source-pg-metrics<br/>heap/index sizes + row counts"]
+        LOB["source-largeobjects<br/>large-object count"]
+    end
+
+    %% ---- Planner: a pure OFFLINE transform — opens no DB connection ----
+    PLAN["plan (phase -1)<br/>LPT bin-pack tables into disjoint shards<br/>+ large-object abort gate"]
+
+    %% Collectors feed the planner as files; labels are the artifacts consumed.
+    MET  -->|"source-pg-metrics.json (required)"| PLAN
+    LOB  -->|"source-pg-largeobjects.json (required)"| PLAN
+    PARAM -.->|"pg-source-parameters.json (optional)"| PLAN
+    PF   -.->|"gate: proceed only if source is ready"| PLAN
+
+    %% ---- Migration DAG: driven in-cluster by the controller ----
+    subgraph CTRL["Controller: run-migration — holds the consistent snapshot for the whole walk"]
+        direction TB
+        SNAP["snapshot (phase 1)<br/>establish + hold slot/snapshot in-pod"]
+        PRED["pre-data (phase 0)<br/>schema only: tables/sequences/functions<br/>(no indexes, PK, FK, triggers)"]
+        SHARD["data shards (phase 2, xN)<br/>data-only COPY, one pod per shard<br/>runs in parallel"]
+        SEQ["sequences (phase 2s)<br/>source pg_sequences then target setval"]
+        IDX["index (phase 3a, xM)<br/>secondary indexes + PK/unique<br/>runs in parallel"]
+        FK["foreign-keys (phase 3b)<br/>ADD NOT VALID then VALIDATE"]
+        CDC["CDC follow<br/>controller becomes the consumer<br/>(not a DAG phase; Option A, #26)"]
+    end
+
+    %% The plan (plan.json + one shard-N.filters per shard) is what the controller walks.
+    PLAN -->|"plan.json + shard-N.filters"| SNAP
+
+    %% One snapshot pins every phase to the same consistent point-in-time.
+    SNAP -->|"SNAPSHOT_ID injected into each phase"| PRED
+    PRED -->|"schema present on target"| SHARD
+    SHARD -->|"barrier: all N shards finish"| SEQ
+    SEQ  --> IDX
+    IDX  -->|"barrier: all M index shards finish"| FK
+    FK   -->|"bulk copy complete; snapshot released"| CDC
+    CDC  -->|"target caught up"| CUT["cutover (planned)"]
+
+    classDef planner fill:#e2f2f5,stroke:#0a6070,color:#0d1b20;
+    classDef future  fill:#eef1f2,stroke:#8a9aa0,color:#33474d,stroke-dasharray:4 3;
+    class PLAN planner;
+    class CUT future;
+```
+
 ### Configuration (environment variables)
 
 Every CLI option falls back to an env var. The common ones — the rest are in each
