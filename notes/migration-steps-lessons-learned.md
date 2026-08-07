@@ -55,13 +55,13 @@ errors and returned exit 1, which pgcopydb surfaces as rc=7, failing the whole
 restore.
 
 **Fix (the schema step):** pass `--skip-extensions` (manifest-level, in
-`40-job-phase0-predata.yaml`). On Azure this is the *correct* behaviour
+`40-job-schema.yaml`). On Azure this is the *correct* behaviour
 regardless: extensions must be pre-provisioned via `azure.extensions` +
 `CREATE EXTENSION` by an allowed role, not carried in a schema restore.
 
 **⚠️ This WILL bite #25 and #28 — check it before you run them:**
 
-- **#25 (data shards):** `60-job-phase2-datashard.template.yaml` runs
+- **#25 (data shards):** `60-job-copy.template.yaml` runs
   `pgcopydb clone …` with **no `--skip-extensions`** today. `clone` processes
   the schema sections, so unless the shards are made data-only (see item 6) or
   given `--skip-extensions`, they will hit the identical extension wall.
@@ -139,7 +139,7 @@ exactly like the schema step does.
 Not a bug we hit, but the reason items 1/2/5 all matter for #25: the sharded
 topology assumes the schema step does pre-data, the copy step copies **data only**, the post-data steps
 does post-data. But `pgcopydb clone` (what
-`60-job-phase2-datashard.template.yaml` invokes) runs the full pipeline —
+`60-job-copy.template.yaml` invokes) runs the full pipeline —
 dump/restore pre-data *and* post-data around the COPY — by default. Before #25 is
 called done, confirm the shard command is actually restricted to table data
 (e.g. the appropriate data-only invocation / section flags), otherwise each shard

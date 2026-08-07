@@ -164,10 +164,10 @@ class PgCyanOrchestrator:
     #: injection happens and the manifests' own env applies.
     STEPS: List[Dict] = [
         {"id": "plan", "name": "Plan", "manifest": "30-job-planner.yaml"},
-        {"id": "schema", "name": "Schema", "manifest": "40-job-phase0-predata.yaml",
+        {"id": "schema", "name": "Schema", "manifest": "40-job-schema.yaml",
          "needs_snapshot": True},
         {
-            "id": "copy", "name": "Copy", "template": "60-job-phase2-datashard.template.yaml",
+            "id": "copy", "name": "Copy", "template": "60-job-copy.template.yaml",
             "plan_key": "data_shards", "needs_plan": True, "substitutions": _data_shard_substitutions,
             "aggregate_copy_logs": True, "needs_snapshot": True,
         },
@@ -177,13 +177,13 @@ class PgCyanOrchestrator:
         # target setval); no snapshot (sequences are not MVCC).
         {"id": "sequences", "name": "Sequences", "manifest": "62-job-sequences.yaml"},
         {
-            "id": "indexes", "name": "Indexes", "template": "70-job-phase3-index.template.yaml",
+            "id": "indexes", "name": "Indexes", "template": "70-job-indexes.template.yaml",
             "plan_key": "index_shards", "needs_plan": True, "substitutions": _index_shard_substitutions,
             # The indexes and foreign-keys steps are both pure psycopg2:
             # they read the source's DDL definitions directly, so -- like the other
             # collectors -- they need no injected snapshot.
         },
-        {"id": "foreign-keys", "name": "Foreign keys", "manifest": "71-job-phase3-fk.yaml"},
+        {"id": "foreign-keys", "name": "Foreign keys", "manifest": "71-job-foreign-keys.yaml"},
         # The follow step (CDC) is NOT an orchestrator step: under Option A the
         # controller itself becomes the CDC consumer after the walk, streaming
         # `pgcopydb follow` on its own --dir (the slot-creator and the streamer must

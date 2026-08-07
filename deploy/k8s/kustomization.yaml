@@ -18,7 +18,7 @@
 #   * 11-configmap-inputs.yaml / 12-configmap-plan.yaml -- illustrative stubs
 #     that the collect + planner Jobs overwrite with real content;
 #     applying the stub adds nothing.
-#   * 60-job-phase2-datashard.template.yaml / 70-job-phase3-index.template.yaml
+#   * 60-job-copy.template.yaml / 70-job-indexes.template.yaml
 #     -- NOT standalone-appliable (contain ${SHARD_NAME}/etc. placeholders the
 #     orchestrator substitutes once per plan.json entry -- see
 #     pg_cyan/orchestrator.py).
@@ -39,7 +39,7 @@ resources:
   # The migration controller: folded snapshot-holder + DAG orchestrator, run as
   # a single-pod StatefulSet.
   - 35-statefulset-controller.yaml
-  - 40-job-phase0-predata.yaml
+  - 40-job-schema.yaml
   - 62-job-sequences.yaml
-  - 71-job-phase3-fk.yaml
+  - 71-job-foreign-keys.yaml
   # (No follow-CDC Deployment: the controller streams CDC itself.)

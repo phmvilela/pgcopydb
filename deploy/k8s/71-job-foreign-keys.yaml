@@ -1,4 +1,4 @@
-# 71-job-phase3-fk.yaml
+# 71-job-foreign-keys.yaml
 # ---------------------------------------------------------------------------
 # FOREIGN-KEYS STEP: FOREIGN KEY constraints -- the SINGLE-PASS job.
 #
@@ -28,7 +28,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: pgcyan-phase3-fk
+  name: pgcyan-foreign-keys
   namespace: pgcyan-migration
   labels:
     pgcyan.dev/step: "foreign-keys"

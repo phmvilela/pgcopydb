@@ -1,7 +1,7 @@
 """
 Sharded initial copy pinned to the snapshot -- step ``2``.
 
-This is the step ``2`` node in ``deploy/k8s/`` (``60-job-phase2-datashard.template.yaml``):
+This is the step ``2`` node in ``deploy/k8s/`` (``60-job-copy.template.yaml``):
 one Job per copy shard, all running concurrently, each copying its OWN disjoint
 set of tables (authored by the planner as ``shard-<n>.filters``) so no row is
 copied twice and none is missed. Scale-out is *more shard Jobs*, not fatter pods

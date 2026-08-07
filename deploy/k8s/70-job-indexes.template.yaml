@@ -1,4 +1,4 @@
-# 70-job-phase3-index.template.yaml
+# 70-job-indexes.template.yaml
 # ---------------------------------------------------------------------------
 # INDEXES STEP: SECONDARY INDEX + PK/UNIQUE builds. TEMPLATE -- one Job per plan.json >
 # index_shards entry. Runs only AFTER the copy barrier (every data shard

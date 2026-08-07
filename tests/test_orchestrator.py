@@ -225,11 +225,11 @@ def test_render_yaml_raises_on_unknown_placeholder():
 
 def test_load_step_manifests_static_step_reads_real_files():
     orch = make_orchestrator()
-    step = {"id": "schema", "name": "Schema", "manifest": "40-job-phase0-predata.yaml"}
+    step = {"id": "schema", "name": "Schema", "manifest": "40-job-schema.yaml"}
     docs = orch._load_step_manifests(step, plan=None)
     assert len(docs) == 1
     assert docs[0]["kind"] == "Job"
-    assert docs[0]["metadata"]["name"] == "pgcyan-phase0-predata"
+    assert docs[0]["metadata"]["name"] == "pgcyan-schema"
 
 
 def test_load_step_manifests_static_step_multi_doc():
@@ -306,7 +306,7 @@ def test_static_manifest_image_placeholder_filled_runtime_vars_preserved():
     assert "${PGCYAN_STOP_AFTER}" in yaml.safe_dump(sts)  # runtime var preserved
 
     predata = orch._load_step_manifests(
-        {"id": "schema", "name": "Schema", "manifest": "40-job-phase0-predata.yaml"}, plan=None
+        {"id": "schema", "name": "Schema", "manifest": "40-job-schema.yaml"}, plan=None
     )[0]
     assert _container_image(predata) == TEST_IMAGE
     # SNAPSHOT_ID is injected by the controller at apply time, not sourced from
@@ -357,16 +357,16 @@ def test_resolve_image_pod_read_failure_raises(monkeypatch):
 def test_apply_creates_job():
     batch_api = FakeBatchApi()
     orch = make_orchestrator(batch_api=batch_api)
-    orch._apply({"kind": "Job", "metadata": {"name": "pgcyan-phase0-predata"}})
-    assert batch_api.created == [("pgcyan-migration", "pgcyan-phase0-predata",
-                                   {"kind": "Job", "metadata": {"name": "pgcyan-phase0-predata",
+    orch._apply({"kind": "Job", "metadata": {"name": "pgcyan-schema"}})
+    assert batch_api.created == [("pgcyan-migration", "pgcyan-schema",
+                                   {"kind": "Job", "metadata": {"name": "pgcyan-schema",
                                                                  "namespace": "pgcyan-migration"}})]
 
 
 def test_apply_treats_conflict_as_idempotent_noop():
-    batch_api = FakeBatchApi(create_conflicts={"pgcyan-phase0-predata"})
+    batch_api = FakeBatchApi(create_conflicts={"pgcyan-schema"})
     orch = make_orchestrator(batch_api=batch_api)
-    orch._apply({"kind": "Job", "metadata": {"name": "pgcyan-phase0-predata"}})  # must not raise
+    orch._apply({"kind": "Job", "metadata": {"name": "pgcyan-schema"}})  # must not raise
     assert batch_api.created == []
 
 
@@ -470,12 +470,12 @@ def test_read_plan_configmap_bad_json_raises():
 def _all_jobs_complete_batch_api():
     return FakeBatchApi(job_outcomes={
         "pgcyan-planner": ["complete"],
-        "pgcyan-phase0-predata": ["complete"],
+        "pgcyan-schema": ["complete"],
         "pgcyan-datashard-shard-0": ["complete"],
         "pgcyan-datashard-shard-1": ["complete"],
         "pgcyan-index-idx-0": ["complete"],
         "pgcyan-index-idx-1": ["complete"],
-        "pgcyan-phase3-fk": ["complete"],
+        "pgcyan-foreign-keys": ["complete"],
     })
 
 
@@ -505,9 +505,9 @@ def test_run_happy_path_applies_all_steps_in_order():
     # data + index shards + fk + pre-data + planner Jobs were all created
     created_job_names = {name for _, name, _ in batch_api.created}
     assert created_job_names == {
-        "pgcyan-planner", "pgcyan-phase0-predata", "pgcyan-datashard-shard-0",
+        "pgcyan-planner", "pgcyan-schema", "pgcyan-datashard-shard-0",
         "pgcyan-datashard-shard-1", "pgcyan-sequences", "pgcyan-index-idx-0",
-        "pgcyan-index-idx-1", "pgcyan-phase3-fk",
+        "pgcyan-index-idx-1", "pgcyan-foreign-keys",
     }
     # NO Deployment: the CDC follow-cdc Deployment is gone (controller streams CDC).
     created_deployment_names = {name for _, name, _ in apps_api.created}
@@ -517,7 +517,7 @@ def test_run_happy_path_applies_all_steps_in_order():
 def test_run_fails_fast_and_stops_the_dag():
     batch_api = FakeBatchApi(job_outcomes={
         "pgcyan-planner": ["complete"],
-        "pgcyan-phase0-predata": ["failed"],
+        "pgcyan-schema": ["failed"],
     })
     apps_api = _all_deployments_ready_apps_api()
     orch = make_orchestrator(batch_api=batch_api, apps_api=apps_api,
@@ -551,7 +551,7 @@ def test_run_stops_before_reading_plan_if_earlier_step_fails():
 def test_run_fails_fast_when_one_of_two_data_shards_fails():
     batch_api = FakeBatchApi(job_outcomes={
         "pgcyan-planner": ["complete"],
-        "pgcyan-phase0-predata": ["complete"],
+        "pgcyan-schema": ["complete"],
         "pgcyan-datashard-shard-0": ["complete"],
         "pgcyan-datashard-shard-1": ["failed"],
     })
@@ -702,12 +702,12 @@ def test_aggregate_copy_logs_empty_when_no_shard_logs():
 def test_full_run_aggregates_copy_logs_on_step_two_success():
     batch_api = FakeBatchApi(job_outcomes={
         "pgcyan-planner": ["complete"],
-        "pgcyan-phase0-predata": ["complete"],
+        "pgcyan-schema": ["complete"],
         "pgcyan-datashard-shard-0": ["complete"],
         "pgcyan-datashard-shard-1": ["complete"],
         "pgcyan-index-idx-0": ["complete"],
         "pgcyan-index-idx-1": ["complete"],
-        "pgcyan-phase3-fk": ["complete"],
+        "pgcyan-foreign-keys": ["complete"],
     })
     apps_api = _all_deployments_ready_apps_api()
     core = FakeCoreApi(
@@ -755,7 +755,7 @@ def test_apply_step_injects_snapshot_into_needs_snapshot_step():
     step = next(p for p in PgCyanOrchestrator.STEPS if p["id"] == "schema")  # schema
     assert step.get("needs_snapshot")
     orch._apply_step(step, plan=None)
-    body = next(b for _, n, b in batch_api.created if n == "pgcyan-phase0-predata")
+    body = next(b for _, n, b in batch_api.created if n == "pgcyan-schema")
     env = body["spec"]["template"]["spec"]["containers"][0]["env"]
     assert {"name": "SNAPSHOT_ID", "value": "SNAP-9"} in env
 
@@ -808,7 +808,7 @@ def test_run_stop_after_step_two_skips_later_steps():
     assert summary["stopped_after"] == "copy"
     assert [p["step"] for p in summary["steps"]] == ["plan", "schema", "copy"]
     created = {name for _, name, _ in batch_api.created}
-    assert "pgcyan-index-idx-0" not in created and "pgcyan-phase3-fk" not in created
+    assert "pgcyan-index-idx-0" not in created and "pgcyan-foreign-keys" not in created
     assert "pgcyan-follow-cdc" not in {name for _, name, _ in apps_api.created}
     # aggregation still ran for the copy step
     assert PgCyanOrchestrator.COPY_LOG_CONFIGMAP in core.configmaps

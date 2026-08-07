@@ -1,7 +1,7 @@
 """
 Post-data foreign-key constraints for the sharded topology -- step ``3b``.
 
-This is the step ``3b`` node in ``deploy/k8s/`` (``71-job-phase3-fk.yaml``): a
+This is the step ``3b`` node in ``deploy/k8s/`` (``71-job-foreign-keys.yaml``): a
 **single** coordinated pass, run after every index shard (step ``3a``) succeeds.
 FKs are NOT sharded like indexes because a foreign key can reference a table in a
 *different* copy shard -- so applying them shard-by-shard could hit a not-yet-present

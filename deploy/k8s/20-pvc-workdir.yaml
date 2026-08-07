@@ -48,7 +48,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: pgcyan-workdir-predata      # the schema step (40-job-phase0-predata.yaml)
+  name: pgcyan-workdir-predata      # the schema step (40-job-schema.yaml)
   namespace: pgcyan-migration
   labels:
     pgcyan.dev/workdir: "predata"
@@ -60,7 +60,7 @@ spec:
   storageClassName: managed-csi     # TODO: confirm the RWO class name on the target cluster
 ---
 # (No foreign-keys FK disk: the FK pass is pure psycopg2 -- no pgcopydb catalog to
-# persist -- so 71-job-phase3-fk.yaml uses an emptyDir, not a PVC.)
+# persist -- so 71-job-foreign-keys.yaml uses an emptyDir, not a PVC.)
 # (No follow CDC disk here: the CONTROLLER is the CDC consumer and uses its OWN
 # --dir, a volumeClaimTemplate on the StatefulSet in
 # 35-statefulset-controller.yaml -- not a standalone PVC.)

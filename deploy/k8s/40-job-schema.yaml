@@ -1,4 +1,4 @@
-# 40-job-phase0-predata.yaml
+# 40-job-schema.yaml
 # ---------------------------------------------------------------------------
 # SCHEMA STEP: pre-data (schema WITHOUT secondary indexes / constraints).
 #
@@ -27,7 +27,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: pgcyan-phase0-predata
+  name: pgcyan-schema
   namespace: pgcyan-migration
 spec:
   backoffLimit: 3           # pre-data is cheap to retry; the wrapper is idempotent

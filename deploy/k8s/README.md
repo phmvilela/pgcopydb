@@ -10,8 +10,8 @@ issue #40 — custom Python using the Kubernetes client and the RBAC in
 `01-rbac.yaml`, chosen over Argo Workflows so no new CRDs/controller are
 needed; see the module docstring for the full rationale) — plain YAML cannot
 express "wait for all shards". Files are numbered in apply order; the
-orchestrator applies steps −1 through 4 (namespace/RBAC/PVC/Secrets and the
-step −2 input collector are assumed already applied).
+orchestrator applies the plan → foreign-keys steps (namespace/RBAC/PVC/Secrets
+and the collect input collector are assumed already applied).
 
 | File | Step | Kind | Role |
 |---|---|---|---|
@@ -24,10 +24,10 @@ step −2 input collector are assumed already applied).
 | `25-job-collect-inputs.yaml`  | collect | Job | collectors hit the source DB → write the inputs ConfigMap |
 | `30-job-planner.yaml`  | plan | Job | runs the planner (`pg_cyan.cli plan`) |
 | `35-statefulset-controller.yaml` | — (drives all) | StatefulSet(1)+Service+PDB | `pg_cyan.cli run-migration`: the folded snapshot-holder + DAG orchestrator (#70). HOLDS the consistent snapshot in-pod and walks plan→schema→copy→sequences→indexes→foreign-keys→follow, injecting `SNAPSHOT_ID` into the pods and owning every workload (delete it → cascade) |
-| `40-job-phase0-predata.yaml`  | schema | Job | `pg_cyan.cli restore-predata`: pre-data schema only (tables/sequences) — NO secondary indexes, PK/unique, FK, or triggers (those are post-data, #28); the controller injects `SNAPSHOT_ID` so the dump pins to the same instant the shards copy |
-| `60-job-phase2-datashard.template.yaml`  | copy | PVC+Job × N | `pg_cyan.cli copy-shard`: concurrent DATA-ONLY (`pgcopydb copy table-data`) COPY shards, each on its own RWO work disk; writes per-shard `migration-copy-log.json` and publishes it to its `pgcyan-copylog-<shard>` ConfigMap (slot/publication/snapshot + per-table row counts), which the orchestrator merges into the combined `pgcyan-copylog` ConfigMap |
-| `70-job-phase3-index.template.yaml`  | indexes | PVC+Job × M | secondary index builds (shardable), each on its own RWO work disk |
-| `71-job-phase3-fk.yaml`  | foreign-keys | Job (single) | FK/constraint single coordinated pass |
+| `40-job-schema.yaml`  | schema | Job | `pg_cyan.cli restore-predata`: pre-data schema only (tables/sequences) — NO secondary indexes, PK/unique, FK, or triggers (those are post-data, #28); the controller injects `SNAPSHOT_ID` so the dump pins to the same instant the shards copy |
+| `60-job-copy.template.yaml`  | copy | PVC+Job × N | `pg_cyan.cli copy-shard`: concurrent DATA-ONLY (`pgcopydb copy table-data`) COPY shards, each on its own RWO work disk; writes per-shard `migration-copy-log.json` and publishes it to its `pgcyan-copylog-<shard>` ConfigMap (slot/publication/snapshot + per-table row counts), which the orchestrator merges into the combined `pgcyan-copylog` ConfigMap |
+| `70-job-indexes.template.yaml`  | indexes | PVC+Job × M | secondary index builds (shardable), each on its own RWO work disk |
+| `71-job-foreign-keys.yaml`  | foreign-keys | Job (single) | FK/constraint single coordinated pass |
 | *(CDC — no manifest)* | — | the controller itself | Under Option A (#26) the controller streams `pgcopydb follow` on its own `--dir` after the walk; there is no separate CDC Deployment (the slot-creator + streamer must share a `--dir`). |
 | `90-cronjob-slot-reaper.example.yaml` | — | CronJob (suspended EXAMPLE) | specification (#70) for reaping the orphaned SOURCE replication slot — the one leaked resource owner-ref cascade can't reach; customize the guard before enabling |
 
@@ -74,8 +74,8 @@ PGCYAN_IMAGE=pgcyanacr.azurecr.io/pgcyan:$(git rev-parse --short HEAD) \
 
 ## Running just the planning steps end-to-end
 
-To execute the **planning half only** — the step −2 collector (`25`) and the
-step −1 planner (`30`), producing the `pgcyan-plan` ConfigMap without moving
+To execute the **planning half only** — the collect step (`25`) and the
+plan step (`30`), producing the `pgcyan-plan` ConfigMap without moving
 any data — use the `planner` job of the manual
 `.github/workflows/integration-tests.yml` workflow (issue #50). It logs in to
 the cluster (OIDC), materializes the source-DB `pgcyan-source-pg` Secret from

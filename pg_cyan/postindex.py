@@ -2,7 +2,7 @@
 Post-data index + PK/unique-constraint build for the sharded topology
 -- step ``3a``.
 
-This is the step ``3a`` node in ``deploy/k8s/`` (``70-job-phase3-index.template.yaml``):
+This is the step ``3a`` node in ``deploy/k8s/`` (``70-job-indexes.template.yaml``):
 one Job per index shard, all concurrent, each building the **secondary indexes AND
 the primary-key / unique constraints** for its OWN disjoint set of tables (the
 planner's ``shard-<n>.filters``). Index builds are independent, so they shard the

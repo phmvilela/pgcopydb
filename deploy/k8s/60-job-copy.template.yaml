@@ -1,4 +1,4 @@
-# 60-job-phase2-datashard.template.yaml
+# 60-job-copy.template.yaml
 # ---------------------------------------------------------------------------
 # COPY STEP: DATA SHARDS -- the horizontally-scaled COPY workers. This is a
 # TEMPLATE. The orchestrator stamps out ONE Job per entry in

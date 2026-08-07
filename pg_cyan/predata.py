@@ -1,7 +1,7 @@
 """
 Pre-data schema transfer for the sharded pgcopydb topology.
 
-This is the step ``0`` node in ``deploy/k8s/`` (``40-job-phase0-predata.yaml``):
+This is the step ``0`` node in ``deploy/k8s/`` (``40-job-schema.yaml``):
 a single coordinator Job that creates the *target* schema **before** any data
 shard runs, so every shard finds its tables already present. It transfers the
 **pre-data section only** -- tables, sequences, functions, LOB metadata -- and
