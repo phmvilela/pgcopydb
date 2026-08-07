@@ -61,7 +61,7 @@ class FakeController:
 
     def __init__(self):
         self.start_response = (202, {"state": "starting", "message": "start accepted"})
-        self.status_response = (200, {"state": "running", "phases": []})
+        self.status_response = (200, {"state": "running", "steps": []})
         self.unreachable = False
         self.started = []
         self.polled = []

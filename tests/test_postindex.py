@@ -141,7 +141,7 @@ def test_idempotent_existing_objects_are_skipped(tmp_path, filter_file, monkeypa
     assert summary["indexes_built"] == 1 and summary["constraints_built"] == 2
 
 
-def test_apply_failure_is_a_phase_failure(tmp_path, filter_file, monkeypatch):
+def test_apply_failure_is_a_step_failure(tmp_path, filter_file, monkeypatch):
     tgt = _TargetCursor(fail="ADD CONSTRAINT")
     monkeypatch.setattr(pi_module.psycopg2, "connect", _connect_factory(tgt))
     summary = _make(tmp_path, filter_file).run()

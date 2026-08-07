@@ -9,10 +9,10 @@ name: Integration tests
 # `${RESTORE_JOBS}` refs intact).
 #
 # ONE job, `migration`, runs the whole implemented pipeline end-to-end via the
-# folded controller -- no per-phase jobs, no parallelism, no shared-object race.
-# It runs the phase -2 collector (barrier), then stands up the controller
+# folded controller -- no per-step jobs, no parallelism, no shared-object race.
+# It runs the the collect step collector (barrier), then stands up the controller
 # StatefulSet with PGCYAN_FOLLOW_CDC=true: the controller holds the consistent
-# snapshot in-pod and walks planner -> pre-data -> data shards -> index -> FK,
+# snapshot in-pod and walks plan -> schema -> copy -> indexes -> foreign-keys,
 # then itself becomes the CDC consumer (`pgcopydb follow --resume` on its own
 # --dir, so follow reuses the slot). It then asserts: the combined pgcyan-copylog
 # ConfigMap is a `completed` copy with per-table row counts; the target has
@@ -67,13 +67,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: azure
     # ONE job, no parallelism -- the folded controller walks the WHOLE implemented
-    # DAG in-pod (planner -> pre-data -> data shards), so there is nothing to
+    # DAG in-pod (plan -> schema -> copy), so there is nothing to
     # serialize against and no shared-object race. Runs the real production code
     # path end-to-end.
     env:
       AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
       AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
-      # Run the WHOLE walk (planner -> post-data; PGCYAN_STOP_AFTER empty) and then
+      # Run the WHOLE walk (plan -> foreign-keys; PGCYAN_STOP_AFTER empty) and then
       # stream CDC: after the walk the controller releases the snapshot and becomes
       # the `pgcopydb follow` consumer on its own --dir, staying Ready.
       PGCYAN_STOP_AFTER: ""
@@ -190,10 +190,10 @@ jobs:
             --from-literal=PGCOPYDB_TARGET_PGURI="$target_uri" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # Clean slate: the controller owns (owner-ref) the phase Jobs/PVCs it
+      # Clean slate: the controller owns (owner-ref) the step Jobs/PVCs it
       # creates, so deleting its StatefulSet cascade-deletes them; also drop the
       # run-state marker (else a fresh controller refuses-to-resume), the plan +
-      # combined/per-shard copy logs, and the phase -2 collector + target-check Job.
+      # combined/per-shard copy logs, and the the collect step collector + target-check Job.
       - name: Clear prior controller run
         run: |
           kubectl delete statefulset pgcyan-controller -n "$NS" --ignore-not-found --wait=true --cascade=foreground || true
@@ -204,14 +204,14 @@ jobs:
           kubectl delete configmap -n "$NS" --ignore-not-found -l pgcyan.dev/copylog=shard || true
           kubectl delete job -n "$NS" --ignore-not-found --wait=true \
             pgcyan-collect-inputs pgcyan-target-check pgcyan-cdc-check pgcyan-cdc-roundtrip || true
-          kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/phase=data || true
+          kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/step=data || true
           # the controller's own --dir PVC (volumeClaimTemplate; not cascaded by the
           # StatefulSet delete) -- clear it so this run gets a fresh --dir.
           kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
 
-      # Phase -2 (collect inputs) is NOT part of the controller walk (which starts
+      # the collect step (collect inputs) is NOT part of the controller walk (which starts
       # at the planner, -1); run it + barrier first so the planner has its inputs.
-      - name: Phase -2 -- collect inputs (barrier)
+      - name: the collect step -- collect inputs (barrier)
         run: |
           set -euo pipefail
           wait_job() {
@@ -241,7 +241,7 @@ jobs:
       # Completion signal is the run-state marker the controller patches, NOT
       # pod readiness (which flips Ready as soon as the snapshot is established,
       # before the walk finishes). Poll until it reaches a terminal status.
-      # 30min: the data copy (phase 2) is heavier than schema-only.
+      # 30min: the data copy (the copy step) is heavier than schema-only.
       - name: Wait for the controller to finish the walk (run-state)
         run: |
           set -euo pipefail
@@ -268,7 +268,7 @@ jobs:
           set -euo pipefail
           kubectl get configmap pgcyan-copylog -n "$NS" \
             -o jsonpath='{.data.migration-copy-log\.json}' > /tmp/copylog.json \
-            || { echo "::error::pgcyan-copylog ConfigMap not found (phase-2 aggregation did not run)"; exit 1; }
+            || { echo "::error::pgcyan-copylog ConfigMap not found (collect-step aggregation did not run)"; exit 1; }
           echo "---- migration-copy-log.json ----" && cat /tmp/copylog.json
           python3 - <<'PY'
           import json, sys
@@ -291,8 +291,8 @@ jobs:
                 f"{log['row_count_total']} rows, slot={log['slot']}")
           PY
 
-      # ACCEPTANCE: after phase 3 the target has tables + data + secondary
-      # indexes + PK/unique constraints (built by phase 3a build-indexes) + ALL
+      # ACCEPTANCE: after the post-data steps the target has tables + data + secondary
+      # indexes + PK/unique constraints (built by the indexes step build-indexes) + ALL
       # foreign keys VALIDATED (NOT VALID then VALIDATE).
       # Checked in-cluster (target unreachable from the runner) with the target URI.
       - name: Verify target post-data shape (indexes + PK/unique + validated FKs)
@@ -304,13 +304,13 @@ jobs:
           kind: Job
           metadata:
             name: pgcyan-target-check
-            labels: { pgcyan.dev/phase: "controller-check" }
+            labels: { pgcyan.dev/step: "controller-check" }
           spec:
             backoffLimit: 0
             ttlSecondsAfterFinished: 3600
             template:
               metadata:
-                labels: { pgcyan.dev/phase: "controller-check" }
+                labels: { pgcyan.dev/step: "controller-check" }
               spec:
                 serviceAccountName: pgcyan-worker
                 restartPolicy: Never
@@ -335,14 +335,14 @@ jobs:
           fksvalid=$(echo "$line" | sed -E 's/.*fksvalid=([0-9]+).*/\1/')
           fail=0
           [ "${tables:-0}" -gt 0 ]      || { echo "::error::expected tables > 0, got ${tables:-}"; fail=1; }
-          [ "${indexes:-0}" -gt 0 ]     || { echo "::error::expected secondary indexes > 0 (phase 3a), got ${indexes:-}"; fail=1; }
-          [ "${pkuq:-0}" -gt 0 ]        || { echo "::error::expected PK/unique constraints > 0 (phase 3a build-indexes), got ${pkuq:-}"; fail=1; }
-          [ "${fks:-0}" -gt 0 ]         || { echo "::error::expected FKs > 0 (phase 3b; source must have FKs), got ${fks:-}"; fail=1; }
+          [ "${indexes:-0}" -gt 0 ]     || { echo "::error::expected secondary indexes > 0 (the indexes step), got ${indexes:-}"; fail=1; }
+          [ "${pkuq:-0}" -gt 0 ]        || { echo "::error::expected PK/unique constraints > 0 (the indexes step build-indexes), got ${pkuq:-}"; fail=1; }
+          [ "${fks:-0}" -gt 0 ]         || { echo "::error::expected FKs > 0 (the foreign-keys step; source must have FKs), got ${fks:-}"; fail=1; }
           [ "${fksvalid:-0}" = "${fks:-1}" ] || { echo "::error::expected ALL FKs validated, got ${fksvalid:-}/${fks:-}"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
           echo "target post-data OK: $tables tables, $indexes indexes, $pkuq PK/unique, $fks FKs ($fksvalid validated)"
 
-      # ACCEPTANCE: after phase 4 the CDC consumer is streaming -- exactly ONE
+      # ACCEPTANCE: after the follow step the CDC consumer is streaming -- exactly ONE
       # active consumer on the SOURCE slot (the controller released its snapshot so
       # `pgcopydb follow` could attach), and migration-cdc-log.json says `streaming`.
       # Checked in-cluster (source URI from the secret).
@@ -355,13 +355,13 @@ jobs:
           kind: Job
           metadata:
             name: pgcyan-cdc-check
-            labels: { pgcyan.dev/phase: "controller-check" }
+            labels: { pgcyan.dev/step: "controller-check" }
           spec:
             backoffLimit: 0
             ttlSecondsAfterFinished: 3600
             template:
               metadata:
-                labels: { pgcyan.dev/phase: "controller-check" }
+                labels: { pgcyan.dev/step: "controller-check" }
               spec:
                 serviceAccountName: pgcyan-worker
                 restartPolicy: Never
@@ -407,13 +407,13 @@ jobs:
           kind: Job
           metadata:
             name: pgcyan-cdc-roundtrip
-            labels: { pgcyan.dev/phase: "controller-check" }
+            labels: { pgcyan.dev/step: "controller-check" }
           spec:
             backoffLimit: 0
             ttlSecondsAfterFinished: 3600
             template:
               metadata:
-                labels: { pgcyan.dev/phase: "controller-check" }
+                labels: { pgcyan.dev/step: "controller-check" }
               spec:
                 serviceAccountName: pgcyan-worker
                 restartPolicy: Never
@@ -448,7 +448,7 @@ jobs:
                         [ "${n:-0}" = "1" ] && exit 0
                         echo "ROUNDTRIP notfound after 30s"; exit 1
           EOF
-          # FATAL: the sequence-sync phase (2s) advances the target identity
+          # FATAL: the sequence-sync step (2s) advances the target identity
           # sequences after the copy, and the pgcopydb fork flushes the apply
           # pipeline on drain, so a live source insert must appear on the target
           # within the window. If it does not, that is a real regression -- dump
@@ -463,15 +463,15 @@ jobs:
           kubectl logs job/pgcyan-cdc-roundtrip -n "$NS" --tail=-1 | grep -q "ROUNDTRIP found"
           echo "CDC replication OK: a source insert appeared on the target"
 
-      - name: Collect controller + phase logs
+      - name: Collect controller + step logs
         if: always()
         run: |
           mkdir -p migration-output
           # The controller streams CDC in-pod (Option A), so its follow events are
           # in controller.log; there is no separate `cdc` pod.
           kubectl logs -l pgcyan.dev/component=controller -n "$NS" --tail=-1 > migration-output/controller.log 2>&1 || true
-          for phase in collect-inputs planner pre-data data sequences post-data-index post-data-fk controller-check; do
-            kubectl logs -l pgcyan.dev/phase="$phase" -n "$NS" --tail=-1 --prefix > "migration-output/${phase}.log" 2>&1 || true
+          for step in collect-inputs planner pre-data data sequences post-data-index post-data-fk controller-check; do
+            kubectl logs -l pgcyan.dev/step="$step" -n "$NS" --tail=-1 --prefix > "migration-output/${step}.log" 2>&1 || true
           done
           kubectl get configmap pgcyan-migration-state -n "$NS" -o yaml > migration-output/run-state.yaml 2>/dev/null || true
           kubectl get configmap pgcyan-copylog -n "$NS" -o jsonpath='{.data.migration-copy-log\.json}' > migration-output/migration-copy-log.json 2>/dev/null || true
@@ -529,13 +529,13 @@ jobs:
           kind: Job
           metadata:
             name: pgcyan-slot-release-check
-            labels: { pgcyan.dev/phase: "controller-check" }
+            labels: { pgcyan.dev/step: "controller-check" }
           spec:
             backoffLimit: 0
             ttlSecondsAfterFinished: 3600
             template:
               metadata:
-                labels: { pgcyan.dev/phase: "controller-check" }
+                labels: { pgcyan.dev/step: "controller-check" }
               spec:
                 serviceAccountName: pgcyan-worker
                 restartPolicy: Never
@@ -583,7 +583,7 @@ jobs:
             pgcyan-migration-state pgcyan-plan pgcyan-copylog || true
           kubectl delete configmap -n "$NS" --ignore-not-found -l pgcyan.dev/copylog=shard || true
           kubectl delete job pgcyan-collect-inputs pgcyan-target-check pgcyan-cdc-check pgcyan-cdc-roundtrip pgcyan-slot-release-check -n "$NS" --ignore-not-found --wait=false || true
-          kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/phase=data || true
+          kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/step=data || true
           # the controller's own --dir PVC (volumeClaimTemplate; not cascaded)
           kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
 

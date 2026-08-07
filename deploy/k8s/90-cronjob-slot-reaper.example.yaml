@@ -8,7 +8,7 @@
 #
 # WHY AN EXAMPLE, NOT WIRED IN: dropping a slot is destructive and easy to get
 # wrong. A slot can be *legitimately* inactive for a window (e.g. between the
-# initial copy finishing and CDC attaching in phase 4), so a naive "drop any
+# initial copy finishing and CDC attaching in the follow step), so a naive "drop any
 # inactive pgcyan slot" cron would break a healthy migration. A correct reaper
 # must be sure the slot is BOTH inactive AND orphaned (no controller StatefulSet,
 # no follow-CDC Deployment referencing it). Encode that policy for YOUR

@@ -1,25 +1,25 @@
 """
 Post-data index + PK/unique-constraint build for the sharded topology
--- phase ``3a``.
+-- step ``3a``.
 
-This is the phase ``3a`` node in ``deploy/k8s/`` (``70-job-phase3-index.template.yaml``):
+This is the step ``3a`` node in ``deploy/k8s/`` (``70-job-phase3-index.template.yaml``):
 one Job per index shard, all concurrent, each building the **secondary indexes AND
 the primary-key / unique constraints** for its OWN disjoint set of tables (the
 planner's ``shard-<n>.filters``). Index builds are independent, so they shard the
 same way the copy does; foreign keys -- which can span shards -- are a separate
-single pass (phase ``3b``, ``pg_cyan/postfk.py``).
+single pass (step ``3b``, ``pg_cyan/postfk.py``).
 
 WHY PK/UNIQUE LIVE HERE. Pre-data creates tables with **no** indexes or
 constraints of any kind -- a primary key is backed by an index, and building it
 during pre-data would slow the COPY. So PK/unique constraints land here alongside
-the secondary indexes, and this phase builds both.
+the secondary indexes, and this step builds both.
 
-WHY CUSTOM SQL, NOT pgcopydb (like phase 3b). pgcopydb's per-object ``copy indexes``
+WHY CUSTOM SQL, NOT pgcopydb (like the foreign-keys step). pgcopydb's per-object ``copy indexes``
 / ``copy constraints`` are built for the shared ``--dir`` clone workflow and do
 nothing in our standalone per-shard pods (they exit 0 having built no indexes).
-Rather than fight that coupling, this phase introspects the source's index and
+Rather than fight that coupling, this step introspects the source's index and
 PK/unique definitions directly and applies them to the target over psycopg2 --
-the exact pattern phase 3b uses for foreign keys. No pgcopydb, no ``--dir``
+the exact pattern the foreign-keys step uses for foreign keys. No pgcopydb, no ``--dir``
 catalog, no snapshot import: the DDL definitions come straight from the source
 catalog (``pg_get_indexdef`` / ``pg_get_constraintdef``), which is stable across
 the migration window (the same assumption 3b already makes -- no snapshot needed).
@@ -42,7 +42,7 @@ two-file shape as the other stages:
   * ``target-pg-index-log-errors.json`` -- on any failure.
 
 The authoritative combined ``target-pg-postload-log.json`` (the ticket's AC) is
-written by phase ``3b`` after every index shard succeeds -- it verifies the
+written by step ``3b`` after every index shard succeeds -- it verifies the
 target's actual index + FK state directly.
 
 Follows the ``PgCyanForeignKeys`` / collector pattern: structured JSON logging via
@@ -90,7 +90,7 @@ _SELECT_PK_UNIQUE = """
 
 
 class PgCyanPostIndex:
-    """Builds one shard's secondary indexes + PK/unique constraints (phase 3a)."""
+    """Builds one shard's secondary indexes + PK/unique constraints (the indexes step)."""
 
     #: Written on the happy path (per shard).
     LOG_OUTPUT_FILENAME = "target-pg-index-log.json"
@@ -306,7 +306,7 @@ class PgCyanPostIndex:
             "shard": self.shard_name,
             "message": message,
             "errors": self.errors or ["Unknown error"],
-            "remediation": "Phase 3a is a barrier before the FK pass (3b); fix the cause and let k8s retry (it is idempotent).",
+            "remediation": "the indexes step is a barrier before the FK pass (3b); fix the cause and let k8s retry (it is idempotent).",
         }
 
     def close(self) -> None:
@@ -390,7 +390,7 @@ class PgCyanPostIndex:
                 "message": (
                     f"Built {idx_ok} secondary index(es) and {con_ok} PK/UNIQUE "
                     f"constraint(s) for shard {self.shard_name}. Foreign keys are "
-                    "the separate phase 3b."
+                    "the separate the foreign-keys step."
                 ),
             }
             summary["log_file"] = self._write_json(self.LOG_OUTPUT_FILENAME, payload)

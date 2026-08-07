@@ -1,13 +1,13 @@
 # 40-job-phase0-predata.yaml
 # ---------------------------------------------------------------------------
-# PHASE 0: pre-data (schema WITHOUT secondary indexes / constraints).
+# SCHEMA STEP: pre-data (schema WITHOUT secondary indexes / constraints).
 #
 # A single coordinator Job. It creates the target schema -- tables, sequences,
 # functions, LOB metadata -- but deliberately NOT secondary indexes, PRIMARY
 # KEY / UNIQUE constraints, foreign keys, or triggers. In Postgres' dump model
 # all of those live in the POST-DATA section (a primary key is backed by an
 # index, built after the data lands), which is dramatically faster than
-# maintaining them during COPY. They are built by the post-data phase.
+# maintaining them during COPY. They are built by the post-data step.
 #
 # This runs BEFORE any data shard so every shard finds its target tables already
 # present. It is a hard barrier: no shard may start until this succeeds.
@@ -15,11 +15,11 @@
 # MECHANISM: a thin wrapper (`pg_cyan.cli restore-predata`) over pgcopydb.
 # `pgcopydb restore pre-data` restores from a custom-format dump file
 # in `--dir`, and this pod's `--dir` starts empty, so the wrapper runs two
-# steps: `pgcopydb dump schema --snapshot=<id>` (pinned to the phase-1 holder's
+# steps: `pgcopydb dump schema --snapshot=<id>` (pinned to the snapshot holder's
 # snapshot so the schema matches the instant the shards copy) then
 # `pgcopydb restore pre-data --no-owner` (pre-data section only).
 #
-# ORDERING: this phase depends on the consistent snapshot. The CONTROLLER holds
+# ORDERING: this step depends on the consistent snapshot. The CONTROLLER holds
 # that snapshot in its own pod and INJECTS `SNAPSHOT_ID` into this Job's env at
 # apply time (no `pgcyan-snapshot` ConfigMap). The wrapper pins `dump schema` to
 # it, exactly like the data shards.
@@ -35,7 +35,7 @@ spec:
   template:
     metadata:
       labels:
-        pgcyan.dev/phase: "pre-data"
+        pgcyan.dev/step: "schema"
     spec:
       serviceAccountName: pgcyan-worker
       # The image runs as non-root uid 1000 ('migration', Dockerfile: useradd

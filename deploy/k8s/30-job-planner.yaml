@@ -1,6 +1,6 @@
 # 30-job-planner.yaml
 # ---------------------------------------------------------------------------
-# PHASE -1 (control plane): the PLANNER.
+# PLAN STEP (control plane): the PLANNER.
 #
 # Reads the inputs ConfigMap (metrics + parameters + constraints), runs the
 # deterministic bin-packing / DAG planner, and WRITES the pgcyan-plan ConfigMap
@@ -37,7 +37,7 @@ spec:
   template:
     metadata:
       labels:
-        pgcyan.dev/phase: "planner"
+        pgcyan.dev/step: "plan"
     spec:
       serviceAccountName: pgcyan-orchestrator   # needs configmap write RBAC
       restartPolicy: Never
@@ -48,7 +48,7 @@ spec:
           # ${PGCYAN_IMAGE} is a placeholder filled at apply time: the
           # integration-tests workflow substitutes the commit-short-SHA-tagged
           # ACR image (envsubst), and the orchestrator substitutes its OWN
-          # running image so every phase pod matches it. Never commit a concrete
+          # running image so every step pod matches it. Never commit a concrete
           # value here.
           image: "${PGCYAN_IMAGE}"
           # Run the planner into a scratch dir, then publish plan.json +

@@ -1,6 +1,6 @@
 # 60-job-phase2-datashard.template.yaml
 # ---------------------------------------------------------------------------
-# PHASE 2: DATA SHARDS -- the horizontally-scaled COPY workers. This is a
+# COPY STEP: DATA SHARDS -- the horizontally-scaled COPY workers. This is a
 # TEMPLATE. The orchestrator stamps out ONE Job per entry in
 # plan.json > data_shards, substituting the ${...} placeholders. They all run
 # concurrently, all point at the same source+target, and by construction (their
@@ -9,7 +9,7 @@
 # WHERE THE WORK LIVES: COPY streams source -> pod -> target. The pod is mostly
 # an I/O pipe; its bottleneck is NETWORK bandwidth, not CPU. That is exactly why
 # fanning out into many pods helps here (more aggregate egress/ingress) -- and
-# is the OPPOSITE of phase 3, whose work runs on the target server (see 70/71).
+# is the OPPOSITE of the post-data steps, whose work runs on the target server (see 70/71).
 #
 # NO-OVERLAP GUARANTEE: `--filters /plan/${FILTER_FILE}` restricts this shard to
 # an explicit [include-only-table] list authored by the planner. Two shards with
@@ -17,13 +17,13 @@
 # planner makes sure nothing overlaps".
 #
 # CONSISTENCY: `--snapshot ${SNAPSHOT_ID}` ties this shard to the holder's
-# snapshot (phase 1) so all shards copy the same instant.
+# snapshot (the snapshot step) so all shards copy the same instant.
 #
 # DATA ONLY: the pod runs `pg_cyan.cli copy-shard`, which drives `pgcopydb copy
-# table-data` -- NOT `pgcopydb clone`. Phase 0 restores the schema and phase 3
-# builds the indexes/constraints, so this phase copies the HEAP and nothing else.
-# `clone` would re-run both schema sections and collide with phases 0/3.
-# See also: pg_cyan/datashard.py, notes/migration-phases-lessons-learned.md
+# table-data` -- NOT `pgcopydb clone`. the schema step restores the schema and the post-data steps
+# builds the indexes/constraints, so this step copies the HEAP and nothing else.
+# `clone` would re-run both schema sections and collide with the schema step/3.
+# See also: pg_cyan/datashard.py, notes/migration-steps-lessons-learned.md
 #
 # INTRA-TABLE SPLIT: `--split-tables-larger-than` lets a single shard further
 # parallelise a giant table across `--table-jobs` processes via integer-range or
@@ -63,7 +63,7 @@ metadata:
   name: pgcyan-workdir-${SHARD_NAME}
   namespace: pgcyan-migration
   labels:
-    pgcyan.dev/phase: "data"
+    pgcyan.dev/step: "copy"
     pgcyan.dev/shard: "${SHARD_NAME}"
 spec:
   accessModes: ["ReadWriteOnce"]
@@ -79,7 +79,7 @@ metadata:
   name: pgcyan-datashard-${SHARD_NAME}
   namespace: pgcyan-migration
   labels:
-    pgcyan.dev/phase: "data"
+    pgcyan.dev/step: "copy"
     pgcyan.dev/shard: "${SHARD_NAME}"
 spec:
   backoffLimit: 6                 # shards are resumable; let k8s retry generously
@@ -89,7 +89,7 @@ spec:
   template:
     metadata:
       labels:
-        pgcyan.dev/phase: "data"
+        pgcyan.dev/step: "copy"
         pgcyan.dev/shard: "${SHARD_NAME}"
     spec:
       serviceAccountName: pgcyan-worker
@@ -117,14 +117,14 @@ spec:
           # `pgcyan-copylog-${SHARD_NAME}` ConfigMap for the orchestrator to
           # aggregate across shards.
           #
-          # DATA ONLY on purpose: phase 0 (pre-data) created the schema and phase
+          # DATA ONLY on purpose: the schema step (pre-data) created the schema and step
           # 3 (post-data) builds indexes/constraints -- so `copy table-data`
           # copies the HEAP and nothing else. `pgcopydb clone` would re-run both
-          # schema sections and collide with phases 0/3 (re-tripping the Azure
+          # schema sections and collide with the schema step/3 (re-tripping the Azure
           # extension/ownership walls). --skip-vacuum + no index build fall out of
           # `copy table-data`; the wrapper adds --resume so a
           # backed-off pod continues on its RWO disk.
-          # See also: pg_cyan/datashard.py, notes/migration-phases-lessons-learned.md
+          # See also: pg_cyan/datashard.py, notes/migration-steps-lessons-learned.md
           command: ["python", "-m", "pg_cyan.cli", "copy-shard"]
           envFrom:
             - secretRef:

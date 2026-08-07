@@ -129,7 +129,7 @@ def test_idempotent_existing_constraint_still_validates(tmp_path, monkeypatch):
     assert sum(1 for e in tgt.executed if "VALIDATE CONSTRAINT" in e) == 2
 
 
-def test_validate_failure_is_a_phase_failure(tmp_path, monkeypatch):
+def test_validate_failure_is_a_step_failure(tmp_path, monkeypatch):
     tgt = _TargetCursor(fail_validate="oi_order_fk", counts=(5, 1))
     monkeypatch.setattr(fk_module.psycopg2, "connect", _connect_factory(tgt))
     w = _make(tmp_path)

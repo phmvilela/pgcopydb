@@ -5,13 +5,13 @@ The single most safety-critical piece of the migration -- the snapshot
 sub-component of the folded controller (``pg_cyan/controller.py`` holds it
 in-pod). It establishes -- and then **holds** -- the consistent
 logical-replication setup on the *source* database in one coordinated step, so
-every downstream copy phase pins the exact same instant:
+every downstream copy step pins the exact same instant:
 
   1. create the publication ``FOR ALL TABLES`` (idempotent),
   2. create the ``pgoutput`` logical replication slot and export its
      **consistent snapshot**,
   3. keep the exporting connection open so the snapshot stays valid for the
-     pre-data and sharded copy phases.
+     pre-data and sharded copy steps.
 
 WHY a long-lived holder: a PostgreSQL exported snapshot is only valid while the
 transaction that exported it stays open. Once that connection closes, ``SET
@@ -42,7 +42,7 @@ shards read it via ``configMapKeyRef``, so the holder needs no shared volume at
 all.
 
 This node does NOT create or advance any replication origin -- that is the
-follow-CDC phase's job.
+follow-CDC step's job.
 
 Outputs (written to ``--output-dir`` / ``$PG_OUTPUT_DIR``, defaulting to the
 node-local work dir; they feed the readiness probe, not the shards):
@@ -981,8 +981,8 @@ class PgCyanSnapshot:
         """
         Block until SIGTERM/SIGINT, then shut the holder down cleanly.
 
-        This is the whole point of the phase-1 pod: keep the exporting
-        transaction open so the snapshot stays valid for phases 0 and 2. On a
+        This is the whole point of the snapshot pod: keep the exporting
+        transaction open so the snapshot stays valid for the schema step and 2. On a
         signal it terminates the pgcopydb child, which closes the replication
         connection -- so a graceful pod exit leaves no stale source connection.
         Returns the child's exit code (0 on a clean, signalled shutdown).

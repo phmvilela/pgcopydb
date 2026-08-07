@@ -14,13 +14,13 @@ This guide details a structured, side-by-side migration path to drastically redu
 
 ## ⚙️ I. Setup and Provisioning
 
-### Step 0 - Provision the New Target Server
+### the schema step - Provision the New Target Server
 
 Create a new Azure Database for PostgreSQL instance with your desired new landscape/technology. Ensure the new server's configuration (SKU, storage size, and location) is suitable for your eventual production load.
 
 >Key Concept: This action enables the core benefit of a side-by-side migration: running two distinct environments concurrently. The existing application remains connected to the source environment, minimizing risk and allowing the new target to be fully configured offline.
 
-### Step 1 - Role Privileges (Source & Target servers)
+### the snapshot step - Role Privileges (Source & Target servers)
 The user role designated for the migration must have the necessary permissions to manage replication and slots.
 
 ```sql
@@ -30,7 +30,7 @@ GRANT azure_pg_admin TO demo;
 > The user role designated for the migration must have the necessary permissions to manage replication and slots. The "demo" user was created at server creation. In case you want to create a dedicated replication user, find my guide [here](https://github.com/berenguel/bi-directional-replication-in-Flexible-Server/blob/main/configuring_replication_user.sql)
 
 
-### Step 2 - Check Prerequisites for Logical Replication (Source & Target servers)
+### the copy step - Check Prerequisites for Logical Replication (Source & Target servers)
 Set these server parameters to at least the minimum recommended values shown below to enable and support the features required for logical replication.
 
 ```sql
@@ -41,7 +41,7 @@ max_wal_senders=10
 track_commit_timestamp=on
 ```
 
-### Step 3 - Ensure tables are ready for logical replication
+### the post-data steps - Ensure tables are ready for logical replication
 
 For PostgreSQL to accurately track row-level changes (updates, deletes), every table you plan to replicate must have a unique identifier.
 
@@ -54,7 +54,7 @@ Tables *must have* one of the following:
 
 This section details the core process of moving data and establishing synchronization between the two environments.
 
-### Step 4 - Set Up Logical Replication (Source Server)
+### the follow step - Set Up Logical Replication (Source Server)
 
 A Publication defines the logical grouping of tables on the source server that will be replicated
 
@@ -64,7 +64,7 @@ alter publication logical_mig01 add table dummy_test;
 
 SELECT pg_create_logical_replication_slot('logical_mig01', 'pgoutput');
 ```
-> The Safety Net: The slot created in step 3 immediately begins tracking all changes in the WAL. This guarantees that all transactions occurring from this moment forward are recorded and preserved, preventing data loss during the initial dump/restore process
+> The Safety Net: The slot created in the post-data steps immediately begins tracking all changes in the WAL. This guarantees that all transactions occurring from this moment forward are recorded and preserved, preventing data loss during the initial dump/restore process
 
 ### Step 5 - Generate Schema + Initial Data Dump (Recommended: Azure VM)
 

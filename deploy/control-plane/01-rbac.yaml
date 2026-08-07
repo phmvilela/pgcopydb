@@ -30,7 +30,7 @@ rules:
   # Manage the workload identities + scaffolding inside those namespaces. This
   # mirrors what deploy/k8s/ contains for a migration: a ServiceAccount, the
   # DB Secret, the plan/inputs ConfigMaps, the work-dir PVCs, the controller
-  # StatefulSet, the phase Jobs, and the headless Service.
+  # StatefulSet, the step Jobs, and the headless Service.
   - apiGroups: [""]
     resources: ["serviceaccounts", "secrets", "configmaps", "persistentvolumeclaims", "services"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]

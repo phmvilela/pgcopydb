@@ -112,11 +112,11 @@ ID=<id from POST /migrations>
 # Kick off the migration: the control plane proxies the controller's POST /start.
 curl -fsS -XPOST localhost:8080/migrations/$ID/start
 #   -> {"id":"...","namespace":"pgcyan-mig-...","state":"running","message":"..."}
-kubectl get pods -n pgcyan-mig-$ID          # phase pods appear as the DAG walks
+kubectl get pods -n pgcyan-mig-$ID          # step pods appear as the DAG walks
 
 # Poll aggregated status (controller /status + registry state).
 curl -fsS localhost:8080/migrations/$ID/status
-#   -> {"state":"running","controller_reachable":true,"controller":{"phases":[...]}}
+#   -> {"state":"running","controller_reachable":true,"controller":{"steps":[...]}}
 # ...eventually {"state":"succeeded",...}; the singleton slot is then free.
 ```
 

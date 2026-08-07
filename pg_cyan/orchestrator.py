@@ -11,46 +11,45 @@ APIs cover without Argo's DSL -- operators keep debugging with ``kubectl``
 against the same ``deploy/k8s/`` files. Argo stays a drop-in later since the
 node objects/YAML do not change (see ``deploy/k8s/README.md``).
 
-Implements the phase walk from ``deploy/k8s/README.md`` /
+Implements the step walk from ``deploy/k8s/README.md`` /
 ``notes/k8s-sharded-migration-topology.md``::
 
-    planner(-1) -> pre-data(0) -> data shards(2, xN)
-    -> index(3a, xM) -> FK(3b)
+    plan -> schema -> copy (xN) -> sequences -> indexes (xM) -> foreign-keys
 
-There is no CDC phase: under Option A the controller streams CDC itself after
+There is no CDC step: under Option A the controller streams CDC itself after
 the walk (see ``pg_cyan/controller.py`` / ``pg_cyan/follow.py``). There is no
-snapshot-holder phase: the CONTROLLER that drives this orchestrator
+snapshot-holder step: the CONTROLLER that drives this orchestrator
 (``pg_cyan/controller.py``) holds the consistent snapshot in its OWN pod and
 passes the id in via ``snapshot_id``, which the orchestrator injects as
-``SNAPSHOT_ID`` into the ``needs_snapshot`` phases (pre-data pins its schema dump
+``SNAPSHOT_ID`` into the ``needs_snapshot`` steps (the schema step pins its dump
 to it; the shards copy it). The controller also passes its StatefulSet as
 ``owner_reference``, stamped onto every workload so deleting the controller
 cascade-deletes the whole migration, and a ``health_check`` the barrier loop
 polls so a dropped snapshot aborts the walk.
 
-Each phase is applied from the ``deploy/k8s/`` manifests -- templated phases
-(data shards, index shards) are stamped out once per ``plan.json`` entry,
+Each step is applied from the ``deploy/k8s/`` manifests -- templated steps
+(the copy and indexes steps) are stamped out once per ``plan.json`` entry,
 substituting the ``${...}`` placeholders -- and the orchestrator BLOCKS on
-that phase's barrier before moving on:
+that step's barrier before moving on:
 
-  * Job phases block until every Job in the phase reports ``Complete``
+  * Job steps block until every Job in the step reports ``Complete``
     (or ``Failed``/exceeded ``backoffLimit``).
-  * Deployment phases block until the Deployment has its desired ready replica
+  * Deployment steps block until the Deployment has its desired ready replica
     count -- a long-running Deployment never "completes", so its barrier means
-    *ready*, not *completed*. (No current phase is a Deployment: CDC/follow is
-    streamed in-pod by the controller, not a phase Deployment. The handling is
-    retained as generic capability for any future Deployment phase.)
+    *ready*, not *completed*. (No current step is a Deployment: CDC/follow is
+    streamed in-pod by the controller, not a step Deployment. The handling is
+    retained as generic capability for any future Deployment step.)
 
-Fails fast: the first phase whose barrier does not resolve to success stops
-the walk immediately (``run()`` returns without applying later phases).
+Fails fast: the first step whose barrier does not resolve to success stops
+the walk immediately (``run()`` returns without applying later steps).
 
 ASSUMPTIONS (out of scope for this ticket, tracked in deploy/k8s/README.md):
   * The namespace/RBAC/PVC/Secrets (00/01/10/20) and the input collector +
-    planner-inputs ConfigMap (11/25, phase -2) are already applied -- the
-    ticket's phase list starts at the planner (-1).
+    planner-inputs ConfigMap (11/25, the collect step) are already applied -- the
+    ticket's step list starts at the plan step.
   * ``plan.json`` is read from the ``pgcyan-plan`` ConfigMap the planner Job
     itself publishes (``30-job-planner.yaml``'s ``kubectl apply``), fetched
-    via the API *after* phase -1's barrier succeeds -- not mounted as a
+    via the API *after* the plan step's barrier succeeds -- not mounted as a
     volume, since the ConfigMap does not exist until the planner Job creates
     it.
 """
@@ -121,7 +120,7 @@ def _index_shard_substitutions(entry: Dict, plan: Dict) -> Dict[str, str]:
 
 
 class PgCyanOrchestrator:
-    """Walks the migration DAG, applying each phase and blocking on its barrier."""
+    """Walks the migration DAG, applying each step and blocking on its barrier."""
 
     DEFAULT_NAMESPACE = "pgcyan-migration"
     #: deploy/k8s next to the pg_cyan package, both in a repo checkout and in the image.
@@ -145,30 +144,30 @@ class PgCyanOrchestrator:
     DEFAULT_POLL_INTERVAL = 5
     DEFAULT_JOB_TIMEOUT = 3600
     #: Placeholder every manifest carries in place of a concrete image; the
-    #: orchestrator fills it with its OWN running image so every phase pod it
+    #: orchestrator fills it with its OWN running image so every step pod it
     #: launches matches its tag (single image per migration run).
     IMAGE_PLACEHOLDER = "PGCYAN_IMAGE"
     IMAGE_TOKEN = "${" + IMAGE_PLACEHOLDER + "}"
     #: Container names that identify the pgcyan app container in the pod spec.
     IMAGE_CONTAINER_NAMES = ("orchestrator", "pgcyan-orchestrator", "pgcyan")
 
-    #: The DAG, in apply order. Static phases carry "manifest"; templated
-    #: phases (stamped out once per plan.json entry) carry "template" +
+    #: The DAG, in apply order. Static steps carry "manifest"; templated
+    #: steps (stamped out once per plan.json entry) carry "template" +
     #: "plan_key" + "substitutions".
-    #: There is no snapshot-holder phase here: the CONTROLLER that runs this
+    #: There is no snapshot-holder step here: the CONTROLLER that runs this
     #: orchestrator holds the consistent snapshot in its OWN pod and passes the
     #: id in via ``snapshot_id``;
-    #: the orchestrator injects it as ``SNAPSHOT_ID`` into the phases flagged
-    #: ``needs_snapshot`` (pre-data pins its schema dump to it; the data shards
+    #: the orchestrator injects it as ``SNAPSHOT_ID`` into the steps flagged
+    #: ``needs_snapshot`` (the schema step pins its dump to it; the copy shards
     #: copy it), so no separate holder Deployment and no ``pgcyan-snapshot``
     #: ConfigMap handoff. When ``snapshot_id`` is unset (standalone runs), no
     #: injection happens and the manifests' own env applies.
-    PHASES: List[Dict] = [
-        {"id": "-1", "name": "planner", "manifest": "30-job-planner.yaml"},
-        {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml",
+    STEPS: List[Dict] = [
+        {"id": "plan", "name": "Plan", "manifest": "30-job-planner.yaml"},
+        {"id": "schema", "name": "Schema", "manifest": "40-job-phase0-predata.yaml",
          "needs_snapshot": True},
         {
-            "id": "2", "name": "data-shards", "template": "60-job-phase2-datashard.template.yaml",
+            "id": "copy", "name": "Copy", "template": "60-job-phase2-datashard.template.yaml",
             "plan_key": "data_shards", "needs_plan": True, "substitutions": _data_shard_substitutions,
             "aggregate_copy_logs": True, "needs_snapshot": True,
         },
@@ -176,16 +175,16 @@ class PgCyanOrchestrator:
         # identity/serial sequences at their start, so CDC/post-cutover inserts would
         # collide on id=1. Custom psycopg2 (source pg_sequences ->
         # target setval); no snapshot (sequences are not MVCC).
-        {"id": "2s", "name": "sequences", "manifest": "62-job-sequences.yaml"},
+        {"id": "sequences", "name": "Sequences", "manifest": "62-job-sequences.yaml"},
         {
-            "id": "3a", "name": "index", "template": "70-job-phase3-index.template.yaml",
+            "id": "indexes", "name": "Indexes", "template": "70-job-phase3-index.template.yaml",
             "plan_key": "index_shards", "needs_plan": True, "substitutions": _index_shard_substitutions,
-            # Phases 3a (index/PK/unique) and 3b (FK) are both pure psycopg2:
+            # The indexes and foreign-keys steps are both pure psycopg2:
             # they read the source's DDL definitions directly, so -- like the other
             # collectors -- they need no injected snapshot.
         },
-        {"id": "3b", "name": "fk", "manifest": "71-job-phase3-fk.yaml"},
-        # Phase 4 (CDC) is NOT an orchestrator phase: under Option A the
+        {"id": "foreign-keys", "name": "Foreign keys", "manifest": "71-job-phase3-fk.yaml"},
+        # The follow step (CDC) is NOT an orchestrator step: under Option A the
         # controller itself becomes the CDC consumer after the walk, streaming
         # `pgcopydb follow` on its own --dir (the slot-creator and the streamer must
         # share a --dir; a separate pod cannot reuse the slot). See controller.py.
@@ -213,14 +212,14 @@ class PgCyanOrchestrator:
 
         Args:
             namespace: Namespace the migration workloads run in.
-            manifests_dir: Directory containing the deploy/k8s phase manifests.
+            manifests_dir: Directory containing the deploy/k8s step manifests.
             plan_configmap: ConfigMap the planner Job publishes plan.json/shard filters to.
             poll_interval: Seconds between Job/Deployment status polls.
-            job_timeout: Seconds to wait for a phase barrier before failing it.
+            job_timeout: Seconds to wait for a step barrier before failing it.
             in_cluster: Load in-cluster ServiceAccount credentials (else local kubeconfig).
             snapshot_id: The consistent snapshot id the controller holds in-pod.
                 When set, injected as ``SNAPSHOT_ID`` into every
-                ``needs_snapshot`` phase pod (replacing any manifest env of that
+                ``needs_snapshot`` step pod (replacing any manifest env of that
                 name). ``None`` -> no injection (standalone runs).
             owner_reference: A ``V1OwnerReference``-shaped dict (the controller's
                 StatefulSet). When set, stamped onto every object this orchestrator
@@ -229,9 +228,9 @@ class PgCyanOrchestrator:
             health_check: Optional ``() -> bool`` the barrier loop calls each poll;
                 returning ``False`` (the controller's snapshot child died) aborts
                 the wait -- a lost snapshot invalidates the in-flight copy.
-            stop_after: Phase id (e.g. ``"2"``) to stop after -- the walk applies
-                phases through this one (inclusive) and returns success without
-                applying any later phase. ``None`` runs the whole DAG. Lets an
+            stop_after: Step id (e.g. ``"2"``) to stop after -- the walk applies
+                steps through this one (inclusive) and returns success without
+                applying any later step. ``None`` runs the whole DAG. Lets an
                 operator bring the pipeline up to a checkpoint (e.g. through the
                 data copy) and, under the controller, park Ready there.
             batch_api, apps_api, policy_api, core_api: Inject fake/mock Kubernetes API
@@ -247,7 +246,7 @@ class PgCyanOrchestrator:
         self.owner_reference = owner_reference
         self.health_check = health_check
         self.stop_after = stop_after
-        #: The image every phase Job/Deployment runs -- the orchestrator's OWN
+        #: The image every step Job/Deployment runs -- the orchestrator's OWN
         #: image, resolved lazily on first use (see _resolve_image).
         self._image: Optional[str] = None
 
@@ -284,7 +283,7 @@ class PgCyanOrchestrator:
 
     def _resolve_image(self) -> str:
         """
-        Resolve the image every phase pod should run: the orchestrator's OWN.
+        Resolve the image every step pod should run: the orchestrator's OWN.
 
         Honours a ``PGCYAN_IMAGE`` env override (handy for local/dev runs);
         otherwise reads the orchestrator's own pod -- its name is the pod
@@ -361,7 +360,7 @@ class PgCyanOrchestrator:
         Parse ``template_text`` as (multi-document) YAML, then substitute every
         ``${KEY}`` in its string values, returning one dict per document.
 
-        Templated phase files carry MORE than one document -- each per-shard Job
+        Templated step files carry MORE than one document -- each per-shard Job
         is preceded by its own ReadWriteOnce work-dir PVC -- so this
         returns a list. Parses BEFORE substituting (rather than regex-replacing
         the raw text) so that YAML comments -- which mention placeholders like
@@ -388,31 +387,31 @@ class PgCyanOrchestrator:
             return {key: self._substitute(item, substitutions) for key, item in value.items()}
         return value
 
-    def _load_phase_manifests(self, phase: Dict, plan: Optional[Dict]) -> List[Dict]:
-        """Return the list of manifest documents (dicts) to apply for ``phase``."""
-        if "template" in phase:
-            entries = (plan or {}).get(phase["plan_key"]) or []
+    def _load_step_manifests(self, step: Dict, plan: Optional[Dict]) -> List[Dict]:
+        """Return the list of manifest documents (dicts) to apply for ``step``."""
+        if "template" in step:
+            entries = (plan or {}).get(step["plan_key"]) or []
             if not entries:
                 raise OrchestratorError(
-                    f"No '{phase['plan_key']}' entries in the plan for phase "
-                    f"{phase['id']} ({phase['name']})"
+                    f"No '{step['plan_key']}' entries in the plan for step "
+                    f"{step['id']} ({step['name']})"
                 )
-            template_text = self._read_manifest_file(phase["template"])
+            template_text = self._read_manifest_file(step["template"])
             image = self._resolve_image()
             docs = []
             for entry in entries:
-                subs = dict(phase["substitutions"](entry, plan or {}))
+                subs = dict(step["substitutions"](entry, plan or {}))
                 subs[self.IMAGE_PLACEHOLDER] = image  # strict _substitute fills the image too
-                # Templated phase files carry MORE than one document -- a per-shard
+                # Templated step files carry MORE than one document -- a per-shard
                 # RWO work-dir PVC precedes each Job -- so extend.
                 docs.extend(self._render_yaml(template_text, subs))
             return docs
 
-        text = self._read_manifest_file(phase["manifest"])
+        text = self._read_manifest_file(step["manifest"])
         try:
             docs = [doc for doc in yaml.safe_load_all(text) if doc]
         except yaml.YAMLError as e:
-            raise OrchestratorError(f"{phase['manifest']} is not valid YAML: {e}") from e
+            raise OrchestratorError(f"{step['manifest']} is not valid YAML: {e}") from e
         # Static manifests aren't run through the strict template substitution
         # (they carry runtime ${RESTORE_JOBS}/$(SNAPSHOT_ID) that must survive);
         # fill only the image placeholder here.
@@ -444,7 +443,7 @@ class PgCyanOrchestrator:
                 self.policy_api.create_namespaced_pod_disruption_budget(namespace=namespace, body=doc)
             elif kind == "PersistentVolumeClaim":
                 # Per-shard RWO work-dir disks stamped alongside the data-shard
-                # Jobs (the index/FK phases are pure psycopg2 and use
+                # Jobs (the index/FK steps are pure psycopg2 and use
                 # emptyDir). Applied, not awaited -- binding happens when the shard
                 # pod schedules.
                 self.core_api.create_namespaced_persistent_volume_claim(namespace=namespace, body=doc)
@@ -656,7 +655,7 @@ class PgCyanOrchestrator:
                 namespace=self.namespace,
                 # 'combined' (not 'shard') so SHARD_COPYLOG_SELECTOR never lists
                 # this aggregate back in as if it were a per-shard input.
-                labels={"pgcyan.dev/phase": "data",
+                labels={"pgcyan.dev/step": "copy",
                         PgCyanDataShard.COPY_LOG_LABEL: "combined"},
             ),
             data={self.COPY_LOG_KEY: json.dumps(payload, indent=2, default=str) + "\n"},
@@ -685,12 +684,12 @@ class PgCyanOrchestrator:
 
     def _aggregate_copy_logs(self) -> Dict:
         """
-        Aggregate the phase-2 shard copy logs and publish the combined result.
+        Aggregate the copy step's shard copy logs and publish the combined result.
 
         Best-effort by design: the COPY barrier has already passed, so a failure
         to aggregate the *reporting* artifact is a warning, not a migration
         failure. Returns the combined payload (plus a ``published`` flag) so the
-        caller can attach it to the phase result and the run summary.
+        caller can attach it to the step result and the run summary.
         """
         shard_logs = self._read_shard_copy_logs()
         combined = self._merge_copy_logs(shard_logs)
@@ -710,7 +709,7 @@ class PgCyanOrchestrator:
         )
         return combined
 
-    # --------------------------------------------------------------- phases
+    # --------------------------------------------------------------- steps
 
     def _inject_snapshot_env(self, doc: Dict) -> None:
         """
@@ -732,12 +731,12 @@ class PgCyanOrchestrator:
             env.append({"name": "SNAPSHOT_ID", "value": self.snapshot_id})
             container["env"] = env
 
-    def _apply_phase(self, phase: Dict, plan: Optional[Dict]) -> Dict:
-        docs = self._load_phase_manifests(phase, plan)
+    def _apply_step(self, step: Dict, plan: Optional[Dict]) -> Dict:
+        docs = self._load_step_manifests(step, plan)
 
         targets = []
         for doc in docs:
-            if phase.get("needs_snapshot"):
+            if step.get("needs_snapshot"):
                 self._inject_snapshot_env(doc)
             self._apply(doc)
             if doc.get("kind") in ("Job", "Deployment"):
@@ -749,23 +748,23 @@ class PgCyanOrchestrator:
             watched.append({"kind": kind, "name": name, "success": success, "error": message})
 
         success = bool(watched) and all(w["success"] for w in watched)
-        return {"phase": phase["id"], "name": phase["name"], "success": success, "targets": watched}
+        return {"step": step["id"], "name": step["name"], "success": success, "targets": watched}
 
     def run(self) -> Dict:
         """
-        Apply every phase in order, blocking on each phase's barrier.
+        Apply every step in order, blocking on each step's barrier.
 
-        Stops (and returns) at the first phase whose barrier does not resolve
-        to success -- later phases are never applied. If ``stop_after`` is set,
-        also stops -- successfully -- once that phase clears. Never raises.
+        Stops (and returns) at the first step whose barrier does not resolve
+        to success -- later steps are never applied. If ``stop_after`` is set,
+        also stops -- successfully -- once that step clears. Never raises.
 
         Returns:
             {
               "status": "success" | "failure",
               "namespace": <str>,
               "run_id": <plan run_id, once known> | None,
-              "stopped_after": <phase id> | None,
-              "phases": [{"phase": id, "name": ..., "success": bool, "targets": [...]}],
+              "stopped_after": <step id> | None,
+              "steps": [{"step": id, "name": ..., "success": bool, "targets": [...]}],
               "errors": [...],
             }
         """
@@ -774,40 +773,40 @@ class PgCyanOrchestrator:
             "namespace": self.namespace,
             "run_id": None,
             "stopped_after": None,
-            "phases": [],
+            "steps": [],
             "errors": [],
         }
 
         # Guard a mistyped stop_after up front: silently running the whole DAG when
         # the caller asked to stop early would be a surprising, costly no-op.
-        if self.stop_after is not None and self.stop_after not in {p["id"] for p in self.PHASES}:
+        if self.stop_after is not None and self.stop_after not in {p["id"] for p in self.STEPS}:
             self._log_event(
-                "run", "failure", f"Unknown stop_after phase id {self.stop_after!r}",
-                {"valid_phase_ids": [p["id"] for p in self.PHASES]},
+                "run", "failure", f"Unknown stop_after step id {self.stop_after!r}",
+                {"valid_step_ids": [p["id"] for p in self.STEPS]},
             )
             summary["errors"].append(
-                f"Unknown stop_after phase id {self.stop_after!r}; "
-                f"valid ids: {[p['id'] for p in self.PHASES]}"
+                f"Unknown stop_after step id {self.stop_after!r}; "
+                f"valid ids: {[p['id'] for p in self.STEPS]}"
             )
             return summary
 
         plan: Optional[Dict] = None
-        for phase in self.PHASES:
+        for step in self.STEPS:
             try:
-                if phase.get("needs_plan") and plan is None:
+                if step.get("needs_plan") and plan is None:
                     plan = self._read_plan_configmap()
                     summary["run_id"] = plan.get("run_id")
-                result = self._apply_phase(phase, plan)
+                result = self._apply_step(step, plan)
             except OrchestratorError as e:
                 result = {
-                    "phase": phase["id"], "name": phase["name"], "success": False,
+                    "step": step["id"], "name": step["name"], "success": False,
                     "targets": [], "error": str(e),
                 }
 
-            # Once a phase whose shards emit copy logs has cleared its barrier,
+            # Once a step whose shards emit copy logs has cleared its barrier,
             # aggregate the per-shard logs into the combined migration-copy-log.json
             # Best-effort: never flips a passed barrier to failure.
-            if result["success"] and phase.get("aggregate_copy_logs"):
+            if result["success"] and step.get("aggregate_copy_logs"):
                 try:
                     result["copy_log"] = self._aggregate_copy_logs()
                 except Exception as e:  # noqa: BLE001 - reporting must not fail the DAG
@@ -817,21 +816,21 @@ class PgCyanOrchestrator:
                     )
 
             self._log_event(
-                "phase",
+                "step",
                 "success" if result["success"] else "failure",
-                f"Phase {phase['id']} ({phase['name']}) {'succeeded' if result['success'] else 'failed'}",
+                f"Step {step['id']} ({step['name']}) {'succeeded' if result['success'] else 'failed'}",
                 result,
             )
-            summary["phases"].append(result)
+            summary["steps"].append(result)
 
             if not result["success"]:
-                summary["errors"].append(f"Phase {phase['id']} ({phase['name']}) failed; DAG stopped")
+                summary["errors"].append(f"Step {step['id']} ({step['name']}) failed; DAG stopped")
                 return summary
 
-            if self.stop_after is not None and phase["id"] == self.stop_after:
+            if self.stop_after is not None and step["id"] == self.stop_after:
                 self._log_event(
                     "run", "success",
-                    f"Stopping after phase {phase['id']} ({phase['name']}) as requested",
+                    f"Stopping after step {step['id']} ({step['name']}) as requested",
                     {"stop_after": self.stop_after},
                 )
                 summary["stopped_after"] = self.stop_after

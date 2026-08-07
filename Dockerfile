@@ -1,9 +1,9 @@
 # pgcyan migration image
 # ---------------------------------------------------------------------------
-# One image serves every deploy/k8s/ pod: the planner Job, the pgcopydb phase
-# Jobs/Deployments, and the custom-Python phases. It therefore bundles three
+# One image serves every deploy/k8s/ pod: the planner Job, the pgcopydb step
+# Jobs/Deployments, and the custom-Python steps. It therefore bundles three
 # things on PATH:
-#   * pgcopydb        -- the copy/CDC engine (phase Jobs invoke `pgcopydb ...`)
+#   * pgcopydb        -- the copy/CDC engine (step Jobs invoke `pgcopydb ...`)
 #   * kubectl         -- the planner publishes the plan ConfigMap with kubectl
 #   * python + pg_cyan CLI -- planner/monitoring/cutover (`python -m pg_cyan.cli`)
 #
@@ -70,7 +70,7 @@ ARG KUBECTL_VERSION=v1.33.0
 WORKDIR /app
 
 # --- pgcopydb runtime: the fork binary + its shared-lib deps ----------------
-# psql (postgresql-client) is used by the phase Jobs and pulls libpq5; libgc1
+# psql (postgresql-client) is used by the step Jobs and pulls libpq5; libgc1
 # is pgcopydb's Boehm-GC runtime dep. Both from PGDG so the major matches the
 # builder's libpq. The pgcopydb binary + bundled sqlite3 are copied from the
 # builder stage.

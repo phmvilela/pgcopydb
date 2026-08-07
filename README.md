@@ -33,8 +33,8 @@ pg_cyan/
   lobs.py              PgCyanLobs: count source large objects
   planner.py           PgCyanPlanner: bin-pack shards + emit the migration plan
   snapshot.py          PgCyanSnapshot: establish + hold the consistent snapshot (in-pod sub-component)
-  predata.py           PgCyanPreData: pre-data schema to target (phase 0)
-  datashard.py         PgCyanDataShard: one disjoint shard's data-only copy (phase 2)
+  predata.py           PgCyanPreData: pre-data schema to target (schema step)
+  datashard.py         PgCyanDataShard: one disjoint shard's data-only copy (copy step)
   orchestrator.py      PgCyanOrchestrator: walk the deploy/k8s migration DAG
   controller.py        PgCyanController: folded controller — holds snapshot + walks DAG (#70)
   cloud/azure/         Azure SDK integrations (skeleton)
@@ -161,7 +161,7 @@ reads the artifacts already produced by the pre-migration stages from
 required; `pg-source-parameters.json` / `constraints.json` optional), LPT
 bin-packs the tables into disjoint copy shards balanced by **heap bytes**, and
 writes `plan.json` plus one `shard-<n>.filters` per shard (pgcopydb `--filters`
-format with a disjoint `[include-only-table]` list). This is the phase `-1`
+format with a disjoint `[include-only-table]` list). This is the `plan` step
 node in `deploy/k8s/`.
 
 Before packing anything it runs a **large-object abort gate**: if the source
@@ -184,15 +184,16 @@ directory).
 
 The migration itself runs on Kubernetes, not by hand. The **controller**
 (`run-migration`, a single-pod StatefulSet) holds the consistent snapshot in its
-own pod and walks the whole DAG — planner → pre-data → data shards → index → FK →
-CDC — injecting the snapshot into each phase and owning every workload it creates.
-The individual phase commands (`restore-predata`, `copy-shard`, `orchestrate`) are
-the nodes it drives; you normally don't invoke them directly.
+own pod and walks the whole DAG — plan → schema → copy → sequences → indexes →
+foreign-keys → follow — injecting the snapshot into each step and owning every
+workload it creates. The individual step commands (`restore-predata`,
+`copy-shard`, `orchestrate`) are the nodes it drives; you normally don't invoke
+them directly.
 
 ```bash
 # In-cluster (what the StatefulSet runs): hold the snapshot + walk the DAG,
-# optionally stopping after a phase id (e.g. through the data copy) then parking.
-python -m pg_cyan.cli run-migration --stop-after 2
+# optionally stopping after a step (by its id, e.g. through the data copy) then parking.
+python -m pg_cyan.cli run-migration --stop-after copy
 ```
 
 See `deploy/k8s/` (the manifests are the nodes) and
@@ -202,14 +203,14 @@ picture, and the `run-integration-test` skill to exercise it on a cluster.
 ### The migration DAG
 
 The pre-migration collectors feed the planner, and the controller walks the
-resulting plan phase by phase. Nodes are `deploy/k8s/` manifests; edges are the
-controller/orchestrator (barriers between fan-out phases are noted on the edges).
+resulting plan step by step. Nodes are `deploy/k8s/` manifests; edges are the
+controller/orchestrator (barriers between fan-out steps are noted on the edges).
 
 ```mermaid
 %% pg_cyan migration pipeline. Read top-to-bottom.
 %% NODES  = deploy/k8s/ manifests (a CLI stage each); EDGES = the controller/orchestrator.
 %% The controller (run-migration) holds ONE consistent snapshot in-pod for the entire walk,
-%% and injects its SNAPSHOT_ID into every phase so all phases see the same point-in-time.
+%% and injects its SNAPSHOT_ID into every step so all steps see the same point-in-time.
 flowchart TD
     %% ---- Pre-migration: collectors run against the SOURCE, each writes a JSON artifact ----
     subgraph PRE["Pre-migration collectors (run against source; no cluster)"]
@@ -221,7 +222,7 @@ flowchart TD
     end
 
     %% ---- Planner: a pure OFFLINE transform — opens no DB connection ----
-    PLAN["plan (phase -1)<br/>LPT bin-pack tables into disjoint shards<br/>+ large-object abort gate"]
+    PLAN["plan<br/>LPT bin-pack tables into disjoint shards<br/>+ large-object abort gate"]
 
     %% Collectors feed the planner as files; labels are the artifacts consumed.
     MET  -->|"source-pg-metrics.json (required)"| PLAN
@@ -232,20 +233,20 @@ flowchart TD
     %% ---- Migration DAG: driven in-cluster by the controller ----
     subgraph CTRL["Controller: run-migration — holds the consistent snapshot for the whole walk"]
         direction TB
-        SNAP["snapshot (phase 1)<br/>establish + hold slot/snapshot in-pod"]
-        PRED["pre-data (phase 0)<br/>schema only: tables/sequences/functions<br/>(no indexes, PK, FK, triggers)"]
-        SHARD["data shards (phase 2, xN)<br/>data-only COPY, one pod per shard<br/>runs in parallel"]
-        SEQ["sequences (phase 2s)<br/>source pg_sequences then target setval"]
-        IDX["index (phase 3a, xM)<br/>secondary indexes + PK/unique<br/>runs in parallel"]
-        FK["foreign-keys (phase 3b)<br/>ADD NOT VALID then VALIDATE"]
-        CDC["CDC follow<br/>controller becomes the consumer<br/>(not a DAG phase; Option A, #26)"]
+        SNAP["snapshot<br/>establish + hold slot/snapshot in-pod"]
+        PRED["schema<br/>tables/sequences/functions only<br/>(no indexes, PK, FK, triggers)"]
+        SHARD["copy (xN)<br/>data-only COPY, one pod per shard<br/>runs in parallel"]
+        SEQ["sequences<br/>source pg_sequences then target setval"]
+        IDX["indexes (xM)<br/>secondary indexes + PK/unique<br/>runs in parallel"]
+        FK["foreign-keys<br/>ADD NOT VALID then VALIDATE"]
+        CDC["CDC follow<br/>controller becomes the consumer<br/>(not a DAG step; Option A, #26)"]
     end
 
     %% The plan (plan.json + one shard-N.filters per shard) is what the controller walks.
     PLAN -->|"plan.json + shard-N.filters"| SNAP
 
-    %% One snapshot pins every phase to the same consistent point-in-time.
-    SNAP -->|"SNAPSHOT_ID injected into each phase"| PRED
+    %% One snapshot pins every step to the same consistent point-in-time.
+    SNAP -->|"SNAPSHOT_ID injected into each step"| PRED
     PRED -->|"schema present on target"| SHARD
     SHARD -->|"barrier: all N shards finish"| SEQ
     SEQ  --> IDX
@@ -285,7 +286,7 @@ stage's `--help` and module docstring.
 | `FILTER_FILE`               | *(unset)*   | `copy-shard` / `build-indexes`: this shard's `shard-<n>.filters` (under `$PGCYAN_PLAN_DIR`) |
 | `PGCYAN_COUNT_ROWS`         | `true`      | `copy-shard`: count copied rows on the target (disable for very large tables; see #69) |
 | `PGCYAN_COPYLOG_CONFIGMAP`  | *(derived)* | `copy-shard`: per-shard copy-log ConfigMap (defaults to `pgcyan-copylog-<shard>`) |
-| `PGCYAN_STOP_AFTER`         | *(unset)*   | `run-migration` / `orchestrate`: walk the DAG through this phase id (e.g. `2`), then park |
+| `PGCYAN_STOP_AFTER`         | *(unset)*   | `run-migration` / `orchestrate`: walk the DAG through this step id (e.g. `2`), then park |
 | `PGCYAN_READY_FILE`         | `/pgcopydb/ready` | `run-migration`: readiness-probe file; present == Ready, removed when parked/failed |
 | `PGCYAN_WORK_DIR`           | `/work`     | pgcopydb `--dir` (per-pod work disk) |
 | `LOG_LEVEL`                  | `INFO`      | Log verbosity                    |

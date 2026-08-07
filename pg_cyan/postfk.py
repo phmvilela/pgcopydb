@@ -1,8 +1,8 @@
 """
-Post-data foreign-key constraints for the sharded topology -- phase ``3b``.
+Post-data foreign-key constraints for the sharded topology -- step ``3b``.
 
-This is the phase ``3b`` node in ``deploy/k8s/`` (``71-job-phase3-fk.yaml``): a
-**single** coordinated pass, run after every index shard (phase ``3a``) succeeds.
+This is the step ``3b`` node in ``deploy/k8s/`` (``71-job-phase3-fk.yaml``): a
+**single** coordinated pass, run after every index shard (step ``3a``) succeeds.
 FKs are NOT sharded like indexes because a foreign key can reference a table in a
 *different* copy shard -- so applying them shard-by-shard could hit a not-yet-present
 parent. One pass over all FKs sidesteps that (internal concurrency comes from
@@ -16,14 +16,14 @@ VALID`` takes a brief ``SHARE ROW EXCLUSIVE`` lock; the subsequent ``VALIDATE
 CONSTRAINT`` scans under a weaker ``SHARE UPDATE EXCLUSIVE`` lock that does not
 block reads/writes). ``pgcopydb restore constraints`` restores FKs the way
 ``pg_dump`` emits them -- **validated inline** -- so it cannot produce this split.
-Hence this phase introspects the source's FK definitions and applies them to the
+Hence this step introspects the source's FK definitions and applies them to the
 target itself, over psycopg2 (like the collector stages), rather than wrapping
 pgcopydb.
 
 It also writes the **authoritative combined output** the ticket's AC names --
 ``target-pg-postload-log.json`` -- by verifying the target's actual state after
 this pass: the secondary indexes (built by 3a) and the validated FK count. So the
-one file attests to the whole post-data phase.
+one file attests to the whole post-data step.
 
 Idempotent retries: a re-run skips a constraint that already exists on the target
 (a prior partial pass) and still (re-)validates it, so a backed-off Job converges.
@@ -77,7 +77,7 @@ _COUNT_FKS_VALIDATED = f"""
 
 
 class PgCyanForeignKeys:
-    """Applies the source's FKs to the target as NOT VALID then VALIDATE (phase 3b)."""
+    """Applies the source's FKs to the target as NOT VALID then VALIDATE (the foreign-keys step)."""
 
     #: The authoritative post-data output (the ticket's AC).
     LOG_OUTPUT_FILENAME = "target-pg-postload-log.json"
@@ -243,7 +243,7 @@ class PgCyanForeignKeys:
             "status": "failure",
             "message": message,
             "errors": self.errors or ["Unknown error"],
-            "remediation": "Phase 3b is the last post-data step before CDC; fix the cause and let k8s retry (it is idempotent).",
+            "remediation": "the foreign-keys step is the last post-data step before CDC; fix the cause and let k8s retry (it is idempotent).",
         }
 
     def close(self) -> None:
@@ -293,7 +293,7 @@ class PgCyanForeignKeys:
             validated_on_target = self._count(_COUNT_FKS_VALIDATED)
 
             # A shortfall (some FK failed to validate, or a count is unreadable) is
-            # a phase failure -- the post-data phase must be complete before CDC.
+            # a step failure -- the post-data step must be complete before CDC.
             if applied < len(fks) or (validated_on_target is not None and validated_on_target < len(fks)):
                 self._log_event("run", "failure",
                                 f"Only {applied}/{len(fks)} FKs validated "
@@ -309,7 +309,7 @@ class PgCyanForeignKeys:
                 "component": "post-fk",
                 "status": "completed",
                 "message": (
-                    "Post-data complete: secondary indexes built (phase 3a) and all "
+                    "Post-data complete: secondary indexes built (the indexes step) and all "
                     "foreign keys added NOT VALID then VALIDATE'd on the target."
                 ),
                 "target_index_count": index_count,

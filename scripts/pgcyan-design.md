@@ -222,7 +222,7 @@ source CPU and per-group apply lag, adjust.
    balance on *write rate*, not bytes.
 3. **Isolate the top write-volume components** into their own groups.
 4. **Bin-pack the long tail** into remaining groups, balancing secondary on total bytes
-   (so the load phase finishes evenly).
+   (so the load step finishes evenly).
 
 ---
 
@@ -264,7 +264,7 @@ if source CPU has headroom. Every added group taxes the source.
 9.  Verify (§6).
 ```
 
-**Step 3 is the highest-leverage line in this document.** Every secondary index on a table
+**the post-data steps is the highest-leverage line in this document.** Every secondary index on a table
 is an extra random write per replicated row. A table with 6 indexes costs ~7× the apply
 I/O of the same table with none. Apply is your bottleneck, and you are choosing to run it
 for days against a fully-indexed target if you skip this.
@@ -348,7 +348,7 @@ Lag was zero in the silent-duplication case too. At 2000 tables this must be aut
 10. Flip the CNAME / virtual endpoint.
 ```
 
-Steps 3 and 5 are the ones that turn a "near-instantaneous" cutover into a two-hour
+the post-data steps and 5 are the ones that turn a "near-instantaneous" cutover into a two-hour
 outage. Eliminate them beforehand or budget them honestly.
 
 ---

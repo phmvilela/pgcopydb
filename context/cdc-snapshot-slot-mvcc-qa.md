@@ -1,7 +1,7 @@
 # CDC, snapshots, replication slots & MVCC — Q&A reference
 
 A working Q&A session clarifying the Postgres/pgcopydb fundamentals behind the
-migration's CDC phase (#26) and the parallelism/consistency trade-offs. Captured
+migration's CDC step (#26) and the parallelism/consistency trade-offs. Captured
 for future reference. Answers were deliberately terse; expanded lightly here.
 
 ---

@@ -136,5 +136,5 @@ class MigrationStatus(BaseModel):
         "id": "a1b2c3d4e5", "namespace": "pgcyan-mig-a1b2c3d4e5",
         "state": "running", "controller_reachable": True,
         "controller": {"state": "running", "ready": True, "snapshot": "00000002-0000002A-1",
-                       "cdc": None, "phases": [{"id": "-1", "status": "succeeded"}],
+                       "cdc": None, "steps": [{"id": "-1", "status": "succeeded"}],
                        "errors": []}}]})

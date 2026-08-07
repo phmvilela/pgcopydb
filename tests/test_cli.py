@@ -121,7 +121,7 @@ class _StubOrchestrator(RealOrchestrator):
 
     def run(self):
         status = "success" if self._ok else "failure"
-        return {"status": status, "namespace": self.namespace, "phases": [], "errors": []}
+        return {"status": status, "namespace": self.namespace, "steps": [], "errors": []}
 
 
 class _StubPreData(RealPreData):
@@ -187,7 +187,7 @@ class _StubController:
     def run(self):
         status = "success" if self._ok else "failure"
         return {"status": status, "ready": self._ok, "snapshot": "0000000A-1",
-                "owned": True, "phases": [], "errors": []}
+                "owned": True, "steps": [], "errors": []}
 
     def park(self):
         return None  # no-op: real controller blocks until SIGTERM
@@ -598,9 +598,9 @@ def test_run_migration_kubeconfig_flag(runner):
 
 
 def test_run_migration_stop_after_flows_through(runner):
-    result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--stop-after", "2"])
+    result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--stop-after", "copy"])
     assert result.exit_code == 0
-    assert _StubController.last_kwargs["stop_after"] == "2"
+    assert _StubController.last_kwargs["stop_after"] == "copy"
 
 
 def test_run_migration_follow_cdc_flows_through(runner):
@@ -614,6 +614,6 @@ def test_run_migration_follow_cdc_flows_through(runner):
     assert _StubController.last_kwargs["follow_cdc"] is False
 
 
-def test_run_migration_stop_after_rejects_unknown_phase(runner):
+def test_run_migration_stop_after_rejects_unknown_step(runner):
     result = runner.invoke(cli_module.cli, ["run-migration", "--namespace", "ok_ns", "--stop-after", "99"])
     assert result.exit_code == 2   # click.Choice rejects at parse time

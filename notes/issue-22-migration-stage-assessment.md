@@ -9,7 +9,7 @@ PUBLICATION migration_pub FOR ALL TABLES`, writing the name to
 **Short answer:** no. `pgcopydb` already creates this publication
 automatically as part of `pgcopydb clone --follow` (or standalone via
 `pgcopydb stream setup`), with a configurable name. More importantly, #22 is
-not an isolated ask — it's step 1 of a 7-issue sequence (`#22`–`#28`) that,
+not an isolated ask — it's the snapshot step of a 7-issue sequence (`#22`–`#28`) that,
 taken together, hand-builds a native logical-replication pipeline that
 `pgcopydb clone --follow` already implements end-to-end, tested, in C.
 
@@ -48,7 +48,7 @@ if DDL during migration is expected; if schema is frozen going into cutover
 
 Pulling the full issue list (`gh api repos/berenguel/pgcyan/issues`) shows
 `#22`–`#28` spell out a hand-built native logical-replication pipeline, one
-issue per phase of what `pgcopydb clone --follow` already does as a single
+issue per step of what `pgcopydb clone --follow` already does as a single
 orchestrated, resumable command:
 
 | # | Title | Covered by `pgcopydb clone --follow` |
@@ -56,7 +56,7 @@ orchestrated, resumable command:
 | 22 | Create Publication For All Tables | Auto-created (§1 above) |
 | 23 | Create Slot With Exported Snapshot | Core mechanism of the tool — slot + `pg_export_snapshot()`, automatic |
 | 24 | Pre-Create Target Schema Without Secondary Indexes | `pgcopydb restore pre-data` / built into `clone` |
-| 25 | Initial Copy And Replication Setup | The COPY phase of `clone --follow` |
+| 25 | Initial Copy And Replication Setup | The COPY step of `clone --follow` |
 | 26 | Start Change Data Capture | `follow`'s receive/apply workers start automatically after initial copy |
 | 27 | Monitor Replication Lag | `pgcopydb stream sentinel get --json` exposes write/flush/transform/replay LSNs directly |
 | 28 | Build Secondary Indexes And FK Constraints On Target | `pgcopydb restore post-data`, runs concurrently with CDC catch-up |

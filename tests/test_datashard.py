@@ -146,7 +146,7 @@ def test_build_copy_command_is_data_only_table_data(tmp_path, filter_file):
     # `copy table-data` rejects `--restart=false`, and restart WIPES temp files.
     assert "--resume" in cmd
     assert not any(a.startswith("--restart") for a in cmd)
-    # phase 2 builds no indexes; that is inherent to table-data (no --index-jobs).
+    # the copy step builds no indexes; that is inherent to table-data (no --index-jobs).
     assert "--index-jobs" not in joined
 
 

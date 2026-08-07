@@ -90,9 +90,9 @@ runs:
         kubectl delete job -n "$NS" --ignore-not-found --wait=true pgcyan-collect-inputs || true
         kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
 
-    # Phase -2 (collect inputs) is not part of the controller walk; the planner
-    # (the first phase we let the walk reach) needs its output.
-    - name: Phase -2 -- collect inputs (barrier)
+    # the collect step (collect inputs) is not part of the controller walk; the planner
+    # (the first step we let the walk reach) needs its output.
+    - name: the collect step -- collect inputs (barrier)
       shell: bash
       run: |
         set -euo pipefail

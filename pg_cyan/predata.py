@@ -1,7 +1,7 @@
 """
 Pre-data schema transfer for the sharded pgcopydb topology.
 
-This is the phase ``0`` node in ``deploy/k8s/`` (``40-job-phase0-predata.yaml``):
+This is the step ``0`` node in ``deploy/k8s/`` (``40-job-phase0-predata.yaml``):
 a single coordinator Job that creates the *target* schema **before** any data
 shard runs, so every shard finds its tables already present. It transfers the
 **pre-data section only** -- tables, sequences, functions, LOB metadata -- and
@@ -9,7 +9,7 @@ deliberately NOT secondary indexes, primary-key/unique constraints, foreign
 keys, or triggers. Those all live in Postgres' **post-data** section (per
 ``pg_dump``/``pgcopydb``: primary keys and unique constraints are backed by
 indexes and are created *after* the data lands, see ``pgcopydb`` clone steps
-6-10) and are built by the post-data phase, which is dramatically faster
+6-10) and are built by the post-data step, which is dramatically faster
 than maintaining them during the COPY.
 
 Rather than hand-building the DDL transfer, this is a thin wrapper over pgcopydb
@@ -18,14 +18,14 @@ restores from a custom-format dump file in ``--dir``, so there is no such file i
 this pod's own (empty) work dir -- the wrapper runs two steps:
 
   1. ``pgcopydb dump schema --snapshot=<id> --dir=<work>`` -- pins the schema
-     dump to the **exact snapshot exported by the phase-1 holder** so the
+     dump to the **exact snapshot exported by the snapshot holder** so the
      schema matches the instant the shards copy, then
   2. ``pgcopydb restore pre-data --dir=<work> --target=<uri>`` -- applies ONLY
      the pre-data section to the target.
 
 The snapshot id arrives as ``$SNAPSHOT_ID``, injected into this Job's env at
 apply time by the controller -- which holds the consistent snapshot in-pod and
-orders this phase after it (see ``pg_cyan/orchestrator.py``). There is no
+orders this step after it (see ``pg_cyan/orchestrator.py``). There is no
 separate holder Job and no ``configMapKeyRef``. Consistency can be waived with
 ``--not-consistent`` (the dump then takes its own snapshot) only if the source
 schema is stable for the migration window.
@@ -108,7 +108,7 @@ class PgCyanPreData:
                 natively; passed as ``--source`` when set).
             target_pguri: Target libpq URI (``--target`` for the restore step;
                 pgcopydb also reads ``PGCOPYDB_TARGET_PGURI`` natively).
-            snapshot_id: The exported snapshot id from the phase-1 holder to pin
+            snapshot_id: The exported snapshot id from the snapshot holder to pin
                 the dump to. Required unless ``not_consistent`` is set.
             work_dir: pgcopydb ``--dir`` (the dump lands here).
             output_dir: Directory for the log files (defaults to ``work_dir``).
@@ -328,7 +328,7 @@ class PgCyanPreData:
             "status": "failure",
             "message": message,
             "errors": self.errors or ["Unknown error"],
-            "remediation": "Check the messages above; the pre-data phase is a hard barrier -- no data shard may start until it succeeds",
+            "remediation": "Check the messages above; the pre-data step is a hard barrier -- no data shard may start until it succeeds",
         }
 
     def _write_json(self, filename: str, payload: Dict) -> Optional[str]:
@@ -375,7 +375,7 @@ class PgCyanPreData:
             self._log_event(
                 "run", "failure",
                 "No snapshot id supplied and --not-consistent not set",
-                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each phase pod) or --not-consistent"},
+                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each step pod) or --not-consistent"},
             )
             self.errors.append(
                 "No snapshot id: pass --snapshot=<id> (holder's snapshot) or --not-consistent"

@@ -1,17 +1,17 @@
-# Lessons learned bringing phase 0 (pre-data) green on AKS + Azure Postgres
+# Lessons learned bringing the schema step (pre-data) green on AKS + Azure Postgres
 
 Captured while getting `restore-predata` (issue #24) to pass its cluster-backed
 integration test end-to-end. Every fix below took several failed runs to
-isolate, and **most of them will recur verbatim in the phases that follow**,
+isolate, and **most of them will recur verbatim in the steps that follow**,
 because they share the exact same shape: a non-root pgcopydb pod, mounting an
 Azure managed-disk PVC as `--dir`, running against Azure Database for PostgreSQL
-(Flexible Server), pinned to the phase-1 holder's snapshot.
+(Flexible Server), pinned to the snapshot holder's snapshot.
 
 Directly relevant to:
 
-- **#25 — Sharded Initial Copy Pinned To Snapshot** (phase 2, `pgcopydb clone`, N PVC pods)
-- **#26 — Start Change Data Capture** (phase 4, `pgcopydb follow`, PVC pod)
-- **#28 — Build Secondary Indexes And FK Constraints** (phase 3, post-data restore, PVC pods)
+- **#25 — Sharded Initial Copy Pinned To Snapshot** (the copy step, `pgcopydb clone`, N PVC pods)
+- **#26 — Start Change Data Capture** (the follow step, `pgcopydb follow`, PVC pod)
+- **#28 — Build Secondary Indexes And FK Constraints** (the post-data steps, post-data restore, PVC pods)
 - (#27 lag monitor and #29 cutover touch the cluster less, but the image/CI lessons still apply.)
 
 Read this before wiring up any of those — it will save the same multi-run debugging loop.
@@ -54,7 +54,7 @@ server parameter. pg_restore emitted 6 `extension "..." is not allow-listed`
 errors and returned exit 1, which pgcopydb surfaces as rc=7, failing the whole
 restore.
 
-**Fix (phase 0):** pass `--skip-extensions` (manifest-level, in
+**Fix (the schema step):** pass `--skip-extensions` (manifest-level, in
 `40-job-phase0-predata.yaml`). On Azure this is the *correct* behaviour
 regardless: extensions must be pre-provisioned via `azure.extensions` +
 `CREATE EXTENSION` by an allowed role, not carried in a schema restore.
@@ -71,7 +71,7 @@ regardless: extensions must be pre-provisioned via `azure.extensions` +
 
 Related, lower-severity: the `…azuresu` `Failed to parse Archive TOC comment or
 acl` lines are **non-fatal** — pgcopydb skipping pg_catalog ACL entries owned by
-Azure's superuser. They did not stop the run. But if a later phase's restore
+Azure's superuser. They did not stop the run. But if a later step's restore
 *does* fail on ACL/COMMENT TOC entries, the next levers (all already CLI flags on
 `restore-predata`, so no rebuild) are `--no-acl` and `--no-comments`. We already
 run `--no-owner` because target roles are pre-created (Terraform).
@@ -132,18 +132,18 @@ the *current* invocation's snapshot matches:
 `--dir` (or `--not-consistent` to waive it). **For #28:** if the post-data build
 is split into separate pgcopydb invocations over a shared work dir, they must all
 carry the same snapshot id (the holder's, from the `pgcyan-snapshot` ConfigMap),
-exactly like phase 0 does.
+exactly like the schema step does.
 
 ## 6. `pgcopydb clone` does schema by default — the shards must be DATA-ONLY (design check for #25)
 
 Not a bug we hit, but the reason items 1/2/5 all matter for #25: the sharded
-topology assumes phase 0 does pre-data, phase 2 copies **data only**, phase 3
+topology assumes the schema step does pre-data, the copy step copies **data only**, the post-data steps
 does post-data. But `pgcopydb clone` (what
 `60-job-phase2-datashard.template.yaml` invokes) runs the full pipeline —
 dump/restore pre-data *and* post-data around the COPY — by default. Before #25 is
 called done, confirm the shard command is actually restricted to table data
 (e.g. the appropriate data-only invocation / section flags), otherwise each shard
-will re-run schema DDL, collide with phase 0/3, and re-trip the extension and
+will re-run schema DDL, collide with the schema step/3, and re-trip the extension and
 ownership walls above.
 
 ## 7. CI: singleton holder + shared cluster objects ⇒ serialize the jobs
@@ -160,9 +160,9 @@ integration job that also needs the holder running (or touches `pgcyan-snapshot`
 never overlaps another holder-using job. `planner` stays parallel only because it
 touches disjoint objects.
 
-## 8. Target-DB config + reachability (applies to every phase that writes the target)
+## 8. Target-DB config + reachability (applies to every step that writes the target)
 
-Phase 0 was the first phase to touch the **target**, which needed new
+the schema step was the first step to touch the **target**, which needed new
 `PG_TARGET_*` GitHub secrets/variables and an in-cluster `psql` check Job (the
 target isn't reachable from the GitHub runner — only from inside the cluster).
 #25 and #28 write the target too and rely on the same `pgcyan-db-uris`
@@ -172,7 +172,7 @@ the runner" pattern. Target roles must be pre-created (we run `--no-owner`).
 ## 9. Least-privilege SA + `*/status` subresources ⇒ barrier read Forbidden
 
 **What happened (bringing the folded controller #70 green):** the orchestrator
-polls each phase barrier with `read_namespaced_job_status` /
+polls each step barrier with `read_namespaced_job_status` /
 `read_namespaced_deployment_status` — i.e. the **`jobs/status` and
 `deployments/status` subresources**. Kubernetes RBAC does **not** fold a status
 subresource into a grant on its parent: a Role that grants `jobs` (create/get/…)
@@ -191,7 +191,7 @@ own grant — a create grant is not enough.
 
 ## 10. pgcopydb flags are NOT portable across sub-commands
 
-**What happened (first cluster run of phase 2):** every shard crash-looped with
+**What happened (first cluster run of the copy step):** every shard crash-looped with
 `table-data: option '--restart' doesn't allow an argument` (rc=1). The command
 built `pgcopydb copy table-data ... --resume --restart=false`. On `copy
 table-data`, `--restart` is a **boolean flag** — it takes no value. The
@@ -222,7 +222,7 @@ did" in another pod's state, and that step is often **non-idempotent**:
 
 - **#28:** `pgcopydb copy indexes`/`copy constraints` silently built nothing in a
   standalone per-shard pod (they no-op without the clone's shared catalog) -> we
-  switched phase 3a to custom SQL.
+  switched the indexes step to custom SQL.
 - **#26:** `pgcopydb follow` in a separate CDC pod (fresh `--dir`) re-runs the full
   slot setup, aborting first on the publication then on the slot itself
   (`replication slot "<slot>" already exists`, rc=6) -- and you CANNOT drop the slot
@@ -257,7 +257,7 @@ did" in another pod's state, and that step is often **non-idempotent**:
   its catchup process replays to the target only once the sentinel `apply` flag is
   set (`ld_apply.c`: "Waiting until the pgcopydb sentinel apply is enabled"). `clone
   --follow` flips it after its base copy (`sentinel_update_apply(true)`); our copy is
-  a separate phase, so nothing did -> `write_lsn`/`flush_lsn` advance but `replay_lsn
+  a separate step, so nothing did -> `write_lsn`/`flush_lsn` advance but `replay_lsn
   0/0` and nothing lands on the target. Fix: `PgCyanFollow.enable_apply` runs
   `pgcopydb stream sentinel set apply --dir <same dir>` once attached. Symptom to
   recognise: CDC "streaming" (slot active) but the target never changes + `replay_lsn
@@ -271,17 +271,17 @@ did" in another pod's state, and that step is often **non-idempotent**:
   `id` from the sequence -> gets **1** -> collides with the copied row id=1; the
   conflict is swallowed on commit -> silent drop. `pgcopydb clone` avoids this with
   its "STEP 9: reset sequences"; our custom copy skipped it. Fix: a **sequence-sync
-  phase (2s, #78)** -- custom SQL, source `pg_sequences` -> target `setval`, after
+  step (2s, #78)** -- custom SQL, source `pg_sequences` -> target `setval`, after
   the copy. **Symptom to recognise:** CDC "committed" a change (COMMIT in the apply
   log) but the row is absent, on a table with a `GENERATED ALWAYS AS IDENTITY` PK ->
   check `SELECT pg_sequence_last_value(pg_get_serial_sequence('t','id'))` on the
   target (NULL = never advanced = collision).
 
-**Rule of thumb for new phases:** any pgcopydb command that runs in a pod OTHER
+**Rule of thumb for new steps:** any pgcopydb command that runs in a pod OTHER
 than the one that created the slot/snapshot/catalog will re-do publication/slot/
 schema setup against a fresh `--dir` (non-idempotently), and cannot resume (the
 sentinel + slot record are `--dir`-local). Either **keep the whole lifecycle in one
-pod on one persistent `--dir`** (what CDC does), or use custom SQL (what phase 3
+pod on one persistent `--dir`** (what CDC does), or use custom SQL (what the post-data steps
 does). `rc=6` == a source-side setup step (publication
 / slot) it could not (re)create.
 

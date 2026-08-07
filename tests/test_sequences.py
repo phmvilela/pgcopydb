@@ -104,7 +104,7 @@ def test_null_last_value_is_skipped_not_failed(tmp_path, monkeypatch):
     assert not any("empty_id_seq" in e for e in tgt.executed)
 
 
-def test_setval_failure_is_a_phase_failure(tmp_path, monkeypatch):
+def test_setval_failure_is_a_step_failure(tmp_path, monkeypatch):
     tgt = _TargetCursor(fail="orders_id_seq")
     monkeypatch.setattr(seq_module.psycopg2, "connect", _connect_factory(tgt))
     summary = _make(tmp_path).run()

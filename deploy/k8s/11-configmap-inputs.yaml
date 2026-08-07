@@ -10,8 +10,8 @@
 # ConfigMap from those files rather than us hand-writing them here.
 #
 # TODO: metrics.py currently reports pg_total_relation_size (heap+index
-# conflated). The planner needs heap-vs-index SEPARATELY to size the COPY phase
-# (heap) independently from the index-build phase (target-side). Extend
+# conflated). The planner needs heap-vs-index SEPARATELY to size the COPY step
+# (heap) independently from the index-build step (target-side). Extend
 # metrics.py before trusting the byte splits the planner derives from this.
 # ---------------------------------------------------------------------------
 apiVersion: v1

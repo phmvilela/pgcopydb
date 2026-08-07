@@ -11,9 +11,9 @@ post-migration**. Deliverables are a mix of Python (checks/orchestration) and
 Terraform (Azure provisioning). See `README.md` for the user-facing view.
 
 Current state: the **pre-migration** stages (`preflight`, `source-parameters`,
-`source-pg-metrics`, `source-largeobjects`, `plan`), the phase-0 **pre-data
-schema transfer** (`restore-predata`), the phase-2 **sharded copy**
-(`copy-shard`), the **migration DAG orchestrator** (`orchestrate`), and the
+`source-pg-metrics`, `source-largeobjects`, `plan`), the **schema** step
+(`restore-predata`), the **copy** step (`copy-shard`), the **migration DAG
+orchestrator** (`orchestrate`), and the
 **folded controller** (`run-migration`, #70) that holds the consistent snapshot
 in-pod and drives the whole `deploy/k8s/` sharded pgcopydb DAG, plus the
 Terraform **worker VM** / **AKS cluster** modules exist. Post-migration is not
@@ -77,20 +77,20 @@ truth** (the code is authoritative; see "Architecture" above). Each stage is a
 `PgCyan<Stage>` class following the pattern there. This table is just the index —
 read the linked module before changing a stage.
 
-| Command | Module / class | Phase | What it is |
+| Command | Module / class | Step | What it is |
 |---|---|---|---|
 | `preflight` | `preflight.py` · `PgCyanPreflight` | pre | Source readiness checks; the **canonical pattern** (pass/fail summary). |
 | `source-parameters` | `parameters.py` · `PgCyanParameters` | pre | Instance-parameter inventory; template for **artifact-producing** stages. |
 | `source-pg-metrics` | `metrics.py` · `PgCyanMetrics` | pre | Object counts + **heap/index sizes** (feeds the planner's shard sizing). |
 | `source-largeobjects` | `lobs.py` · `PgCyanLobs` | pre | Large-object count (a count of 0 is a valid happy path; gates CDC). |
-| `plan` | `planner.py` · `PgCyanPlanner` | −1 | Offline transform: LPT bin-pack tables into N disjoint copy shards + `shard-<n>.filters`; **LOB abort gate**. |
-| `restore-predata` | `predata.py` · `PgCyanPreData` | 0 | Pre-data schema to target (tables/sequences/functions — **no** indexes/PK/FK/triggers; those are post-data #28). |
-| `copy-shard` | `datashard.py` · `PgCyanDataShard` | 2 | One disjoint shard's **data-only** copy (`pgcopydb copy table-data`); per-table row counts → `pgcyan-copylog-<shard>` ConfigMap. |
-| `copy-sequences` | `sequences.py` · `PgCyanSequences` | 2s | **Custom SQL**: source `pg_sequences` → target `setval` — the COPY load leaves target identity/serial sequences at their start, so CDC/post-cutover inserts collide on id=1 (#78). |
-| `build-indexes` | `postindex.py` · `PgCyanPostIndex` | 3a | One shard's secondary indexes **+ PK/unique constraints** — **custom SQL** (`pg_get_indexdef`/`pg_get_constraintdef` → target DDL); PK/unique was #24's descope. |
-| `build-foreign-keys` | `postfk.py` · `PgCyanForeignKeys` | 3b | **Custom SQL** (not pgcopydb): source FKs → target `ADD … NOT VALID` then `VALIDATE`; single pass; writes `target-pg-postload-log.json`. |
+| `plan` | `planner.py` · `PgCyanPlanner` | plan | Offline transform: LPT bin-pack tables into N disjoint copy shards + `shard-<n>.filters`; **LOB abort gate**. |
+| `restore-predata` | `predata.py` · `PgCyanPreData` | schema | Pre-data schema to target (tables/sequences/functions — **no** indexes/PK/FK/triggers; those are post-data #28). |
+| `copy-shard` | `datashard.py` · `PgCyanDataShard` | copy | One disjoint shard's **data-only** copy (`pgcopydb copy table-data`); per-table row counts → `pgcyan-copylog-<shard>` ConfigMap. |
+| `copy-sequences` | `sequences.py` · `PgCyanSequences` | sequences | **Custom SQL**: source `pg_sequences` → target `setval` — the COPY load leaves target identity/serial sequences at their start, so CDC/post-cutover inserts collide on id=1 (#78). |
+| `build-indexes` | `postindex.py` · `PgCyanPostIndex` | indexes | One shard's secondary indexes **+ PK/unique constraints** — **custom SQL** (`pg_get_indexdef`/`pg_get_constraintdef` → target DDL); PK/unique was #24's descope. |
+| `build-foreign-keys` | `postfk.py` · `PgCyanForeignKeys` | foreign-keys | **Custom SQL** (not pgcopydb): source FKs → target `ADD … NOT VALID` then `VALIDATE`; single pass; writes `target-pg-postload-log.json`. |
 | *(controller-owned)* | `follow.py` · `PgCyanFollow` | CDC | **Not a CLI stage.** After the walk, the controller releases its snapshot and *becomes* the CDC consumer — `pgcopydb follow --resume` on its OWN `--dir` (so follow reuses the slot; slot-creator + streamer must share a `--dir`). Gated by `PGCYAN_FOLLOW_CDC`. Option A, #26. |
-| `orchestrate` | `orchestrator.py` · `PgCyanOrchestrator` | — | Walks the DAG, applies each phase manifest, blocks on its barrier; aggregates the combined `pgcyan-copylog`. |
+| `orchestrate` | `orchestrator.py` · `PgCyanOrchestrator` | — | Walks the DAG, applies each step manifest, blocks on its barrier; aggregates the combined `pgcyan-copylog`. |
 | `run-migration` | `controller.py` · `PgCyanController` | — | **The folded controller (#70)**: holds the snapshot in-pod and drives the whole DAG. This is what runs in-cluster. With `--wait-for-start`/`PGCYAN_WAIT_FOR_START` (#85) it parks **pre-snapshot** and serves a control API (`GET /status`, `POST /start` on :9999), snapshotting + walking only when `POST /start` arrives — the control-plane (#84) entry point. |
 | *(no command)* | `snapshot.py` · `PgCyanSnapshot` | 1 | Snapshot sub-component — establishes + holds the consistent slot/snapshot; driven in-pod by the controller (standalone `snapshot-hold` retired in #70). |
 
@@ -107,12 +107,12 @@ read the linked module before changing a stage.
   f-string config into SQL.
 
 **The migration DAG** (nodes = `deploy/k8s/` manifests, edges = the
-orchestrator): `plan(-1)` → `pre-data(0)` → `data shards(2, ×N)` →
-`sequences(2s)` → `index(3a, ×M)` → `FK(3b)`. The **controller** (`run-migration`, a single-pod
+orchestrator): `plan` → `schema` → `copy (×N)` →
+`sequences` → `indexes (×M)` → `foreign-keys`. The **controller** (`run-migration`, a single-pod
 StatefulSet) holds the consistent snapshot in its own pod for the whole copy and
-**injects `SNAPSHOT_ID`** into the phase pods (no `pgcyan-snapshot` ConfigMap),
+**injects `SNAPSHOT_ID`** into the step pods (no `pgcyan-snapshot` ConfigMap),
 **owns** every workload it creates (delete it → cascade), and **refuses to resume**
-a lost-snapshot restart (parks not-ready). **CDC is not a DAG phase**: after the
+a lost-snapshot restart (parks not-ready). **CDC is not a DAG step**: after the
 walk the controller *itself* streams `pgcopydb follow` on its own `--dir` (Option
 A, #26) — the slot-creator and streamer must share one pgcopydb `--dir`, so a
 separate pod can't do it. See `notes/k8s-sharded-migration-topology.md` for the
@@ -148,7 +148,7 @@ topology and the module docstrings for each node.
   every documented field is present -- never specific values. **No workflow
   currently drives this pytest file** (the old `integration-pre-migration.yml`
   was retired when the workflows were consolidated); run it manually with
-  `PG_SOURCE_*` set, or rely on the cluster-side phase -2 collector Job that
+  `PG_SOURCE_*` set, or rely on the cluster-side the collect step collector Job that
   `.github/workflows/integration-tests.yml` exercises for CI coverage of a real
   source DB. Keep the file's conventions (env-var config, secrets only for
   credentials, field-presence-only assertions) for future stages.
@@ -164,7 +164,7 @@ Exactly **five** GitHub workflows, each with one clear job (issue #50 cleanup, +
 - `.github/workflows/integration-tests.yml` -- manual (`workflow_dispatch`),
   cluster-backed. **One `migration` job** stands up the folded controller
   (`run-migration`, `PGCYAN_FOLLOW_CDC=true`) and walks the whole implemented DAG
-  end-to-end (planner → pre-data → data shards → index → FK), then the controller
+  end-to-end (plan → schema → copy → indexes → foreign-keys), then the controller
   streams CDC on its own `--dir` (#26 Option A). Asserts the combined
   `pgcyan-copylog` ConfigMap (#25), the post-data target shape (indexes + PK/unique
   + validated FKs, #28), and one active consumer on the slot (#26). Needs
@@ -187,7 +187,7 @@ Exactly **five** GitHub workflows, each with one clear job (issue #50 cleanup, +
 `integration-tests.yml` substitutes `<acr>.azurecr.io/pgcyan:<short-sha>` with
 `envsubst '${PGCYAN_IMAGE}'` (which leaves runtime `$(SNAPSHOT_ID)` /
 `${RESTORE_JOBS}` refs untouched), and the orchestrator substitutes its OWN
-running image (resolved from its pod spec via `_resolve_image`) so every phase
+running image (resolved from its pod spec via `_resolve_image`) so every step
 Job/Deployment it launches shares its exact build. Never commit a concrete
 image or digest to the manifests or `kustomization.yaml`.
 
@@ -269,17 +269,17 @@ Azure resources by losing local state. Keep state/secrets out of the repo
 (`*.tfstate`, `*.tfvars`, `backend.hcl` are gitignored; commit only the
 `*.example` files).
 
-## Before wiring up a new migration phase (#25–#29)
+## Before wiring up a new migration step (#25–#29)
 
-Read **`notes/migration-phases-lessons-learned.md`** first. It captures the
-non-obvious failures hit getting phase 0 (`restore-predata`, #24) green on
+Read **`notes/migration-steps-lessons-learned.md`** first. It captures the
+non-obvious failures hit getting the schema step (`restore-predata`, #24) green on
 AKS + Azure Postgres — non-root pod + managed-disk PVC permissions
 (`fsGroup`), Azure extension allow-listing (`--skip-extensions`), the
 image-pinned-by-commit-SHA CI flow (build then test, or retag), the
 manifest-applied-live vs image-baked deploy layers, shared pgcopydb `--dir`
 snapshot consistency, the `clone`-does-schema data-only check for #25, and
 holder/ConfigMap CI-job serialization. Most of these recur verbatim in the
-data-shard (#25), CDC (#26), and post-data (#28) phases.
+data-shard (#25), CDC (#26), and post-data (#28) steps.
 
 ## Known gaps / cleanups worth doing
 

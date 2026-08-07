@@ -39,7 +39,7 @@ in an observable terminal state after a run finishes.
 
 Ordering: the snapshot is established **first** (planning is offline and fast, so
 holding it from the start costs nothing and pins everything to one instant), then
-the full walk runs (planner -> pre-data -> shards -> index -> FK -> CDC) with the
+the full walk runs (plan -> schema -> copy -> indexes -> foreign-keys -> follow) with the
 id injected. A ``health_check`` the barrier loop polls means a child that dies
 mid-walk aborts the copy rather than "succeeding" against a dead snapshot.
 
@@ -259,11 +259,11 @@ class PgCyanController:
 
     @staticmethod
     def _walk_reached_postdata(result: Dict) -> bool:
-        """Did the walk complete through post-data (the last phase) -- i.e. is the
+        """Did the walk complete through post-data (the last step) -- i.e. is the
         target ready for CDC to apply against? True when it ran the whole DAG, or
-        stopped after the last phase (``PgCyanOrchestrator.PHASES[-1]``)."""
-        last_phase = PgCyanOrchestrator.PHASES[-1]["id"]
-        return result.get("stopped_after") in (None, last_phase)
+        stopped after the last step (``PgCyanOrchestrator.STEPS[-1]``)."""
+        last_step = PgCyanOrchestrator.STEPS[-1]["id"]
+        return result.get("stopped_after") in (None, last_step)
 
     def _start_cdc(self, snapshot_id: Optional[str], summary: Dict) -> bool:
         """
@@ -295,8 +295,8 @@ class PgCyanController:
         The controller's ``pgcopydb snapshot --follow`` child keeps the slot
         acquired while its exported-snapshot connection is open, so a second
         consumer (``pgcopydb follow``) cannot attach. The snapshot's last user was
-        the phase-2 copy; the slot is persistent (WAL retained), so closing here
-        loses nothing. Idempotent -- the orchestrator calls it once, before phase 4.
+        the copy step; the slot is persistent (WAL retained), so closing here
+        loses nothing. Idempotent -- the orchestrator calls it once, before the follow step.
         """
         if self._released:
             return
@@ -433,7 +433,7 @@ class PgCyanController:
             "ready": os.path.exists(self.ready_file),
             "snapshot": s.get("snapshot"),
             "cdc": s.get("cdc"),
-            "phases": s.get("phases", []),
+            "steps": s.get("steps", []),
             "errors": s.get("errors", self.errors),
         }
 
@@ -547,13 +547,13 @@ class PgCyanController:
               "ready": <bool>,          # what the readiness probe now reflects
               "snapshot": <id or None>,
               "owned": <bool>,
-              "phases": [...],
+              "steps": [...],
               "errors": [...],
             }
         ``halted`` == refused to resume a run a prior pod already began.
         """
         summary = {"status": "failure", "ready": False, "snapshot": None,
-                   "owned": False, "phases": [], "errors": self.errors}
+                   "owned": False, "steps": [], "errors": self.errors}
         # Expose the (mutating) summary + state to the control API's /status.
         self._summary = summary
         self.state = "running"
@@ -615,7 +615,7 @@ class PgCyanController:
                 stop_after=self.stop_after,
             )
             result = orch.run()
-            summary["phases"] = result.get("phases", [])
+            summary["steps"] = result.get("steps", [])
             summary["errors"].extend(result.get("errors", []))
             summary["status"] = result.get("status", "failure")
             walk_ok = summary["status"] == "success"

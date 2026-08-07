@@ -8,7 +8,7 @@
 #   * the integration-tests workflow substitutes the commit-short-SHA-tagged
 #     ACR image via `envsubst` before `kubectl apply`, and
 #   * the orchestrator (pg_cyan/orchestrator.py) substitutes its OWN running
-#     image so every phase Job/Deployment it launches matches its tag.
+#     image so every step Job/Deployment it launches matches its tag.
 # `kubectl kustomize deploy/k8s` therefore emits the literal `${PGCYAN_IMAGE}`
 # placeholder -- fill it (envsubst) before applying the rendered output.
 #
@@ -16,7 +16,7 @@
 #   * 10-secrets.example.yaml -- an EXAMPLE; never apply placeholder secret
 #     values to a real cluster. Create the real Secret out-of-band.
 #   * 11-configmap-inputs.yaml / 12-configmap-plan.yaml -- illustrative stubs
-#     that the phase -2 collector / planner Jobs overwrite with real content;
+#     that the collect + planner Jobs overwrite with real content;
 #     applying the stub adds nothing.
 #   * 60-job-phase2-datashard.template.yaml / 70-job-phase3-index.template.yaml
 #     -- NOT standalone-appliable (contain ${SHARD_NAME}/etc. placeholders the

@@ -1,12 +1,12 @@
 # 71-job-phase3-fk.yaml
 # ---------------------------------------------------------------------------
-# PHASE 3b: FOREIGN KEY constraints -- the SINGLE-PASS job.
+# FOREIGN-KEYS STEP: FOREIGN KEY constraints -- the SINGLE-PASS job.
 #
 # WHY it is one job and NOT sharded like the indexes:
 #   A foreign key spans TWO tables that may live in DIFFERENT data shards. There
 #   is no clean way to partition FK creation across shared-nothing pods without
 #   them coordinating locks. So FKs are applied in ONE coordinated pass, after ALL
-#   data (phase 2) AND all indexes (phase 3a) are in place.
+#   data (the copy step) AND all indexes (the indexes step) are in place.
 #
 # WHY CUSTOM SQL, NOT pgcopydb: the wrapper (`build-foreign-keys`,
 # PgCyanForeignKeys) introspects the source's FK definitions and applies each to
@@ -23,7 +23,7 @@
 # the authoritative target-pg-postload-log.json.
 #
 # This is the last hard barrier before the source and target are schema- and
-# data-equivalent (modulo any CDC still catching up in phase 4).
+# data-equivalent (modulo any CDC still catching up in the follow step).
 # See also: pg_cyan/postfk.py
 apiVersion: batch/v1
 kind: Job
@@ -31,17 +31,17 @@ metadata:
   name: pgcyan-phase3-fk
   namespace: pgcyan-migration
   labels:
-    pgcyan.dev/phase: "post-data-fk"
+    pgcyan.dev/step: "foreign-keys"
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
       labels:
-        pgcyan.dev/phase: "post-data-fk"
+        pgcyan.dev/step: "foreign-keys"
     spec:
       serviceAccountName: pgcyan-worker
-      # Non-root uid 1000 ('migration'). No managed-disk PVC here -- this phase is
+      # Non-root uid 1000 ('migration'). No managed-disk PVC here -- this step is
       # pure psycopg2 (no pgcopydb catalog), so it only needs a scratch dir for
       # the one small output JSON; an emptyDir suffices, so no fsGroup is needed.
       securityContext:

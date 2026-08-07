@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build and push the pgcyan migration image to Azure Container Registry (#39).
 #
-# One image serves every deploy/k8s/ pod (planner, pgcopydb phases, custom
-# Python phases). This script builds it and pushes it to the ACR that
+# One image serves every deploy/k8s/ pod (planner, pgcopydb steps, custom
+# Python steps). This script builds it and pushes it to the ACR that
 # terraform/aks provisions, then prints the digest-pinned reference to drop
 # into the manifests.
 #

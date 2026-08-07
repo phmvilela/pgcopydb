@@ -1,8 +1,8 @@
 # Three identities:
 #
 #   1. pgcyan-orchestrator -- the control plane. It (and only it) creates/patches/
-#      deletes the per-phase Jobs and reads their status to enforce the DAG
-#      barriers (wait for phase N to fully succeed before applying N+1). This is
+#      deletes the per-step Jobs and reads their status to enforce the DAG
+#      barriers (wait for step N to fully succeed before applying N+1). This is
 #      the imperative glue that plain YAML cannot express on its own.
 #      See also: pg_cyan/controller.py, pg_cyan/orchestrator.py
 #
@@ -49,9 +49,9 @@ metadata:
   name: pgcyan-orchestrator
   namespace: pgcyan-migration
 rules:
-  # Create and supervise the phase Jobs and the follow-CDC Deployment. The
+  # Create and supervise the step Jobs and the follow-CDC Deployment. The
   # `*/status` subresources are SEPARATE from the parent in RBAC: the orchestrator
-  # polls each phase's barrier via read_namespaced_job_status /
+  # polls each step's barrier via read_namespaced_job_status /
   # read_namespaced_deployment_status (the `jobs/status` / `deployments/status`
   # subresources), which a grant on `jobs`/`deployments` alone does NOT cover --
   # without them the barrier read is Forbidden even though create/get succeed.
@@ -62,8 +62,8 @@ rules:
     resources: ["deployments", "deployments/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
   # PodDisruptionBudgets ship with the controller StatefulSet, and the
-  # orchestrator applies whatever a phase manifest contains, so it keeps the
-  # verbs for any future Deployment/PDB phase too.
+  # orchestrator applies whatever a step manifest contains, so it keeps the
+  # verbs for any future Deployment/PDB step too.
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
@@ -143,9 +143,9 @@ metadata:
   name: pgcyan-viewer
   namespace: pgcyan-migration
 rules:
-  # Observe the migration DAG: pods (+ their logs), the phase Jobs and the
+  # Observe the migration DAG: pods (+ their logs), the step Jobs and the
   # controller StatefulSet (which holds the snapshot in-pod and streams CDC).
-  # Deployment/ReplicaSet verbs are kept for any future Deployment phase.
+  # Deployment/ReplicaSet verbs are kept for any future Deployment step.
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch"]
@@ -156,7 +156,7 @@ rules:
     resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch"]
   # Read the plan / snapshot / inputs ConfigMaps and the work-dir PVCs the
-  # phases stamp, plus the events that explain scheduling / image-pull failures.
+  # steps stamp, plus the events that explain scheduling / image-pull failures.
   - apiGroups: [""]
     resources: ["configmaps", "persistentvolumeclaims", "events"]
     verbs: ["get", "list", "watch"]

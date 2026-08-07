@@ -1,6 +1,6 @@
 # 25-job-collect-inputs.yaml
 # ---------------------------------------------------------------------------
-# PHASE -2 (control plane): the INPUT COLLECTOR.
+# COLLECT STEP (control plane): the INPUT COLLECTOR.
 #
 # This is the only pre-plan step that TALKS TO THE SOURCE DATABASE. It runs the
 # read-only pg_cyan collectors against the source Postgres and publishes their
@@ -19,7 +19,7 @@
 # It replaces the illustrative stub in 11-configmap-inputs.yaml with real data.
 #
 # DB auth: reads the single pgcopydb-style `PGCOPYDB_SOURCE_PGURI` from the
-# shared `pgcyan-db-uris` Secret (the same Secret the controller/phase pods use),
+# shared `pgcyan-db-uris` Secret (the same Secret the controller/step pods use),
 # created out-of-band (never in git):
 #   kubectl create secret generic pgcyan-db-uris -n pgcyan-migration \
 #     --from-literal=PGCOPYDB_SOURCE_PGURI="postgres://user:pw@host:5432/db?sslmode=require" \
@@ -40,7 +40,7 @@ spec:
   template:
     metadata:
       labels:
-        pgcyan.dev/phase: "collect-inputs"
+        pgcyan.dev/step: "collect"
     spec:
       serviceAccountName: pgcyan-orchestrator   # needs configmap write RBAC
       restartPolicy: Never

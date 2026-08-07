@@ -1,9 +1,9 @@
 ---
 name: add-migration-stage
-description: Use when adding a new pg_cyan stage or migration phase — a new PgCyan<Stage> class, a CLI subcommand, and (for a migration phase) a deploy/k8s manifest node. Covers the authoritative orchestrator pattern, the success-vs-error two-file output, structured logging, DB-free tests, and the RBAC/injection wiring a new phase needs under the folded controller.
+description: Use when adding a new pg_cyan stage or migration step — a new PgCyan<Stage> class, a CLI subcommand, and (for a migration step) a deploy/k8s manifest node. Covers the authoritative orchestrator pattern, the success-vs-error two-file output, structured logging, DB-free tests, and the RBAC/injection wiring a new step needs under the folded controller.
 ---
 
-# Add a pg_cyan stage / migration phase
+# Add a pg_cyan stage / migration step
 
 `pg_cyan/preflight.py` (`PgCyanPreflight`) is the canonical shape; every stage is
 a `PgCyan<Stage>` class. **Follow the existing code — the module docstrings are
@@ -32,9 +32,7 @@ that drives subprocesses (`predata.py`, `datashard.py`, `snapshot.py`), or an
 - **A warning is not a blocker** — increment the pass counter for warnings; only
   real problems flip readiness / fail.
 
-## Steps
-
-1. **New stage class** `pg_cyan/<stage>.py` — copy the closest sibling; keep
+## the snapshot step. **New stage class** `pg_cyan/<stage>.py` — copy the closest sibling; keep
    `_log_event`, the two-file output, and the never-raise `run()`.
 2. **CLI subcommand** in `pg_cyan/cli.py` — a thin click command mirroring an
    existing one. Every option gets an env fallback
@@ -50,28 +48,28 @@ that drives subprocesses (`predata.py`, `datashard.py`, `snapshot.py`), or an
 4. **Update the CLAUDE.md stage index** (`## CLI & stages`) — one table row. The
    deep prose stays in your module docstring, NOT in CLAUDE.md.
 
-## If it's a MIGRATION PHASE (a deploy/k8s node)
+## If it's a MIGRATION STEP (a deploy/k8s node)
 
-Read `notes/migration-phases-lessons-learned.md` first — the non-obvious AKS
-failures recur across phases. Then:
+Read `notes/migration-steps-lessons-learned.md` first — the non-obvious AKS
+failures recur across steps. Then:
 
 - **Manifest** `deploy/k8s/NN-...yaml` (Job, or `*.template.yaml` if per-shard).
   Non-root pods that mount a managed-disk PVC need the `securityContext`
   (`runAsUser: 1000`, `fsGroup: 1000`, `fsGroupChangePolicy: OnRootMismatch`) —
   copy it. Image is `image: "${PGCYAN_IMAGE}"`, never a concrete tag. Add it to
   `kustomization.yaml`.
-- **Snapshot** (if the phase pins the copy): do NOT read a `pgcyan-snapshot`
+- **Snapshot** (if the step pins the copy): do NOT read a `pgcyan-snapshot`
   ConfigMap — the controller (#70) INJECTS `SNAPSHOT_ID` into the pod env. Mark
-  the phase `needs_snapshot: True` in the orchestrator's `PHASES`.
-- **Orchestrator wiring** (`orchestrator.py`): add a `PHASES` entry (static
+  the step `needs_snapshot: True` in the orchestrator's `STEPS`.
+- **Orchestrator wiring** (`orchestrator.py`): add a `STEPS` entry (static
   `manifest` or templated `template`+`plan_key`+`substitutions`). Templated
-  phases are stamped once per `plan.json` entry.
+  steps are stamped once per `plan.json` entry.
 - **RBAC** (`01-rbac.yaml`): if the orchestrator makes a NEW kind of API call for
-  this phase, grant it. Reads of a `*/status` subresource need it explicitly
+  this step, grant it. Reads of a `*/status` subresource need it explicitly
   (`jobs/status`, `deployments/status`) — a grant on the parent is NOT enough
   (lessons-learned #9). Worker pods that write a ConfigMap need the narrow
   `configmaps` grant (as the data shards do).
-- **Integration**: the phase runs inside the controller walk — bump
+- **Integration**: the step runs inside the controller walk — bump
   `PGCYAN_STOP_AFTER` in `.github/workflows/integration-tests.yml` to include it,
   and add an assertion. Use the `run-integration-test` skill to run/debug it.
 

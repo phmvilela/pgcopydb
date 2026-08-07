@@ -1,10 +1,10 @@
 # 70-job-phase3-index.template.yaml
 # ---------------------------------------------------------------------------
-# PHASE 3a: SECONDARY INDEX + PK/UNIQUE builds. TEMPLATE -- one Job per plan.json >
-# index_shards entry. Runs only AFTER the phase-2 barrier (every data shard
+# INDEXES STEP: SECONDARY INDEX + PK/UNIQUE builds. TEMPLATE -- one Job per plan.json >
+# index_shards entry. Runs only AFTER the copy barrier (every data shard
 # succeeded), because an index over half-loaded data is worthless.
 #
-# CRITICAL RESOURCE INSIGHT (this drove the whole phase-3 design):
+# CRITICAL RESOURCE INSIGHT (this drove the whole post-data design):
 #   The heavy compute of CREATE INDEX runs ON THE TARGET POSTGRES SERVER, not in
 #   this pod. This pod issues `CREATE INDEX` / `ADD CONSTRAINT` and then just holds
 #   a connection open and WAITS. Giving this pod more CPU/RAM does almost nothing.
@@ -19,10 +19,10 @@
 #   count -- each CREATE INDEX pins ~1 target core; beyond ~target_vCPU total
 #   concurrent builds, extra jobs just queue on the server.
 #
-# STORAGE: none. Phase 3a is pure psycopg2 (custom SQL -- introspect the source's
+# STORAGE: none. the indexes step is pure psycopg2 (custom SQL -- introspect the source's
 # index/constraint defs, apply to the target); it holds no pgcopydb catalog, so it
 # only needs a scratch dir for the one small output JSON. An emptyDir suffices --
-# no managed-disk PVC, no fsGroup (only the pgcopydb phases need those).
+# no managed-disk PVC, no fsGroup (only the pgcopydb steps need those).
 # See also: pg_cyan/postindex.py
 apiVersion: batch/v1
 kind: Job
@@ -31,7 +31,7 @@ metadata:
   name: pgcyan-index-${INDEX_SHARD_NAME}
   namespace: pgcyan-migration
   labels:
-    pgcyan.dev/phase: "post-data-index"
+    pgcyan.dev/step: "indexes"
     pgcyan.dev/shard: "${INDEX_SHARD_NAME}"
 spec:
   backoffLimit: 3
@@ -39,7 +39,7 @@ spec:
   template:
     metadata:
       labels:
-        pgcyan.dev/phase: "post-data-index"
+        pgcyan.dev/step: "indexes"
     spec:
       serviceAccountName: pgcyan-worker
       # Non-root uid 1000 ('migration'). No managed-disk PVC here (pure psycopg2),

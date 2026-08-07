@@ -45,7 +45,7 @@ data:
         { "name": "idx-0", "filter_file": "shard-0.filters", "index_jobs": 4 },
         { "name": "idx-1", "filter_file": "shard-1.filters", "index_jobs": 4 }
       ],
-      "notes": "index/FK compute runs on the TARGET server; pod sizing for phase 3 is near-irrelevant, so keep index/fk pods thin and instead raise target index_jobs + maintenance_work_mem for the window."
+      "notes": "index/FK compute runs on the TARGET server; pod sizing for the post-data steps is near-irrelevant, so keep index/fk pods thin and instead raise target index_jobs + maintenance_work_mem for the window."
     }
   # --- Example filter files (pgcopydb --filters format) -------------------
   # ASSUMPTION: LPT bin-packing put the big tables on shard-1, the long tail on

@@ -1,6 +1,6 @@
 # The migration controller: a single-pod StatefulSet that holds the consistent
-# snapshot in-process, walks the DAG (planner -> pre-data -> data shards -> index
-# -> FK) injecting the snapshot id into each phase pod and owning every workload
+# snapshot in-process, walks the DAG (plan -> schema -> copy -> indexes
+# -> foreign-keys) injecting the snapshot id into each step pod and owning every workload
 # it creates, then releases the snapshot and becomes the CDC consumer itself
 # (`pgcopydb follow --resume` on its OWN --dir, where the slot record lives).
 # CDC is controller-owned, not a separate pod, because the slot-creator and the
@@ -21,7 +21,7 @@
 #
 # --dir ON A MANAGED-DISK PVC (volumeClaimTemplate): pgcopydb keeps a SQLite
 # catalog in WAL mode under --dir, which needs locking Azure Files (SMB) cannot
-# provide -- a managed-csi RWO disk gives real POSIX locking. The CDC phase also
+# provide -- a managed-csi RWO disk gives real POSIX locking. The CDC step also
 # writes a prefetch/replay store here that can grow during a long catch-up, so it
 # needs bounded, dedicated capacity rather than node-ephemeral emptyDir. The
 # StatefulSet reattaches the same PVC by ordinal on restart.
@@ -68,7 +68,7 @@ spec:
       labels:
         pgcyan.dev/component: "controller"
     spec:
-      # The controller drives the Kubernetes API (create/watch the phase Jobs,
+      # The controller drives the Kubernetes API (create/watch the step Jobs,
       # stamp owner-refs) -- so it runs as the pgcyan-orchestrator SA, NOT the
       # API-less worker SA. DB auth is the pgcyan-db-uris Secret (envFrom).
       serviceAccountName: pgcyan-orchestrator
@@ -107,7 +107,7 @@ spec:
             - name: PG_OUTPUT_DIR
               value: "/pgcopydb"
             # Own namespace, for resolving the owning StatefulSet + applying the
-            # phase workloads into it.
+            # step workloads into it.
             - name: PGCYAN_NAMESPACE
               valueFrom:
                 fieldRef:
@@ -121,10 +121,10 @@ spec:
               value: "pgcyan_slot"
             - name: PGCYAN_SNAPSHOT_MODE
               value: "coordinator-held"
-            # Checkpoint knob: bring the pipeline up through this phase id then
+            # Checkpoint knob: bring the pipeline up through this step id then
             # park Ready (e.g. "2" = through the data copy). Filled by envsubst at
             # apply time; EMPTY (the default) = run the whole DAG. Used by the
-            # integration test to stop before the unbuilt phases 3/4.
+            # integration test to stop before the unbuilt the post-data steps/4.
             - name: PGCYAN_STOP_AFTER
               value: "${PGCYAN_STOP_AFTER}"
             # After a full successful walk, become the CDC consumer:

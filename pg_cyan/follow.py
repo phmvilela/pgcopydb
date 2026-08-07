@@ -16,7 +16,7 @@ controller already created the slot (via ``pgcopydb snapshot --follow`` on its o
 ``--dir``); running ``follow`` on that SAME ``--dir`` finds the slot record and
 reuses it instead of colliding. A separate pod with a fresh ``--dir`` cannot do
 this (it would re-create the slot -> "already exists"). This is why CDC is a
-controller-owned step, not a k8s phase.
+controller-owned step, not a k8s step.
 
 Consequently the controller's ``--dir`` is a PERSISTENT volume (not the fold's
 node-local emptyDir): CDC state (the sentinel + prefetch stores) must survive a
@@ -28,7 +28,7 @@ WHY NOT A SHARD: logical decoding is ONE slot with ONE consumer -- an ordered st
 that cannot be fanned out. So CDC is exactly one consumer; the sharded model is an
 initial-copy accelerator, and this serial tail is the price of an online cutover.
 
-``follow`` streams CHANGES only (phases 0-3 did the copy). One more twist: its
+``follow`` streams CHANGES only (the copy step already did the bulk data). One more twist: its
 catchup process only REPLAYS to the target once the sentinel ``apply`` flag is set,
 which ``clone --follow`` flips after its base copy but our separate copy does not --
 so ``start()`` enables it explicitly (``enable_apply`` -> ``stream sentinel set
@@ -255,7 +255,7 @@ class PgCyanFollow:
         (``ld_apply.c``: "Waiting until the pgcopydb sentinel apply is enabled");
         it defaults off. ``clone --follow`` flips it on right after its base copy
         (``cli_clone_follow.c``: ``sentinel_update_apply(true)``). OUR copy is a
-        separate phase, so nothing enabled it -- ``follow`` would prefetch forever
+        separate step, so nothing enabled it -- ``follow`` would prefetch forever
         with ``replay_lsn 0/0`` and never touch the target. ``pgcopydb stream
         sentinel set apply`` sets it, direct-mode against the SAME ``--dir``
         ``source.db`` the running follow uses (SQLite WAL handles the concurrency).

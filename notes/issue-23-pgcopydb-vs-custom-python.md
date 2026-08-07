@@ -75,8 +75,8 @@ We could push the publication step into pgcopydb by switching the driver from
 `snapshot --follow` to a `stream setup`-style path, which *does* auto-manage the
 publication. Rejected because `stream setup` also initialises replication
 origin / replay-DB state — and #23 explicitly says **"Do not create or advance
-any replication origin."** That work belongs to the follow-CDC phase (#4), not
-to this phase-1 holder. Keeping `snapshot --follow` + an explicit
+any replication origin."** That work belongs to the follow-CDC step (#4), not
+to this snapshot holder. Keeping `snapshot --follow` + an explicit
 `CREATE PUBLICATION` is the minimal shape that satisfies both constraints.
 
 ---

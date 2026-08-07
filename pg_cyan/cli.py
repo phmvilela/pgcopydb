@@ -215,11 +215,11 @@ def source_largeobjects(host: str, port: int, user: str, password: str,
 @click.option("--publication-name",
               default=lambda: os.getenv("PGCYAN_PUBLICATION", PgCyanPlanner.DEFAULT_PUBLICATION),
               show_default="$PGCYAN_PUBLICATION",
-              help="Logical-replication publication name for downstream phases.")
+              help="Logical-replication publication name for downstream steps.")
 @click.option("--slot-name",
               default=lambda: os.getenv("PGCYAN_SLOT", PgCyanPlanner.DEFAULT_SLOT),
               show_default="$PGCYAN_SLOT",
-              help="Replication slot name for downstream phases.")
+              help="Replication slot name for downstream steps.")
 @click.option("--run-id", default=lambda: os.getenv("PGCYAN_RUN_ID"),
               show_default="$PGCYAN_RUN_ID",
               help="Opaque run identifier; generated from the clock if omitted.")
@@ -254,7 +254,7 @@ def plan(inputs_dir: str, output_dir: str, shards: int, split_tables_larger_than
 @click.option("--manifests-dir",
               default=lambda: os.getenv("PGCYAN_MANIFESTS_DIR", PgCyanOrchestrator.DEFAULT_MANIFESTS_DIR),
               show_default="$PGCYAN_MANIFESTS_DIR",
-              help="Directory containing the deploy/k8s phase manifests.")
+              help="Directory containing the deploy/k8s step manifests.")
 @click.option("--plan-configmap",
               default=lambda: os.getenv("PGCYAN_PLAN_CONFIGMAP", PgCyanOrchestrator.DEFAULT_PLAN_CONFIGMAP),
               show_default="$PGCYAN_PLAN_CONFIGMAP",
@@ -265,19 +265,19 @@ def plan(inputs_dir: str, output_dir: str, shards: int, split_tables_larger_than
 @click.option("--job-timeout", type=int,
               default=lambda: int(os.getenv("PGCYAN_JOB_TIMEOUT", str(PgCyanOrchestrator.DEFAULT_JOB_TIMEOUT))),
               show_default="$PGCYAN_JOB_TIMEOUT",
-              help="Seconds to wait for a phase barrier before failing it.")
+              help="Seconds to wait for a step barrier before failing it.")
 @click.option("--in-cluster/--kubeconfig", default=True,
               help="Load in-cluster ServiceAccount credentials (default) or a local kubeconfig for dev/testing.")
 def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
                  poll_interval: int, job_timeout: int, in_cluster: bool) -> None:
-    """Walk the migration DAG: apply each phase in order and block on its barrier.
+    """Walk the migration DAG: apply each step in order and block on its barrier.
 
-    Applies planner(-1) -> pre-data(0) -> data shards(2) -> index(3a) -> FK(3b),
-    stopping (without applying later phases) at the first phase whose Jobs/
-    Deployments do not all succeed/become ready. (CDC is not a DAG phase -- the
+    Applies plan -> schema -> copy -> indexes -> foreign-keys,
+    stopping (without applying later steps) at the first step whose Jobs/
+    Deployments do not all succeed/become ready. (CDC is not a DAG step -- the
     controller streams it after the walk.) Standalone: the snapshot is NOT held
     (that is what `run-migration` adds); pass SNAPSHOT_ID some other way if a
-    phase needs it.
+    step needs it.
     """
     orchestrator = PgCyanOrchestrator(
         namespace=namespace, manifests_dir=manifests_dir, plan_configmap=plan_configmap,
@@ -300,7 +300,7 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
               help="Target libpq URI (pgcopydb-native); passed to the restore step.")
 @click.option("--snapshot", "snapshot_id", default=lambda: os.getenv("SNAPSHOT_ID"),
               show_default="$SNAPSHOT_ID",
-              help="Exported snapshot id from the phase-1 holder to pin the dump to.")
+              help="Exported snapshot id from the snapshot holder to pin the dump to.")
 @click.option("--work-dir",
               default=lambda: os.getenv("PGCYAN_WORK_DIR", PgCyanPreData.DEFAULT_WORK_DIR),
               show_default="$PGCYAN_WORK_DIR", help="pgcopydb --dir; the schema dump lands here.")
@@ -327,12 +327,12 @@ def restore_predata(source_pguri: str, target_pguri: str, snapshot_id: str,
                     restore_jobs: int, pgcopydb_bin: str) -> None:
     """Transfer the source's pre-data schema (tables only) to the target.
 
-    A thin wrapper that dumps the source schema pinned to the phase-1 holder's
+    A thin wrapper that dumps the source schema pinned to the snapshot holder's
     snapshot (``pgcopydb dump schema --snapshot``) and restores ONLY the
     pre-data section to the target (``pgcopydb restore pre-data``) -- tables,
     sequences and functions, but deliberately NOT secondary indexes,
     primary-key/unique constraints, foreign keys, or triggers (those are the
-    post-data phase, so the initial COPY is not slowed by index
+    post-data step, so the initial COPY is not slowed by index
     maintenance). Writes ``target-pg-schema-log.json`` on success, or
     ``target-pg-schema-log-errors.json`` on failure.
     """
@@ -362,7 +362,7 @@ def restore_predata(source_pguri: str, target_pguri: str, snapshot_id: str,
               help="Target libpq URI (pgcopydb-native); also used for the per-table count(*).")
 @click.option("--snapshot", "snapshot_id", default=lambda: os.getenv("SNAPSHOT_ID"),
               show_default="$SNAPSHOT_ID",
-              help="Exported snapshot id from the phase-1 holder to pin the copy to.")
+              help="Exported snapshot id from the snapshot holder to pin the copy to.")
 @click.option("--filter-file", default=lambda: os.getenv("FILTER_FILE"),
               show_default="$FILTER_FILE",
               help="Shard filter file (e.g. shard-0.filters), resolved under $PGCYAN_PLAN_DIR.")
@@ -387,9 +387,9 @@ def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_fi
                table_jobs: int, split_tables_larger_than: str, count_rows: bool) -> None:
     """Copy one disjoint shard's table DATA to the target, pinned to the snapshot.
 
-    A thin wrapper over ``pgcopydb copy table-data`` (DATA ONLY -- phase 0 already
-    created the schema, phase 3 builds the indexes/constraints), restricted to
-    this shard's ``[include-only-table]`` filter set and pinned to the phase-1
+    A thin wrapper over ``pgcopydb copy table-data`` (DATA ONLY -- the schema step already
+    created the schema, the post-data steps builds the indexes/constraints), restricted to
+    this shard's ``[include-only-table]`` filter set and pinned to the snapshot
     holder's ``--snapshot`` so every shard copies the same instant. Resumable on
     its own RWO work disk (``--resume``). After the copy it counts
     the rows landed on the target per table and writes ``migration-copy-log.json``
@@ -436,7 +436,7 @@ def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_fi
               show_default="$SHARD_NAME", help="This index shard's name (e.g. idx-0), recorded in the log.")
 def build_indexes(source_pguri: str, target_pguri: str,
                   filter_file: str, shard_name: str) -> None:
-    """Build one shard's indexes + PK/unique constraints on the target (phase 3a).
+    """Build one shard's indexes + PK/unique constraints on the target (the indexes step).
 
     Custom SQL (like build-foreign-keys, not pgcopydb): introspect this shard's
     tables' secondary indexes (pg_get_indexdef) and PK/UNIQUE constraints
@@ -468,7 +468,7 @@ def build_indexes(source_pguri: str, target_pguri: str,
 @click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
               show_default="$PG_OUTPUT_DIR", help="Directory for target-pg-sequences-log[-errors].json.")
 def copy_sequences(source_pguri: str, target_pguri: str, output_dir: str) -> None:
-    """Sync the target's sequences to the source after the copy (phase 2s).
+    """Sync the target's sequences to the source after the copy (the sequences step).
 
     Custom SQL (not pgcopydb): read each source sequence's value and ``setval`` it on
     the target, so target identity/serial sequences continue past the copied rows.
@@ -496,7 +496,7 @@ def copy_sequences(source_pguri: str, target_pguri: str, output_dir: str) -> Non
 @click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
               show_default="$PG_OUTPUT_DIR", help="Directory for target-pg-postload-log[-errors].json.")
 def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) -> None:
-    """Apply the source's foreign keys to the target (phase 3b).
+    """Apply the source's foreign keys to the target (the foreign-keys step).
 
     Custom SQL (not pgcopydb): introspect the source's FK definitions and apply
     each to the target as ``ADD CONSTRAINT ... NOT VALID`` (brief lock) then
@@ -524,9 +524,9 @@ def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) ->
 @click.option("--in-cluster/--kubeconfig", default=True,
               help="Load in-cluster ServiceAccount credentials (default) or a local kubeconfig.")
 @click.option("--stop-after", default=lambda: os.getenv("PGCYAN_STOP_AFTER") or None,
-              type=click.Choice([p["id"] for p in PgCyanOrchestrator.PHASES]),
+              type=click.Choice([p["id"] for p in PgCyanOrchestrator.STEPS]),
               show_default="$PGCYAN_STOP_AFTER (empty/unset = the whole DAG)",
-              help="Bring the pipeline up through this phase id, then park Ready (e.g. 2 = through the data copy).")
+              help="Bring the pipeline up through this step id, then park Ready (e.g. copy = through the data copy).")
 @click.option("--follow-cdc/--no-follow-cdc",
               default=lambda: os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes"),
               show_default="$PGCYAN_FOLLOW_CDC (unset = off)",
@@ -541,7 +541,7 @@ def run_migration(namespace: str, in_cluster: bool, stop_after: str,
 
     The folded controller: it establishes and HOLDS the consistent snapshot in
     its own pod (no separate holder Deployment, no `pgcyan-snapshot` ConfigMap),
-    walks planner -> pre-data -> data shards -> index -> FK injecting the snapshot
+    walks plan -> schema -> copy -> indexes -> foreign-keys injecting the snapshot
     id into the pods and owning every workload it creates, then -- with
     ``--follow-cdc`` -- releases the snapshot and becomes the CDC consumer itself
     (`pgcopydb follow` on its own --dir, Option A). Single-pod StatefulSet;

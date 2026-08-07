@@ -1,23 +1,23 @@
 """
-Sharded initial copy pinned to the snapshot -- phase ``2``.
+Sharded initial copy pinned to the snapshot -- step ``2``.
 
-This is the phase ``2`` node in ``deploy/k8s/`` (``60-job-phase2-datashard.template.yaml``):
+This is the step ``2`` node in ``deploy/k8s/`` (``60-job-phase2-datashard.template.yaml``):
 one Job per copy shard, all running concurrently, each copying its OWN disjoint
 set of tables (authored by the planner as ``shard-<n>.filters``) so no row is
 copied twice and none is missed. Scale-out is *more shard Jobs*, not fatter pods
 -- COPY is network-bound (source -> pod -> target).
 
-DATA ONLY -- ``pgcopydb copy table-data``, NOT ``clone``. Phase 0 already
+DATA ONLY -- ``pgcopydb copy table-data``, NOT ``clone``. the schema step already
 created the target schema (pre-data section: tables, sequences, functions) and
-phase 3 builds the secondary indexes / PK-unique / FK constraints afterwards
+the post-data steps builds the secondary indexes / PK-unique / FK constraints afterwards
 (post-data section). ``pgcopydb clone`` would re-run BOTH schema sections around
-the COPY (see ``notes/migration-phases-lessons-learned.md`` item 6), colliding
-with phases 0/3 and re-tripping the Azure extension/ownership walls (item 2).
+the COPY (see ``notes/migration-steps-lessons-learned.md`` item 6), colliding
+with the schema step/3 and re-tripping the Azure extension/ownership walls (item 2).
 ``pgcopydb copy table-data`` copies the HEAP and nothing else -- no schema, no
-indexes, no vacuum -- which is exactly this phase's job.
+indexes, no vacuum -- which is exactly this step's job.
 
 CONSISTENCY: every shard is pinned to the SAME ``--snapshot=<id>`` -- the
-consistent point the controller holds in-pod and injects into each phase pod as
+consistent point the controller holds in-pod and injects into each step pod as
 ``$SNAPSHOT_ID`` -- so all shards copy the same instant.
 
 RESUME: each shard has its OWN ReadWriteOnce managed disk mounted at ``--dir``
@@ -43,7 +43,7 @@ filter set (pgcopydb's own progress JSON only exposes the *source* ``reltuples``
 estimate, not rows actually landed). Counting is gated by ``--count-rows`` /
 ``$PGCYAN_COUNT_ROWS`` -- default on, because verifying the copy is the whole
 point of the log, but disableable for very large tables where a full seq-scan
-(indexes are not built until phase 3) is too costly. Sourcing the count from
+(indexes are not built until the post-data steps) is too costly. Sourcing the count from
 pgcopydb's own accounting instead is a possible future refinement.
 
 The per-shard log is ALSO published into its OWN ``pgcyan-copylog-<shard>``
@@ -138,7 +138,7 @@ class PgCyanDataShard:
             target_pguri: Target libpq URI (pgcopydb reads ``PGCOPYDB_TARGET_PGURI``
                 natively; passed as ``--target`` when set, and used for the
                 per-table count(*)).
-            snapshot_id: The exported snapshot id from the phase-1 holder to pin
+            snapshot_id: The exported snapshot id from the snapshot holder to pin
                 the copy to. Required -- shards must all copy the same instant.
             filter_file: The shard's filter file name (e.g. ``shard-0.filters``),
                 resolved under ``plan_dir``; its ``[include-only-table]`` list
@@ -257,7 +257,7 @@ class PgCyanDataShard:
         Build the ``pgcopydb copy table-data`` invocation for this shard.
 
         DATA ONLY: ``copy table-data`` copies the heap and nothing else -- no
-        schema (phase 0), no indexes/constraints (phase 3), no vacuum. Restricted
+        schema (the schema step), no indexes/constraints (the post-data steps), no vacuum. Restricted
         to the shard's disjoint tables via ``--filters`` and pinned to the
         holder's snapshot via ``--snapshot``. ``--resume`` makes a restarted pod
         continue on its RWO disk rather than start over; ``--restart`` is
@@ -329,7 +329,7 @@ class PgCyanDataShard:
             self._log_event(
                 "copy", "failure", f"Copy exited non-zero (rc={result.returncode})",
                 {"returncode": result.returncode, "output_tail": tail,
-                 "remediation": "Read the pgcopydb FATAL/ERROR lines above; check the snapshot is still valid (holder up), the source/target URIs, and target write privileges. rc=12 -> work-dir permissions; rc=7 -> catalog/snapshot mismatch (see notes/migration-phases-lessons-learned.md)."},
+                 "remediation": "Read the pgcopydb FATAL/ERROR lines above; check the snapshot is still valid (holder up), the source/target URIs, and target write privileges. rc=12 -> work-dir permissions; rc=7 -> catalog/snapshot mismatch (see notes/migration-steps-lessons-learned.md)."},
             )
             self.errors.append(f"Copy failed (rc={result.returncode}): {tail}")
             return False
@@ -349,7 +349,7 @@ class PgCyanDataShard:
         failure records an error and returns ``None`` for every table; a
         per-table error records that table's count as ``None`` and continues, so
         one bad table does not lose the rest. ``statement_timeout`` bounds each
-        count (indexes are not built until phase 3, so these are seq-scans).
+        count (indexes are not built until the post-data steps, so these are seq-scans).
         """
         counts: Dict[str, Optional[int]] = {
             f"{schema}.{table}": None for schema, table in tables
@@ -437,7 +437,7 @@ class PgCyanDataShard:
             "shard": self.shard_name,
             "message": message,
             "errors": self.errors or ["Unknown error"],
-            "remediation": "The data-copy phase is a hard barrier -- the orchestrator blocks phase 3 until every shard succeeds. Fix the cause and let k8s retry the Job (the shard resumes on its RWO disk).",
+            "remediation": "The data-copy step is a hard barrier -- the orchestrator blocks the post-data steps until every shard succeeds. Fix the cause and let k8s retry the Job (the shard resumes on its RWO disk).",
         }
 
     def _write_json(self, filename: str, payload: Dict) -> Optional[str]:
@@ -557,7 +557,7 @@ class PgCyanDataShard:
         if not self.snapshot_id:
             self._log_event(
                 "run", "failure", "No snapshot id supplied",
-                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each phase pod)"},
+                {"remediation": "Pass --snapshot (the controller injects $SNAPSHOT_ID into each step pod)"},
             )
             self.errors.append(
                 "No snapshot id: pass --snapshot=<id> (the holder's snapshot)"

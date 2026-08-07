@@ -70,8 +70,8 @@ _OBJECT_COUNTS_QUERY = """
 """
 
 # Heap and index bytes are reported separately: the planner bin-packs copy
-# shards by heap bytes (phase 2, network-bound COPY) but sizes the index-build
-# work (phase 3) by index bytes, so a single conflated size makes both splits
+# shards by heap bytes (the copy step, network-bound COPY) but sizes the index-build
+# work (the post-data steps) by index bytes, so a single conflated size makes both splits
 # wrong. ``pg_table_size`` (heap + TOAST + FSM/VM) plus ``pg_indexes_size`` sum
 # to the ``pg_total_relation_size`` figure.
 _TABLE_SIZES_QUERY = """
@@ -295,8 +295,8 @@ class PgCyanMetrics:
         Sum the per-table heap/index figures into database-wide totals.
 
         Reported alongside the per-table breakdown so the planner can size the
-        network-bound COPY (phase 2, heap bytes) separately from the index build
-        (phase 3, index bytes). ``heap_bytes + index_bytes`` equals
+        network-bound COPY (the copy step, heap bytes) separately from the index build
+        (the post-data steps, index bytes). ``heap_bytes + index_bytes`` equals
         ``total_bytes``, which matches the conflated ``pg_total_relation_size``
         sum.
         """

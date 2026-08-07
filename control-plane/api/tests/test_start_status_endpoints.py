@@ -54,7 +54,7 @@ def test_start_controller_error_502(client, fake_controller):
 def test_status_aggregates_controller_and_registry(client, fake_controller):
     mid = _provision(client)
     fake_controller.status_response = (200, {"state": "running", "snapshot": "42/AB",
-                                             "phases": [{"id": "1", "status": "done"}]})
+                                             "steps": [{"id": "1", "status": "done"}]})
     resp = client.get(f"/migrations/{mid}/status")
     assert resp.status_code == 200
     body = resp.json()
@@ -66,7 +66,7 @@ def test_status_aggregates_controller_and_registry(client, fake_controller):
 
 def test_status_terminal_writes_back_and_frees_slot(client, fake_controller, registry):
     mid = _provision(client)
-    fake_controller.status_response = (200, {"state": "succeeded", "phases": []})
+    fake_controller.status_response = (200, {"state": "succeeded", "steps": []})
     body = client.get(f"/migrations/{mid}/status").json()
     assert body["state"] == "succeeded"
     # registry converged to terminal -> the singleton slot is now free

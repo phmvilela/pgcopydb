@@ -1,9 +1,9 @@
 """
 Migration planner for the sharded pgcopydb topology.
 
-This is the phase ``-1`` node in ``deploy/k8s/`` (``30-job-planner.yaml``): a
+This is the step ``-1`` node in ``deploy/k8s/`` (``30-job-planner.yaml``): a
 pure, **offline** transform that reads the pre-collected source artifacts and
-emits the migration *plan* every downstream Kubernetes phase consumes --
+emits the migration *plan* every downstream Kubernetes step consumes --
 ``plan.json`` plus one ``shard-<n>.filters`` file per copy shard (pgcopydb
 ``--filters`` format with a disjoint ``[include-only-table]`` list). It never
 connects to a database; it only reads the JSON already produced by the
@@ -17,18 +17,18 @@ Inputs (read from ``--inputs-dir`` / ``$PG_INPUTS_DIR``):
 
 Responsibilities (this ticket, per the resolved scope):
   * **Bin-pack** tables into N disjoint shards by **heap bytes** (LPT greedy) so
-    phase-2 COPY is balanced. Disjoint ``include-only-table`` lists are the whole
+    the copy step's COPY is balanced. Disjoint ``include-only-table`` lists are the whole
     safety basis of the shared-nothing shards -- no table appears in two shards,
     enforced and re-validated before anything is written.
   * **LOB abort gate:** if the source has any large objects (``lob_count > 0``),
     exit non-zero with a clear message and write *no plan* -- pgcopydb pgoutput
     CDC does not replicate large objects (see
     ``notes/PostgreSQL Logical Replication Limitations & Workarounds for LOBs.md``).
-  * Record ``snapshot.mode``, publication name, and slot name for downstream phases.
+  * Record ``snapshot.mode``, publication name, and slot name for downstream steps.
 
 Deferred to follow-up work:
   * **FK graph** is emitted as ``"status": "deferred"`` -- FK edges are not yet
-    collected by any artifact, and phase-3b applies all constraints in one
+    collected by any artifact, and foreign-keys applies all constraints in one
     non-sharded pass regardless. Real FK collection is a follow-up.
   * **Range-splitting a single oversized table across shards** is out of scope: an
     oversized table stays whole on its own shard and carries
@@ -82,7 +82,7 @@ class PgCyanPlanner:
     DEFAULT_SNAPSHOT_MODE = "coordinator-held"
     DEFAULT_PUBLICATION = "pgcyan_pub"
     DEFAULT_SLOT = "pgcyan_slot"
-    #: Per-shard pod resources. Phase-2 COPY is network-bound, so requests are
+    #: Per-shard pod resources. the copy step's COPY is network-bound, so requests are
     #: kept small enough to co-schedule with the controller on a single small
     #: node (``*_request``), while limits stay generous so the copy is not CPU-
     #: throttled. ``cpu``/``memory`` are the limits; ``cpu_request``/
@@ -112,8 +112,8 @@ class PgCyanPlanner:
             shards: Desired number of copy shards (clamped to the table count).
             split_tables_larger_than: pgcopydb within-job split threshold recorded per shard.
             snapshot_mode: Snapshot strategy (e.g. ``coordinator-held``/``frozen-source``).
-            publication_name: Logical-replication publication name for downstream phases.
-            slot_name: Replication slot name for downstream phases.
+            publication_name: Logical-replication publication name for downstream steps.
+            slot_name: Replication slot name for downstream steps.
             run_id: Opaque run identifier; generated from the clock if omitted.
         """
         self.inputs_dir = inputs_dir
@@ -345,7 +345,7 @@ class PgCyanPlanner:
                 "edges": [],
                 "note": (
                     "FK edge collection is not yet implemented. "
-                    "Phase-3b applies all constraints in one "
+                    "Step-3b applies all constraints in one "
                     "non-sharded pass regardless of this graph."
                 ),
             },

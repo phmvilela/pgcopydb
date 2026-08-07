@@ -35,7 +35,7 @@ class _FakeHolder:
         self._summary = {"status": status, "snapshot_name": snapshot,
                          "slot": "pgcyan_slot", "publication": "pgcyan_pub"}
         self.proc = _FakeProc(proc_alive)
-        # The controller hands these to the orchestrator for the CDC phase.
+        # The controller hands these to the orchestrator for the CDC step.
         self.slot_name = "pgcyan_slot"
         self.plugin = "pgoutput"
         self.established = False
@@ -53,7 +53,7 @@ class _FakeOrchestrator:
     def __init__(self, result=None, **kwargs):
         self.kwargs = kwargs
         self._result = result or {"status": "success",
-                                  "phases": [{"phase": "2", "success": True}], "errors": []}
+                                  "steps": [{"step": "copy", "success": True}], "errors": []}
 
     def run(self):
         return self._result
@@ -180,7 +180,7 @@ def test_walk_failure_clears_readiness(tmp_path):
     core = _FakeCore()
     ready = tmp_path / "ready"
     ctl = _make_controller(core=core, ready_file=str(ready),
-                           orch_result={"status": "failure", "phases": [], "errors": ["boom"]})
+                           orch_result={"status": "failure", "steps": [], "errors": ["boom"]})
     summary = ctl.run()
     assert summary["status"] == "failure"
     assert summary["ready"] is False
@@ -219,7 +219,7 @@ def test_no_statefulset_owner_runs_unowned():
 def test_walk_failure_propagates_and_releases():
     holder = _FakeHolder()
     ctl = _make_controller(holder=holder,
-                           orch_result={"status": "failure", "phases": [], "errors": ["boom"]})
+                           orch_result={"status": "failure", "steps": [], "errors": ["boom"]})
     summary = ctl.run()
     assert summary["status"] == "failure"
     assert "boom" in summary["errors"]
@@ -229,9 +229,9 @@ def test_walk_failure_propagates_and_releases():
 def test_stop_after_flows_to_orchestrator():
     capture = {}
     ctl = _make_controller(capture=capture)
-    ctl.stop_after = "2"
+    ctl.stop_after = "copy"
     ctl.run()
-    assert capture["orch"].kwargs["stop_after"] == "2"
+    assert capture["orch"].kwargs["stop_after"] == "copy"
 
 
 def test_no_cdc_by_default_parks_after_walk():
@@ -274,11 +274,11 @@ def test_cdc_start_failure_marks_not_ready(monkeypatch):
 
 
 def test_cdc_skipped_when_walk_stops_before_postdata():
-    # Stopping the walk before post-data (stopped_after != last phase) => no CDC.
+    # Stopping the walk before post-data (stopped_after != last step) => no CDC.
     capture = {}
     ctl = _make_controller(capture=capture, follow_cdc=True,
-                           orch_result={"status": "success", "stopped_after": "2",
-                                        "phases": [], "errors": []})
+                           orch_result={"status": "success", "stopped_after": "copy",
+                                        "steps": [], "errors": []})
     summary = ctl.run()
     assert summary["status"] == "success"
     assert ctl.cdc is None                 # CDC not started (post-data not reached)

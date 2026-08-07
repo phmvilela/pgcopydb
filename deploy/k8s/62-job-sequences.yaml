@@ -1,7 +1,7 @@
 # 62-job-sequences.yaml
 # ---------------------------------------------------------------------------
-# PHASE 2s: SEQUENCE SYNC -- a single coordinated pass, run after the data copy
-# (phase 2) and before CDC.
+# SEQUENCES STEP: SEQUENCE SYNC -- a single coordinated pass, run after the data copy
+# (the copy step) and before CDC.
 #
 # WHY IT EXISTS: the sharded copy loads rows with their EXPLICIT id values
 # (`pgcopydb copy table-data` -> COPY), which never advances the owning
@@ -9,7 +9,7 @@
 # next `nextval` returns 1. That silently breaks CDC (apply sets identity columns
 # to DEFAULT -> nextval -> 1 -> collides with the copied row id=1, conflict
 # swallowed on commit) and any post-cutover INSERT. `pgcopydb clone` does this as
-# its "STEP 9: reset sequences"; our custom copy skips it, so this phase does it.
+# its "STEP 9: reset sequences"; our custom copy skips it, so this step does it.
 #
 # WHY CUSTOM SQL (not `pgcopydb copy sequences`): pgcopydb's per-object `copy`
 # sub-commands no-op in our standalone per-pod --dir. This is pure psycopg2 (read
@@ -22,14 +22,14 @@ metadata:
   name: pgcyan-sequences
   namespace: pgcyan-migration
   labels:
-    pgcyan.dev/phase: "sequences"
+    pgcyan.dev/step: "sequences"
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
       labels:
-        pgcyan.dev/phase: "sequences"
+        pgcyan.dev/step: "sequences"
     spec:
       serviceAccountName: pgcyan-worker
       # Non-root uid 1000 ('migration'). No managed-disk PVC -- pure psycopg2, so

@@ -8,7 +8,7 @@ injected as a fake, so nothing here needs a real cluster. Tests exercise
 ``${...}`` template substitution, manifest loading against the REAL
 ``deploy/k8s`` files (so a drift between the templates and the substitution
 keys is caught), apply idempotency, Job/Deployment barrier outcomes, and the
-end-to-end phase walk (fail-fast + successful run).
+end-to-end step walk (fail-fast + successful run).
 """
 import json
 
@@ -95,7 +95,7 @@ class FakePolicyApi:
         self.created.append((namespace, body["metadata"]["name"], body))
 
 
-#: The image every test expects phase pods to be stamped with. An autouse
+#: The image every test expects step pods to be stamped with. An autouse
 #: fixture below exports it as PGCYAN_IMAGE so `_resolve_image` uses the
 #: override and never has to read a pod -- keeping the existing fakes pod-free.
 TEST_IMAGE = "test-registry.example.io/pgcyan:testsha"
@@ -223,30 +223,30 @@ def test_render_yaml_raises_on_unknown_placeholder():
 
 # --------------------------------------------------------- manifest loading
 
-def test_load_phase_manifests_static_phase_reads_real_files():
+def test_load_step_manifests_static_step_reads_real_files():
     orch = make_orchestrator()
-    phase = {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"}
-    docs = orch._load_phase_manifests(phase, plan=None)
+    step = {"id": "schema", "name": "Schema", "manifest": "40-job-phase0-predata.yaml"}
+    docs = orch._load_step_manifests(step, plan=None)
     assert len(docs) == 1
     assert docs[0]["kind"] == "Job"
     assert docs[0]["metadata"]["name"] == "pgcyan-phase0-predata"
 
 
-def test_load_phase_manifests_static_phase_multi_doc():
+def test_load_step_manifests_static_step_multi_doc():
     # A multi-document manifest is split into all its objects (the controller
     # StatefulSet manifest carries a Service + StatefulSet + PDB).
     orch = make_orchestrator()
-    phase = {"id": "ctl", "name": "controller", "manifest": "35-statefulset-controller.yaml"}
-    docs = orch._load_phase_manifests(phase, plan=None)
+    step = {"id": "ctl", "name": "controller", "manifest": "35-statefulset-controller.yaml"}
+    docs = orch._load_step_manifests(step, plan=None)
     kinds = {d["kind"] for d in docs}
     assert kinds == {"Service", "StatefulSet", "PodDisruptionBudget"}
 
 
-def test_load_phase_manifests_templated_phase_renders_pvc_and_job_per_shard():
+def test_load_step_manifests_templated_step_renders_pvc_and_job_per_shard():
     orch = make_orchestrator()
-    phase = dict(PgCyanOrchestrator.PHASES[2])  # data-shards
-    assert phase["id"] == "2"
-    docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
+    step = dict(PgCyanOrchestrator.STEPS[2])  # copy
+    assert step["id"] == "copy"
+    docs = orch._load_step_manifests(step, plan=SAMPLE_PLAN)
     # one RWO work-dir PVC + one Job per shard, PVC first so it is
     # applied before the Job that mounts it.
     jobs = [d for d in docs if d["kind"] == "Job"]
@@ -265,24 +265,24 @@ def test_load_phase_manifests_templated_phase_renders_pvc_and_job_per_shard():
     assert "${" not in yaml.safe_dump(docs)
 
 
-def test_load_phase_manifests_index_template_renders_job_per_index_shard():
+def test_load_step_manifests_index_template_renders_job_per_index_shard():
     orch = make_orchestrator()
-    phase = dict(next(p for p in PgCyanOrchestrator.PHASES if p["id"] == "3a"))  # index
-    assert phase["id"] == "3a"
-    docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
+    step = dict(next(p for p in PgCyanOrchestrator.STEPS if p["id"] == "indexes"))  # indexes
+    assert step["id"] == "indexes"
+    docs = orch._load_step_manifests(step, plan=SAMPLE_PLAN)
     jobs = [d["metadata"]["name"] for d in docs if d["kind"] == "Job"]
-    # Phase 3a is pure psycopg2 (custom SQL), no pgcopydb catalog, so it uses
+    # the indexes step is pure psycopg2 (custom SQL), no pgcopydb catalog, so it uses
     # emptyDir, not a per-shard RWO PVC (unlike the data shards).
     pvcs = [d for d in docs if d["kind"] == "PersistentVolumeClaim"]
     assert jobs == ["pgcyan-index-idx-0", "pgcyan-index-idx-1"]
     assert pvcs == []
 
 
-def test_load_phase_manifests_templated_phase_requires_plan_entries():
+def test_load_step_manifests_templated_step_requires_plan_entries():
     orch = make_orchestrator()
-    phase = dict(PgCyanOrchestrator.PHASES[2])
+    step = dict(PgCyanOrchestrator.STEPS[2])
     with pytest.raises(OrchestratorError, match="data_shards"):
-        orch._load_phase_manifests(phase, plan={"data_shards": []})
+        orch._load_step_manifests(step, plan={"data_shards": []})
 
 
 # ----------------------------------------------------------- image handling
@@ -298,15 +298,15 @@ def test_static_manifest_image_placeholder_filled_runtime_vars_preserved():
     orch = make_orchestrator()
     # The controller StatefulSet carries both ${PGCYAN_IMAGE} and the runtime
     # ${PGCYAN_STOP_AFTER}; image-only substitution fills the former, keeps latter.
-    docs = orch._load_phase_manifests(
+    docs = orch._load_step_manifests(
         {"id": "ctl", "name": "controller", "manifest": "35-statefulset-controller.yaml"}, plan=None
     )
     sts = next(d for d in docs if d["kind"] == "StatefulSet")
     assert _container_image(sts) == TEST_IMAGE
     assert "${PGCYAN_STOP_AFTER}" in yaml.safe_dump(sts)  # runtime var preserved
 
-    predata = orch._load_phase_manifests(
-        {"id": "0", "name": "pre-data", "manifest": "40-job-phase0-predata.yaml"}, plan=None
+    predata = orch._load_step_manifests(
+        {"id": "schema", "name": "Schema", "manifest": "40-job-phase0-predata.yaml"}, plan=None
     )[0]
     assert _container_image(predata) == TEST_IMAGE
     # SNAPSHOT_ID is injected by the controller at apply time, not sourced from
@@ -316,9 +316,9 @@ def test_static_manifest_image_placeholder_filled_runtime_vars_preserved():
 
 def test_templated_manifest_image_placeholder_filled():
     orch = make_orchestrator()
-    phase = dict(PgCyanOrchestrator.PHASES[2])  # data-shards
-    docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
-    # Templated phases are multi-doc (a per-shard PVC precedes each Job); the
+    step = dict(PgCyanOrchestrator.STEPS[2])  # copy
+    docs = orch._load_step_manifests(step, plan=SAMPLE_PLAN)
+    # Templated steps are multi-doc (a per-shard PVC precedes each Job); the
     # image placeholder lives on the Job containers.
     jobs = [d for d in docs if d["kind"] == "Job"]
     assert jobs
@@ -483,7 +483,7 @@ def _all_deployments_ready_apps_api():
     return FakeAppsApi(deployment_outcomes={"pgcyan-snapshot-holder": 1, "pgcyan-follow-cdc": 1})
 
 
-def test_run_happy_path_applies_all_phases_in_order():
+def test_run_happy_path_applies_all_steps_in_order():
     batch_api = _all_jobs_complete_batch_api()
     apps_api = _all_deployments_ready_apps_api()
     core_api = FakeCoreApi(plan=SAMPLE_PLAN)
@@ -492,11 +492,11 @@ def test_run_happy_path_applies_all_phases_in_order():
 
     assert summary["status"] == "success"
     assert summary["run_id"] == "pgcyan-test-run"
-    # No snapshot-holder phase (controller holds it in-pod) and no CDC phase (the
-    # controller streams CDC itself after the walk). The sequence-sync phase 2s
+    # No snapshot-holder step (controller holds it in-pod) and no CDC step (the
+    # controller streams CDC itself after the walk). The sequence-sync the sequences step
     # sits between the data copy and the index builds.
-    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "2", "2s", "3a", "3b"]
-    assert all(p["success"] for p in summary["phases"])
+    assert [p["step"] for p in summary["steps"]] == ["plan", "schema", "copy", "sequences", "indexes", "foreign-keys"]
+    assert all(p["success"] for p in summary["steps"])
     # each DATA shard got its own RWO work-dir PVC stamped; the index shards are
     # pure psycopg2 and use emptyDir, so they stamp no PVC.
     assert {n for _, n, _ in core_api.created_pvcs} == {
@@ -526,26 +526,26 @@ def test_run_fails_fast_and_stops_the_dag():
 
     assert summary["status"] == "failure"
     # planner (-1) ran, pre-data (0) failed, nothing after attempted
-    assert [p["phase"] for p in summary["phases"]] == ["-1", "0"]
-    assert summary["phases"][0]["success"] is True   # planner
-    assert summary["phases"][1]["success"] is False  # pre-data
-    # the failing pre-data phase halts the DAG: no data shards, no follow-cdc
+    assert [p["step"] for p in summary["steps"]] == ["plan", "schema"]
+    assert summary["steps"][0]["success"] is True   # planner
+    assert summary["steps"][1]["success"] is False  # pre-data
+    # the failing pre-data step halts the DAG: no data shards, no follow-cdc
     assert "pgcyan-datashard-shard-0" not in {n for _, n, _ in batch_api.created}
     assert "pgcyan-follow-cdc" not in {n for _, n, _ in apps_api.created}
 
 
-def test_run_stops_before_reading_plan_if_earlier_phase_fails():
-    """The plan ConfigMap must not even be read if phase -1/0/1 already failed."""
+def test_run_stops_before_reading_plan_if_earlier_step_fails():
+    """The plan ConfigMap must not even be read if the plan step/0/1 already failed."""
     batch_api = FakeBatchApi(job_outcomes={"pgcyan-planner": ["failed"]})
 
     class ExplodingCoreApi:
         def read_namespaced_config_map(self, name, namespace):
-            raise AssertionError("plan should not be read before phase 2")
+            raise AssertionError("plan should not be read before the copy step")
 
     orch = make_orchestrator(batch_api=batch_api, core_api=ExplodingCoreApi())
     summary = orch.run()
     assert summary["status"] == "failure"
-    assert [p["phase"] for p in summary["phases"]] == ["-1"]
+    assert [p["step"] for p in summary["steps"]] == ["plan"]
 
 
 def test_run_fails_fast_when_one_of_two_data_shards_fails():
@@ -561,10 +561,10 @@ def test_run_fails_fast_when_one_of_two_data_shards_fails():
     summary = orch.run()
 
     assert summary["status"] == "failure"
-    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "2"]
-    data_phase = summary["phases"][-1]
-    assert data_phase["success"] is False
-    targets_by_name = {t["name"]: t for t in data_phase["targets"]}
+    assert [p["step"] for p in summary["steps"]] == ["plan", "schema", "copy"]
+    data_step = summary["steps"][-1]
+    assert data_step["success"] is False
+    targets_by_name = {t["name"]: t for t in data_step["targets"]}
     assert targets_by_name["pgcyan-datashard-shard-0"]["success"] is True
     assert targets_by_name["pgcyan-datashard-shard-1"]["success"] is False
 
@@ -579,8 +579,8 @@ def _shard_env(job_doc):
 
 def test_data_shard_env_carries_plan_slot_and_publication():
     orch = make_orchestrator()
-    phase = dict(PgCyanOrchestrator.PHASES[2])  # data-shards
-    docs = orch._load_phase_manifests(phase, plan=SAMPLE_PLAN)
+    step = dict(PgCyanOrchestrator.STEPS[2])  # copy
+    docs = orch._load_step_manifests(step, plan=SAMPLE_PLAN)
     job = next(d for d in docs if d["kind"] == "Job")
     env = _shard_env(job)
     # slot/publication are plan-level and flow into the shard log via env.
@@ -699,7 +699,7 @@ def test_aggregate_copy_logs_empty_when_no_shard_logs():
     assert any("No shard copy logs" in w for w in combined["warnings"])
 
 
-def test_full_run_aggregates_copy_logs_on_phase_two_success():
+def test_full_run_aggregates_copy_logs_on_step_two_success():
     batch_api = FakeBatchApi(job_outcomes={
         "pgcyan-planner": ["complete"],
         "pgcyan-phase0-predata": ["complete"],
@@ -721,8 +721,8 @@ def test_full_run_aggregates_copy_logs_on_phase_two_success():
     summary = orch.run()
 
     assert summary["status"] == "success"
-    data_phase = next(p for p in summary["phases"] if p["phase"] == "2")
-    assert data_phase["copy_log"]["row_count_total"] == 60
+    data_step = next(p for p in summary["steps"] if p["step"] == "copy")
+    assert data_step["copy_log"]["row_count_total"] == 60
     assert PgCyanOrchestrator.COPY_LOG_CONFIGMAP in core.configmaps
 
 
@@ -749,12 +749,12 @@ def test_inject_snapshot_env_noop_without_id():
     assert "env" not in doc["spec"]["template"]["spec"]["containers"][0]
 
 
-def test_apply_phase_injects_snapshot_into_needs_snapshot_phase():
+def test_apply_step_injects_snapshot_into_needs_snapshot_step():
     batch_api = _all_jobs_complete_batch_api()
     orch = make_orchestrator(batch_api=batch_api, snapshot_id="SNAP-9")
-    phase = next(p for p in PgCyanOrchestrator.PHASES if p["id"] == "0")  # pre-data
-    assert phase.get("needs_snapshot")
-    orch._apply_phase(phase, plan=None)
+    step = next(p for p in PgCyanOrchestrator.STEPS if p["id"] == "schema")  # schema
+    assert step.get("needs_snapshot")
+    orch._apply_step(step, plan=None)
     body = next(b for _, n, b in batch_api.created if n == "pgcyan-phase0-predata")
     env = body["spec"]["template"]["spec"]["containers"][0]["env"]
     assert {"name": "SNAPSHOT_ID", "value": "SNAP-9"} in env
@@ -790,7 +790,7 @@ def test_wait_for_aborts_when_snapshot_child_dies():
 
 # ---------------------------------------------------------- --stop-after
 
-def test_run_stop_after_phase_two_skips_later_phases():
+def test_run_stop_after_step_two_skips_later_steps():
     batch_api = _all_jobs_complete_batch_api()
     apps_api = _all_deployments_ready_apps_api()
     core = FakeCoreApi(
@@ -801,26 +801,26 @@ def test_run_stop_after_phase_two_skips_later_phases():
         },
     )
     orch = make_orchestrator(batch_api=batch_api, apps_api=apps_api, core_api=core,
-                             stop_after="2")
+                             stop_after="copy")
     summary = orch.run()
 
     assert summary["status"] == "success"
-    assert summary["stopped_after"] == "2"
-    assert [p["phase"] for p in summary["phases"]] == ["-1", "0", "2"]
+    assert summary["stopped_after"] == "copy"
+    assert [p["step"] for p in summary["steps"]] == ["plan", "schema", "copy"]
     created = {name for _, name, _ in batch_api.created}
     assert "pgcyan-index-idx-0" not in created and "pgcyan-phase3-fk" not in created
     assert "pgcyan-follow-cdc" not in {name for _, name, _ in apps_api.created}
-    # aggregation still ran for phase 2
+    # aggregation still ran for the copy step
     assert PgCyanOrchestrator.COPY_LOG_CONFIGMAP in core.configmaps
 
 
-def test_run_stop_after_unknown_phase_fails_fast():
+def test_run_stop_after_unknown_step_fails_fast():
     batch_api = _all_jobs_complete_batch_api()
     orch = make_orchestrator(batch_api=batch_api,
                              core_api=FakeCoreApi(plan=SAMPLE_PLAN), stop_after="99")
     summary = orch.run()
     assert summary["status"] == "failure"
-    assert summary["phases"] == []
+    assert summary["steps"] == []
     assert not batch_api.created
     assert any("stop_after" in e for e in summary["errors"])
 
@@ -828,7 +828,7 @@ def test_run_stop_after_unknown_phase_fails_fast():
 # ------------------------------------------------ RBAC covers the barrier reads
 
 def test_orchestrator_rbac_grants_status_subresources():
-    """The orchestrator polls each phase barrier via read_namespaced_job_status /
+    """The orchestrator polls each step barrier via read_namespaced_job_status /
     read_namespaced_deployment_status -- the `jobs/status` / `deployments/status`
     SUBRESOURCES, which RBAC does NOT fold into a grant on `jobs`/`deployments`.
     A missing grant is Forbidden only in-cluster, so lock the manifest
