@@ -12,7 +12,7 @@ Terraform (Azure provisioning). See `README.md` for the user-facing view.
 
 Current state: the **pre-migration** stages (`preflight`, `source-parameters`,
 `source-pg-metrics`, `source-largeobjects`, `plan`), the **schema** step
-(`restore-predata`), the **copy** step (`copy-shard`), the **migration DAG
+(`schema`), the **copy** step (`copy`), the **migration DAG
 orchestrator** (`orchestrate`), and the
 **folded controller** (`run-migration`, #70) that holds the consistent snapshot
 in-pod and drives the whole `deploy/k8s/` sharded pgcopydb DAG, plus the
@@ -84,11 +84,11 @@ read the linked module before changing a stage.
 | `source-pg-metrics` | `metrics.py` · `PgCyanMetrics` | pre | Object counts + **heap/index sizes** (feeds the planner's shard sizing). |
 | `source-largeobjects` | `lobs.py` · `PgCyanLobs` | pre | Large-object count (a count of 0 is a valid happy path; gates CDC). |
 | `plan` | `planner.py` · `PgCyanPlanner` | plan | Offline transform: LPT bin-pack tables into N disjoint copy shards + `shard-<n>.filters`; **LOB abort gate**. |
-| `restore-predata` | `predata.py` · `PgCyanPreData` | schema | Pre-data schema to target (tables/sequences/functions — **no** indexes/PK/FK/triggers; those are post-data #28). |
-| `copy-shard` | `datashard.py` · `PgCyanDataShard` | copy | One disjoint shard's **data-only** copy (`pgcopydb copy table-data`); per-table row counts → `pgcyan-copylog-<shard>` ConfigMap. |
-| `copy-sequences` | `sequences.py` · `PgCyanSequences` | sequences | **Custom SQL**: source `pg_sequences` → target `setval` — the COPY load leaves target identity/serial sequences at their start, so CDC/post-cutover inserts collide on id=1 (#78). |
-| `build-indexes` | `postindex.py` · `PgCyanPostIndex` | indexes | One shard's secondary indexes **+ PK/unique constraints** — **custom SQL** (`pg_get_indexdef`/`pg_get_constraintdef` → target DDL); PK/unique was #24's descope. |
-| `build-foreign-keys` | `postfk.py` · `PgCyanForeignKeys` | foreign-keys | **Custom SQL** (not pgcopydb): source FKs → target `ADD … NOT VALID` then `VALIDATE`; single pass; writes `target-pg-postload-log.json`. |
+| `schema` | `predata.py` · `PgCyanPreData` | schema | Pre-data schema to target (tables/sequences/functions — **no** indexes/PK/FK/triggers; those are post-data #28). |
+| `copy` | `datashard.py` · `PgCyanDataShard` | copy | One disjoint shard's **data-only** copy (`pgcopydb copy table-data`); per-table row counts → `pgcyan-copylog-<shard>` ConfigMap. |
+| `sequences` | `sequences.py` · `PgCyanSequences` | sequences | **Custom SQL**: source `pg_sequences` → target `setval` — the COPY load leaves target identity/serial sequences at their start, so CDC/post-cutover inserts collide on id=1 (#78). |
+| `indexes` | `postindex.py` · `PgCyanPostIndex` | indexes | One shard's secondary indexes **+ PK/unique constraints** — **custom SQL** (`pg_get_indexdef`/`pg_get_constraintdef` → target DDL); PK/unique was #24's descope. |
+| `foreign-keys` | `postfk.py` · `PgCyanForeignKeys` | foreign-keys | **Custom SQL** (not pgcopydb): source FKs → target `ADD … NOT VALID` then `VALIDATE`; single pass; writes `target-pg-postload-log.json`. |
 | *(controller-owned)* | `follow.py` · `PgCyanFollow` | CDC | **Not a CLI stage.** After the walk, the controller releases its snapshot and *becomes* the CDC consumer — `pgcopydb follow --resume` on its OWN `--dir` (so follow reuses the slot; slot-creator + streamer must share a `--dir`). Gated by `PGCYAN_FOLLOW_CDC`. Option A, #26. |
 | `orchestrate` | `orchestrator.py` · `PgCyanOrchestrator` | — | Walks the DAG, applies each step manifest, blocks on its barrier; aggregates the combined `pgcyan-copylog`. |
 | `run-migration` | `controller.py` · `PgCyanController` | — | **The folded controller (#70)**: holds the snapshot in-pod and drives the whole DAG. This is what runs in-cluster. With `--wait-for-start`/`PGCYAN_WAIT_FOR_START` (#85) it parks **pre-snapshot** and serves a control API (`GET /status`, `POST /start` on :9999), snapshotting + walking only when `POST /start` arrives — the control-plane (#84) entry point. |
@@ -272,7 +272,7 @@ Azure resources by losing local state. Keep state/secrets out of the repo
 ## Before wiring up a new migration step (#25–#29)
 
 Read **`notes/migration-steps-lessons-learned.md`** first. It captures the
-non-obvious failures hit getting the schema step (`restore-predata`, #24) green on
+non-obvious failures hit getting the schema step (`schema`, #24) green on
 AKS + Azure Postgres — non-root pod + managed-disk PVC permissions
 (`fsGroup`), Azure extension allow-listing (`--skip-extensions`), the
 image-pinned-by-commit-SHA CI flow (build then test, or retag), the

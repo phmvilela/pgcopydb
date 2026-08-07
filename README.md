@@ -186,8 +186,8 @@ The migration itself runs on Kubernetes, not by hand. The **controller**
 (`run-migration`, a single-pod StatefulSet) holds the consistent snapshot in its
 own pod and walks the whole DAG — plan → schema → copy → sequences → indexes →
 foreign-keys → follow — injecting the snapshot into each step and owning every
-workload it creates. The individual step commands (`restore-predata`,
-`copy-shard`, `orchestrate`) are the nodes it drives; you normally don't invoke
+workload it creates. The individual step commands (`schema`,
+`copy`, `orchestrate`) are the nodes it drives; you normally don't invoke
 them directly.
 
 ```bash
@@ -282,10 +282,10 @@ stage's `--help` and module docstring.
 | `PGCYAN_FOLLOW_CDC` | *(unset)* | `run-migration`: after the walk, become the CDC consumer (`pgcopydb follow` in-controller — #26); `true` to enable |
 | `PGCYAN_RUN_ID`              | *(clock)*   | `plan`: opaque run identifier    |
 | `PGCOPYDB_SOURCE_PGURI` / `PGCOPYDB_TARGET_PGURI` | *(unset)* | pgcopydb-native source/target libpq URIs (else `PG_SOURCE_*`) |
-| `SNAPSHOT_ID`               | *(unset)*   | `restore-predata` / `copy-shard`: consistent snapshot to pin to (**injected by the controller** — #70) |
-| `FILTER_FILE`               | *(unset)*   | `copy-shard` / `build-indexes`: this shard's `shard-<n>.filters` (under `$PGCYAN_PLAN_DIR`) |
-| `PGCYAN_COUNT_ROWS`         | `true`      | `copy-shard`: count copied rows on the target (disable for very large tables; see #69) |
-| `PGCYAN_COPYLOG_CONFIGMAP`  | *(derived)* | `copy-shard`: per-shard copy-log ConfigMap (defaults to `pgcyan-copylog-<shard>`) |
+| `SNAPSHOT_ID`               | *(unset)*   | `schema` / `copy`: consistent snapshot to pin to (**injected by the controller** — #70) |
+| `FILTER_FILE`               | *(unset)*   | `copy` / `indexes`: this shard's `shard-<n>.filters` (under `$PGCYAN_PLAN_DIR`) |
+| `PGCYAN_COUNT_ROWS`         | `true`      | `copy`: count copied rows on the target (disable for very large tables; see #69) |
+| `PGCYAN_COPYLOG_CONFIGMAP`  | *(derived)* | `copy`: per-shard copy-log ConfigMap (defaults to `pgcyan-copylog-<shard>`) |
 | `PGCYAN_STOP_AFTER`         | *(unset)*   | `run-migration` / `orchestrate`: walk the DAG through this step id (e.g. `2`), then park |
 | `PGCYAN_READY_FILE`         | `/pgcopydb/ready` | `run-migration`: readiness-probe file; present == Ready, removed when parked/failed |
 | `PGCYAN_WORK_DIR`           | `/work`     | pgcopydb `--dir` (per-pod work disk) |

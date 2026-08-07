@@ -1,7 +1,7 @@
 """
 Source-connection resolution shared by the psycopg2-based pre-migration stages.
 
-The pgcopydb-native stages (``copy-shard``, ``restore-predata``, …) take a single
+The pgcopydb-native stages (``copy``, ``schema``, …) take a single
 libpq URI via ``PGCOPYDB_SOURCE_PGURI``/``PGCOPYDB_TARGET_PGURI``. The
 introspection stages (``source-pg-metrics``, ``source-largeobjects``) instead
 connect with psycopg2 and historically read the discrete ``PG_SOURCE_*`` vars.

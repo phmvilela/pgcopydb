@@ -19,7 +19,7 @@
 # CONSISTENCY: `--snapshot ${SNAPSHOT_ID}` ties this shard to the holder's
 # snapshot (the snapshot step) so all shards copy the same instant.
 #
-# DATA ONLY: the pod runs `pg_cyan.cli copy-shard`, which drives `pgcopydb copy
+# DATA ONLY: the pod runs `pg_cyan.cli copy`, which drives `pgcopydb copy
 # table-data` -- NOT `pgcopydb clone`. the schema step restores the schema and the post-data steps
 # builds the indexes/constraints, so this step copies the HEAP and nothing else.
 # `clone` would re-run both schema sections and collide with the schema step/3.
@@ -109,7 +109,7 @@ spec:
       containers:
         - name: pgcopydb-copy
           image: "${PGCYAN_IMAGE}"
-          # The pg_cyan `copy-shard` wrapper (PgCyanDataShard) drives
+          # The pg_cyan `copy` wrapper (PgCyanDataShard) drives
           # `pgcopydb copy table-data` -- DATA ONLY, restricted to this shard's
           # [include-only-table] filter set and pinned to the holder's snapshot --
           # then counts the rows landed on the target, writes
@@ -125,7 +125,7 @@ spec:
           # `copy table-data`; the wrapper adds --resume so a
           # backed-off pod continues on its RWO disk.
           # See also: pg_cyan/datashard.py, notes/migration-steps-lessons-learned.md
-          command: ["python", "-m", "pg_cyan.cli", "copy-shard"]
+          command: ["python", "-m", "pg_cyan.cli", "copy"]
           envFrom:
             - secretRef:
                 name: pgcyan-db-uris

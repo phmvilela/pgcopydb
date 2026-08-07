@@ -1,5 +1,5 @@
 """
-Unit tests for the sharded initial copy (`pg_cyan.cli copy-shard`).
+Unit tests for the sharded initial copy (`pg_cyan.cli copy`).
 
 See also: pg_cyan/datashard.py
 

@@ -42,10 +42,10 @@ spec:
       containers:
         - name: pgcyan-sequences
           image: "${PGCYAN_IMAGE}"
-          # The pg_cyan `copy-sequences` wrapper (PgCyanSequences): read each
+          # The pg_cyan `sequences` wrapper (PgCyanSequences): read each
           # source sequence's value and setval it on the target, so target ids
           # continue past the copied rows (else CDC/post-cutover inserts collide).
-          command: ["python", "-m", "pg_cyan.cli", "copy-sequences"]
+          command: ["python", "-m", "pg_cyan.cli", "sequences"]
           envFrom:
             - secretRef:
                 name: pgcyan-db-uris     # PGCOPYDB_SOURCE_PGURI / _TARGET_PGURI

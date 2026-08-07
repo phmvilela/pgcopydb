@@ -411,7 +411,7 @@ def test_plan_options_fall_back_to_env(runner, monkeypatch):
 
 def test_restore_predata_exit_zero_on_success(runner):
     result = runner.invoke(cli_module.cli, [
-        "restore-predata", "--target-pguri", "postgres://good/db",
+        "schema", "--target-pguri", "postgres://good/db",
         "--snapshot", "0000000A-1",
     ])
     assert result.exit_code == 0
@@ -423,7 +423,7 @@ def test_restore_predata_exit_zero_on_success(runner):
 
 def test_restore_predata_exit_one_on_failure(runner):
     result = runner.invoke(cli_module.cli, [
-        "restore-predata", "--target-pguri", "postgres://bad/db",
+        "schema", "--target-pguri", "postgres://bad/db",
         "--snapshot", "0000000A-1",
     ])
     assert result.exit_code == 1
@@ -434,7 +434,7 @@ def test_restore_predata_options_fall_back_to_env(runner, monkeypatch):
     monkeypatch.setenv("PGCOPYDB_TARGET_PGURI", "postgres://tgt/db")
     monkeypatch.setenv("SNAPSHOT_ID", "0000000B-2")
     monkeypatch.setenv("PGCYAN_WORK_DIR", "/mywork")
-    runner.invoke(cli_module.cli, ["restore-predata"])
+    runner.invoke(cli_module.cli, ["schema"])
     assert _StubPreData.last_kwargs["source_pguri"] == "postgres://src/db"
     assert _StubPreData.last_kwargs["target_pguri"] == "postgres://tgt/db"
     assert _StubPreData.last_kwargs["snapshot_id"] == "0000000B-2"
@@ -443,7 +443,7 @@ def test_restore_predata_options_fall_back_to_env(runner, monkeypatch):
 
 def test_restore_predata_owner_flag_overrides_default(runner):
     runner.invoke(cli_module.cli, [
-        "restore-predata", "--target-pguri", "postgres://good/db",
+        "schema", "--target-pguri", "postgres://good/db",
         "--snapshot", "x", "--owner", "--not-consistent",
     ])
     assert _StubPreData.last_kwargs["no_owner"] is False
@@ -452,7 +452,7 @@ def test_restore_predata_owner_flag_overrides_default(runner):
 
 def test_copy_shard_exit_zero_on_success(runner):
     result = runner.invoke(cli_module.cli, [
-        "copy-shard", "--target-pguri", "postgres://good/db",
+        "copy", "--target-pguri", "postgres://good/db",
         "--snapshot", "0000000A-1", "--filter-file", "shard-0.filters",
         "--shard-name", "shard-0",
     ])
@@ -467,7 +467,7 @@ def test_copy_shard_exit_zero_on_success(runner):
 
 def test_copy_shard_exit_one_on_failure(runner):
     result = runner.invoke(cli_module.cli, [
-        "copy-shard", "--target-pguri", "postgres://bad/db",
+        "copy", "--target-pguri", "postgres://bad/db",
         "--snapshot", "0000000A-1", "--filter-file", "shard-0.filters",
     ])
     assert result.exit_code == 1
@@ -481,7 +481,7 @@ def test_copy_shard_options_fall_back_to_env(runner, monkeypatch):
     monkeypatch.setenv("SHARD_NAME", "shard-1")
     monkeypatch.setenv("SLOT_NAME", "pgcyan_slot")
     monkeypatch.setenv("PUBLICATION_NAME", "pgcyan_pub")
-    runner.invoke(cli_module.cli, ["copy-shard"])
+    runner.invoke(cli_module.cli, ["copy"])
     assert _StubDataShard.last_kwargs["source_pguri"] == "postgres://src/db"
     assert _StubDataShard.last_kwargs["target_pguri"] == "postgres://tgt/db"
     assert _StubDataShard.last_kwargs["snapshot_id"] == "0000000B-2"
@@ -492,7 +492,7 @@ def test_copy_shard_options_fall_back_to_env(runner, monkeypatch):
 
 def test_copy_shard_no_count_rows_flag(runner):
     runner.invoke(cli_module.cli, [
-        "copy-shard", "--target-pguri", "postgres://good/db",
+        "copy", "--target-pguri", "postgres://good/db",
         "--snapshot", "x", "--filter-file", "shard-0.filters", "--no-count-rows",
     ])
     assert _StubDataShard.last_kwargs["count_rows"] is False
@@ -524,7 +524,7 @@ def test_orchestrate_kubeconfig_flag(runner):
 
 def test_build_indexes_exit_zero_on_success(runner):
     result = runner.invoke(cli_module.cli, [
-        "build-indexes", "--source-pguri", "postgres://src/db",
+        "indexes", "--source-pguri", "postgres://src/db",
         "--target-pguri", "postgres://good/db",
         "--filter-file", "shard-0.filters", "--shard-name", "idx-0",
     ])
@@ -535,7 +535,7 @@ def test_build_indexes_exit_zero_on_success(runner):
 
 def test_build_indexes_exit_one_on_failure(runner):
     result = runner.invoke(cli_module.cli, [
-        "build-indexes", "--source-pguri", "postgres://src/db",
+        "indexes", "--source-pguri", "postgres://src/db",
         "--target-pguri", "postgres://bad/db", "--filter-file", "shard-0.filters",
     ])
     assert result.exit_code == 1
@@ -543,7 +543,7 @@ def test_build_indexes_exit_one_on_failure(runner):
 
 def test_copy_sequences_exit_zero_on_success(runner):
     result = runner.invoke(cli_module.cli, [
-        "copy-sequences", "--source-pguri", "postgres://src/db",
+        "sequences", "--source-pguri", "postgres://src/db",
         "--target-pguri", "postgres://good/db",
     ])
     assert result.exit_code == 0
@@ -552,14 +552,14 @@ def test_copy_sequences_exit_zero_on_success(runner):
 
 def test_copy_sequences_exit_one_on_failure(runner):
     result = runner.invoke(cli_module.cli, [
-        "copy-sequences", "--target-pguri", "postgres://bad/db",
+        "sequences", "--target-pguri", "postgres://bad/db",
     ])
     assert result.exit_code == 1
 
 
 def test_build_foreign_keys_exit_zero_on_success(runner):
     result = runner.invoke(cli_module.cli, [
-        "build-foreign-keys", "--source-pguri", "postgres://src/db",
+        "foreign-keys", "--source-pguri", "postgres://src/db",
         "--target-pguri", "postgres://good/db",
     ])
     assert result.exit_code == 0
@@ -568,7 +568,7 @@ def test_build_foreign_keys_exit_zero_on_success(runner):
 
 def test_build_foreign_keys_exit_one_on_failure(runner):
     result = runner.invoke(cli_module.cli, [
-        "build-foreign-keys", "--target-pguri", "postgres://bad/db",
+        "foreign-keys", "--target-pguri", "postgres://bad/db",
     ])
     assert result.exit_code == 1
 

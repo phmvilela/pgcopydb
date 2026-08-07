@@ -1,5 +1,5 @@
 """
-Unit tests for the post-data index + PK/unique build (`pg_cyan.cli build-indexes`)
+Unit tests for the post-data index + PK/unique build (`pg_cyan.cli indexes`)
 -- custom SQL.
 
 See also: pg_cyan/postindex.py

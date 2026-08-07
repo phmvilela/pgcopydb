@@ -1,5 +1,5 @@
 # Node-local ReadWriteOnce disk for the SQLite registry (mounted at /data), same
-# pattern as the copy-shard work dirs: SQLite needs real POSIX locking, which a
+# pattern as the copy work dirs: SQLite needs real POSIX locking, which a
 # managed disk gives and Azure Files does not.
 # See also: deploy/k8s/20-pvc-workdir.yaml
 #

@@ -1,6 +1,6 @@
 # Lessons learned bringing the schema step (pre-data) green on AKS + Azure Postgres
 
-Captured while getting `restore-predata` (issue #24) to pass its cluster-backed
+Captured while getting `schema` (issue #24) to pass its cluster-backed
 integration test end-to-end. Every fix below took several failed runs to
 isolate, and **most of them will recur verbatim in the steps that follow**,
 because they share the exact same shape: a non-root pgcopydb pod, mounting an
@@ -73,7 +73,7 @@ Related, lower-severity: the `…azuresu` `Failed to parse Archive TOC comment o
 acl` lines are **non-fatal** — pgcopydb skipping pg_catalog ACL entries owned by
 Azure's superuser. They did not stop the run. But if a later step's restore
 *does* fail on ACL/COMMENT TOC entries, the next levers (all already CLI flags on
-`restore-predata`, so no rebuild) are `--no-acl` and `--no-comments`. We already
+`schema`, so no rebuild) are `--no-acl` and `--no-comments`. We already
 run `--no-owner` because target roles are pre-created (Terraform).
 
 ## 3. The image is pinned by commit short SHA — you must publish one per commit

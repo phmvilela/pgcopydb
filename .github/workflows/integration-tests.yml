@@ -292,7 +292,7 @@ jobs:
           PY
 
       # ACCEPTANCE: after the post-data steps the target has tables + data + secondary
-      # indexes + PK/unique constraints (built by the indexes step build-indexes) + ALL
+      # indexes + PK/unique constraints (built by the indexes step) + ALL
       # foreign keys VALIDATED (NOT VALID then VALIDATE).
       # Checked in-cluster (target unreachable from the runner) with the target URI.
       - name: Verify target post-data shape (indexes + PK/unique + validated FKs)
@@ -336,7 +336,7 @@ jobs:
           fail=0
           [ "${tables:-0}" -gt 0 ]      || { echo "::error::expected tables > 0, got ${tables:-}"; fail=1; }
           [ "${indexes:-0}" -gt 0 ]     || { echo "::error::expected secondary indexes > 0 (the indexes step), got ${indexes:-}"; fail=1; }
-          [ "${pkuq:-0}" -gt 0 ]        || { echo "::error::expected PK/unique constraints > 0 (the indexes step build-indexes), got ${pkuq:-}"; fail=1; }
+          [ "${pkuq:-0}" -gt 0 ]        || { echo "::error::expected PK/unique constraints > 0 (the indexes step), got ${pkuq:-}"; fail=1; }
           [ "${fks:-0}" -gt 0 ]         || { echo "::error::expected FKs > 0 (the foreign-keys step; source must have FKs), got ${fks:-}"; fail=1; }
           [ "${fksvalid:-0}" = "${fks:-1}" ] || { echo "::error::expected ALL FKs validated, got ${fksvalid:-}/${fks:-}"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1

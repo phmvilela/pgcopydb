@@ -589,7 +589,7 @@ def test_data_shard_env_carries_plan_slot_and_publication():
     assert env["SHARD_NAME"] == "shard-0"
     # the shard runs the Python wrapper, not a raw pgcopydb clone.
     assert job["spec"]["template"]["spec"]["containers"][0]["command"] == [
-        "python", "-m", "pg_cyan.cli", "copy-shard",
+        "python", "-m", "pg_cyan.cli", "copy",
     ]
 
 

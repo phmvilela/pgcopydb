@@ -291,7 +291,7 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
         sys.exit(2)
 
 
-@cli.command(name="restore-predata")
+@cli.command(name="schema")
 @click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
               show_default="$PGCOPYDB_SOURCE_PGURI",
               help="Source libpq URI (pgcopydb-native); passed to the dump step.")
@@ -321,7 +321,7 @@ def orchestrate(namespace: str, manifests_dir: str, plan_configmap: str,
 @click.option("--pgcopydb-bin",
               default=lambda: os.getenv("PGCOPYDB_BIN", PgCyanPreData.DEFAULT_PGCOPYDB_BIN),
               show_default="$PGCOPYDB_BIN", help="pgcopydb executable name/path.")
-def restore_predata(source_pguri: str, target_pguri: str, snapshot_id: str,
+def schema(source_pguri: str, target_pguri: str, snapshot_id: str,
                     work_dir: str, output_dir: str, no_owner: bool,
                     drop_if_exists: bool, skip_extensions: bool, not_consistent: bool,
                     restore_jobs: int, pgcopydb_bin: str) -> None:
@@ -353,7 +353,7 @@ def restore_predata(source_pguri: str, target_pguri: str, snapshot_id: str,
         sys.exit(2)
 
 
-@cli.command(name="copy-shard")
+@cli.command(name="copy")
 @click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
               show_default="$PGCOPYDB_SOURCE_PGURI",
               help="Source libpq URI (pgcopydb-native); passed to the copy step.")
@@ -382,7 +382,7 @@ def restore_predata(source_pguri: str, target_pguri: str, snapshot_id: str,
 @click.option("--count-rows/--no-count-rows",
               default=lambda: os.getenv("PGCYAN_COUNT_ROWS", "true").strip().lower() in ("1", "true", "yes", "on"),
               help="Count rows on the target after the copy (verification; disable for very large tables).")
-def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_file: str,
+def copy(source_pguri: str, target_pguri: str, snapshot_id: str, filter_file: str,
                shard_name: str, slot_name: str, publication_name: str,
                table_jobs: int, split_tables_larger_than: str, count_rows: bool) -> None:
     """Copy one disjoint shard's table DATA to the target, pinned to the snapshot.
@@ -425,7 +425,7 @@ def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_fi
         sys.exit(2)
 
 
-@cli.command(name="build-indexes")
+@cli.command(name="indexes")
 @click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
               show_default="$PGCOPYDB_SOURCE_PGURI", help="Source libpq URI (index/constraint defs read from here).")
 @click.option("--target-pguri", default=lambda: os.getenv("PGCOPYDB_TARGET_PGURI"),
@@ -434,15 +434,15 @@ def copy_shard(source_pguri: str, target_pguri: str, snapshot_id: str, filter_fi
               show_default="$FILTER_FILE", help="This shard's filter file (under $PGCYAN_PLAN_DIR).")
 @click.option("--shard-name", default=lambda: os.getenv("SHARD_NAME"),
               show_default="$SHARD_NAME", help="This index shard's name (e.g. idx-0), recorded in the log.")
-def build_indexes(source_pguri: str, target_pguri: str,
+def indexes(source_pguri: str, target_pguri: str,
                   filter_file: str, shard_name: str) -> None:
     """Build one shard's indexes + PK/unique constraints on the target (the indexes step).
 
-    Custom SQL (like build-foreign-keys, not pgcopydb): introspect this shard's
+    Custom SQL (like foreign-keys, not pgcopydb): introspect this shard's
     tables' secondary indexes (pg_get_indexdef) and PK/UNIQUE constraints
     (pg_get_constraintdef) from the source and apply them to the target -- CREATE
     INDEX then ADD CONSTRAINT. The PK/unique piece is deferred here from pre-data.
-    Foreign keys are the separate single pass (``build-foreign-keys``). Writes
+    Foreign keys are the separate single pass (``foreign-keys``). Writes
     ``target-pg-index-log.json`` (per shard) or ``-errors.json``.
     """
     worker = PgCyanPostIndex(
@@ -460,14 +460,14 @@ def build_indexes(source_pguri: str, target_pguri: str,
         sys.exit(2)
 
 
-@cli.command(name="copy-sequences")
+@cli.command(name="sequences")
 @click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
               show_default="$PGCOPYDB_SOURCE_PGURI", help="Source libpq URI (sequence values read from here).")
 @click.option("--target-pguri", default=lambda: os.getenv("PGCOPYDB_TARGET_PGURI"),
               show_default="$PGCOPYDB_TARGET_PGURI", help="Target libpq URI (sequences setval'd here).")
 @click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
               show_default="$PG_OUTPUT_DIR", help="Directory for target-pg-sequences-log[-errors].json.")
-def copy_sequences(source_pguri: str, target_pguri: str, output_dir: str) -> None:
+def sequences(source_pguri: str, target_pguri: str, output_dir: str) -> None:
     """Sync the target's sequences to the source after the copy (the sequences step).
 
     Custom SQL (not pgcopydb): read each source sequence's value and ``setval`` it on
@@ -488,14 +488,14 @@ def copy_sequences(source_pguri: str, target_pguri: str, output_dir: str) -> Non
         sys.exit(2)
 
 
-@cli.command(name="build-foreign-keys")
+@cli.command(name="foreign-keys")
 @click.option("--source-pguri", default=lambda: os.getenv("PGCOPYDB_SOURCE_PGURI"),
               show_default="$PGCOPYDB_SOURCE_PGURI", help="Source libpq URI (introspected for FK defs).")
 @click.option("--target-pguri", default=lambda: os.getenv("PGCOPYDB_TARGET_PGURI"),
               show_default="$PGCOPYDB_TARGET_PGURI", help="Target libpq URI (FKs applied + verified here).")
 @click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR"),
               show_default="$PG_OUTPUT_DIR", help="Directory for target-pg-postload-log[-errors].json.")
-def build_foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) -> None:
+def foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) -> None:
     """Apply the source's foreign keys to the target (the foreign-keys step).
 
     Custom SQL (not pgcopydb): introspect the source's FK definitions and apply

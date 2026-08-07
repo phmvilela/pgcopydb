@@ -12,7 +12,7 @@
 # This runs BEFORE any data shard so every shard finds its target tables already
 # present. It is a hard barrier: no shard may start until this succeeds.
 #
-# MECHANISM: a thin wrapper (`pg_cyan.cli restore-predata`) over pgcopydb.
+# MECHANISM: a thin wrapper (`pg_cyan.cli schema`) over pgcopydb.
 # `pgcopydb restore pre-data` restores from a custom-format dump file
 # in `--dir`, and this pod's `--dir` starts empty, so the wrapper runs two
 # steps: `pgcopydb dump schema --snapshot=<id>` (pinned to the snapshot holder's
@@ -63,7 +63,7 @@ spec:
           # fails and aborts the whole pre-data restore. Extensions on Azure must
           # be pre-provisioned via the `azure.extensions` server parameter, not
           # carried in a schema dump -- so pre-data skips them by design.
-          command: ["python", "-m", "pg_cyan.cli", "restore-predata", "--skip-extensions"]
+          command: ["python", "-m", "pg_cyan.cli", "schema", "--skip-extensions"]
           env:
             # SNAPSHOT_ID is injected at apply time by the controller, which holds
             # the consistent snapshot in-pod and knows the id directly

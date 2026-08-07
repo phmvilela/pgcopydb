@@ -1,5 +1,5 @@
 """
-Unit tests for the pre-data schema transfer (`pg_cyan.cli restore-predata`).
+Unit tests for the pre-data schema transfer (`pg_cyan.cli schema`).
 
 See also: pg_cyan/predata.py
 

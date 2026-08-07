@@ -1,5 +1,5 @@
 """
-Unit tests for the sequence sync (`pg_cyan.cli copy-sequences`).
+Unit tests for the sequence sync (`pg_cyan.cli sequences`).
 
 See also: pg_cyan/sequences.py
 

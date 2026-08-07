@@ -1,5 +1,5 @@
 """
-Unit tests for the post-data FK build (`pg_cyan.cli build-foreign-keys`).
+Unit tests for the post-data FK build (`pg_cyan.cli foreign-keys`).
 
 See also: pg_cyan/postfk.py
 
