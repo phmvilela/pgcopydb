@@ -228,7 +228,7 @@ class PgCyanOrchestrator:
             health_check: Optional ``() -> bool`` the barrier loop calls each poll;
                 returning ``False`` (the controller's snapshot child died) aborts
                 the wait -- a lost snapshot invalidates the in-flight copy.
-            stop_after: Step id (e.g. ``"2"``) to stop after -- the walk applies
+            stop_after: Step id (e.g. ``"copy"``) to stop after -- the walk applies
                 steps through this one (inclusive) and returns success without
                 applying any later step. ``None`` runs the whole DAG. Lets an
                 operator bring the pipeline up to a checkpoint (e.g. through the
