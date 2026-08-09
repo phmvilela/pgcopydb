@@ -43,10 +43,12 @@ SAMPLE_METRICS = {
     "tables": [
         {"schema": "public", "name": "widgets", "relkind": "r",
          "heap_bytes": 600, "heap_pretty": "600 bytes",
-         "index_bytes": 400, "index_pretty": "400 bytes", "row_estimate": 10.0},
+         "index_bytes": 400, "index_pretty": "400 bytes", "row_estimate": 10.0,
+         "dead_tuple_ratio": 0.0, "toast_bytes": 0, "avg_row_width": 60},
         {"schema": "public", "name": "gadgets", "relkind": "r",
          "heap_bytes": 120, "heap_pretty": "120 bytes",
-         "index_bytes": 80, "index_pretty": "80 bytes", "row_estimate": 5.0},
+         "index_bytes": 80, "index_pretty": "80 bytes", "row_estimate": 5.0,
+         "dead_tuple_ratio": 0.5, "toast_bytes": 40, "avg_row_width": 24},
     ],
     "table_totals": {"heap_bytes": 720, "index_bytes": 480, "total_bytes": 1200},
 }

@@ -74,6 +74,16 @@ _OBJECT_COUNTS_QUERY = """
 # work (the post-data steps) by index bytes, so a single conflated size makes both splits
 # wrong. ``pg_table_size`` (heap + TOAST + FSM/VM) plus ``pg_indexes_size`` sum
 # to the ``pg_total_relation_size`` figure.
+#
+# The planner's cost model estimates copy *time*, which needs more than raw
+# bytes, so each row also carries (see also: pg_cyan/cost_model.py):
+#   * ``row_estimate``     -- ``reltuples`` (bounds narrow, high-row tables);
+#   * ``dead_tuple_ratio`` -- ``n_dead_tup / (n_live+n_dead)`` from the stats
+#     collector, so a bloated heap is not mistaken for copy volume;
+#   * ``toast_bytes``      -- the TOAST relation's size (a subset of heap_bytes),
+#     so detoast-heavy tables can be surcharged;
+#   * ``avg_row_width``    -- summed ``pg_stats.avg_width``.
+# All are optional to the planner and degrade gracefully when NULL/absent.
 _TABLE_SIZES_QUERY = """
     SELECT
         n.nspname AS schema,
@@ -83,9 +93,20 @@ _TABLE_SIZES_QUERY = """
         pg_size_pretty(pg_table_size(c.oid)) AS heap_pretty,
         pg_indexes_size(c.oid) AS index_bytes,
         pg_size_pretty(pg_indexes_size(c.oid)) AS index_pretty,
-        c.reltuples AS row_estimate
+        c.reltuples AS row_estimate,
+        CASE
+            WHEN (COALESCE(st.n_live_tup, 0) + COALESCE(st.n_dead_tup, 0)) > 0
+            THEN COALESCE(st.n_dead_tup, 0)::float8
+                 / (COALESCE(st.n_live_tup, 0) + COALESCE(st.n_dead_tup, 0))
+            ELSE 0.0
+        END AS dead_tuple_ratio,
+        CASE WHEN c.reltoastrelid <> 0
+             THEN pg_total_relation_size(c.reltoastrelid) ELSE 0 END AS toast_bytes,
+        (SELECT COALESCE(sum(s.avg_width), 0) FROM pg_stats s
+         WHERE s.schemaname = n.nspname AND s.tablename = c.relname) AS avg_row_width
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_stat_all_tables st ON st.relid = c.oid
     WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN %(schemas)s
     ORDER BY pg_table_size(c.oid) DESC, pg_indexes_size(c.oid) DESC;
 """

@@ -10,16 +10,24 @@ connects to a database; it only reads the JSON already produced by the
 pre-migration stages.
 
 Inputs (read from ``--inputs-dir`` / ``$PG_INPUTS_DIR``):
-  * ``source-pg-metrics.json``      -- per-table heap/index bytes; required.
+  * ``source-pg-metrics.json``      -- per-table heap/index bytes plus the cost
+    inputs (``row_estimate``, ``dead_tuple_ratio``, ``toast_bytes``); required.
+    The extra cost fields are optional per row and degrade gracefully.
   * ``source-pg-largeobjects.json`` -- large-object count; required for the abort gate.
   * ``pg-source-parameters.json``   -- instance parameters; optional.
   * ``constraints.json``            -- operator-supplied ceilings/overrides; optional.
 
 Responsibilities (this ticket, per the resolved scope):
-  * **Bin-pack** tables into N disjoint shards by **heap bytes** (LPT greedy) so
-    the copy step's COPY is balanced. Disjoint ``include-only-table`` lists are the whole
-    safety basis of the shared-nothing shards -- no table appears in two shards,
-    enforced and re-validated before anything is written.
+  * **Bin-pack** tables into N disjoint shards by **estimated copy time** (LPT
+    greedy) so the copy step's COPY is balanced by wall-clock, not raw bytes.
+    The per-table weight is ``cost_model.CostModel.estimate_seconds`` -- roughly
+    ``max(live_bytes / per_stream_bw, rows / per_stream_rows)`` with
+    ``live_bytes ~= heap_bytes * (1 - dead_tuple_ratio)`` (see also
+    ``pg_cyan/cost_model.py``). When the extended metrics fields are absent the
+    cost collapses to ``heap_bytes`` and the assignment matches plain heap-bytes
+    packing. Disjoint ``include-only-table`` lists are the whole safety basis of
+    the shared-nothing shards -- no table appears in two shards, enforced and
+    re-validated before anything is written.
   * **LOB abort gate:** if the source has any large objects (``lob_count > 0``),
     exit non-zero with a clear message and write *no plan* -- pgcopydb pgoutput
     CDC does not replicate large objects (see
@@ -34,7 +42,8 @@ Deferred to follow-up work:
     oversized table stays whole on its own shard and carries
     ``split_tables_larger_than`` so pgcopydb splits it *within* its job.
   * Shard count is fixed at 4 (clamped down when fewer tables exist); smarter
-    cost/budget-driven sizing is deferred.
+    capacity/budget-driven sizing is deferred. The cost model reweights the LPT
+    packer only -- it does not change how many shards are produced.
 
 Follows the ``PgCyanParameters`` / ``PgCyanMetrics`` orchestrator pattern (see
 ``CLAUDE.md``): structured JSON logging via ``_log_event`` and graceful
@@ -49,6 +58,8 @@ import os
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional
+
+from pg_cyan import cost_model
 
 # Structured JSON logging (mirrors the other stages).
 logging.basicConfig(
@@ -102,6 +113,7 @@ class PgCyanPlanner:
         publication_name: str = DEFAULT_PUBLICATION,
         slot_name: str = DEFAULT_SLOT,
         run_id: Optional[str] = None,
+        cost_model_: Optional[cost_model.CostModel] = None,
     ):
         """
         Initialize the planner.
@@ -115,10 +127,13 @@ class PgCyanPlanner:
             publication_name: Logical-replication publication name for downstream steps.
             slot_name: Replication slot name for downstream steps.
             run_id: Opaque run identifier; generated from the clock if omitted.
+            cost_model_: Time-based per-table cost model used to weight the
+                bin-packer; defaults to ``cost_model.DEFAULT``.
         """
         self.inputs_dir = inputs_dir
         self.output_dir = output_dir
         self.shards = shards
+        self.cost_model = cost_model_ or cost_model.DEFAULT
         self.split_tables_larger_than = split_tables_larger_than
         self.snapshot_mode = snapshot_mode
         self.publication_name = publication_name
@@ -237,19 +252,28 @@ class PgCyanPlanner:
     def _heap_bytes(table: Dict) -> int:
         return int(table.get("heap_bytes") or 0)
 
+    def _cost(self, table: Dict) -> float:
+        """Estimated single-stream copy time (s) -- the bin-packing weight."""
+        return self.cost_model.estimate_seconds(table)
+
     def bin_pack(self, tables: List[Dict], n: int) -> List[List[Dict]]:
         """
-        LPT-greedy bin-pack ``tables`` into ``n`` shards balanced by heap bytes.
+        LPT-greedy bin-pack ``tables`` into ``n`` shards balanced by copy time.
 
-        Largest table first, each assigned to the currently-lightest shard. Every
-        table lands in exactly one shard, so the shards partition the table set.
+        The weight is each table's estimated single-stream copy time
+        (``cost_model``), not raw heap bytes -- a bloated or narrow-hot table no
+        longer distorts the balance. Costliest table first, each assigned to the
+        currently-lightest shard. Every table lands in exactly one shard, so the
+        shards partition the table set. When the extended metrics fields are
+        absent the cost is proportional to ``heap_bytes``, so the packing matches
+        plain heap-bytes balancing.
         """
         shards: List[List[Dict]] = [[] for _ in range(n)]
-        loads = [0] * n
-        for table in sorted(tables, key=self._heap_bytes, reverse=True):
+        loads = [0.0] * n
+        for table in sorted(tables, key=self._cost, reverse=True):
             lightest = loads.index(min(loads))
             shards[lightest].append(table)
-            loads[lightest] += self._heap_bytes(table)
+            loads[lightest] += self._cost(table)
         return shards
 
     def _validate_disjoint(self, shards: List[List[Dict]], tables: List[Dict]) -> bool:
@@ -306,12 +330,17 @@ class PgCyanPlanner:
             filter_file = f"shard-{i}.filters"
             heap_bytes = sum(self._heap_bytes(t) for t in shard_tables)
             index_bytes = sum(int(t.get("index_bytes") or 0) for t in shard_tables)
+            est_copy_seconds = sum(self._cost(t) for t in shard_tables)
             data_shards.append({
                 "name": f"shard-{i}",
                 "filter_file": filter_file,
                 "table_count": len(shard_tables),
                 "heap_bytes": heap_bytes,
                 "index_bytes": index_bytes,
+                # Estimated serial single-stream copy time for this shard's
+                # tables -- the balancing weight, not a makespan prediction
+                # (that needs the concurrency budget, which is not modelled yet).
+                "est_copy_seconds": round(est_copy_seconds, 2),
                 "table_jobs": max(1, min(len(shard_tables), self.DEFAULT_TABLE_JOBS)),
                 "split_tables_larger_than": self.split_tables_larger_than,
                 "resources": dict(self.DEFAULT_SHARD_RESOURCES),
@@ -324,6 +353,7 @@ class PgCyanPlanner:
 
         total_heap = sum(s["heap_bytes"] for s in data_shards)
         total_index = sum(s["index_bytes"] for s in data_shards)
+        total_cost = sum(s["est_copy_seconds"] for s in data_shards)
         return {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "component": "planner",
@@ -337,6 +367,20 @@ class PgCyanPlanner:
                 "shard_count": len(data_shards),
                 "heap_bytes": total_heap,
                 "index_bytes": total_index,
+                "est_copy_seconds": round(total_cost, 2),
+            },
+            "cost_model": {
+                "weight": "estimated_copy_seconds",
+                "constants": self.cost_model.as_dict(),
+                "note": (
+                    "Shards balanced by estimated single-stream copy time: "
+                    "t(table) = max(live_bytes/per_stream_bytes_per_sec, "
+                    "rows/per_stream_rows_per_sec), live_bytes = "
+                    "heap_bytes*(1-dead_tuple_ratio). Constants are calibratable; "
+                    "when the extended metrics fields are absent the weight "
+                    "degrades to heap_bytes. Concurrency budget and makespan "
+                    "prediction are not modelled yet."
+                ),
             },
             "data_shards": data_shards,
             "index_shards": index_shards,
@@ -350,7 +394,7 @@ class PgCyanPlanner:
                 ),
             },
             "notes": (
-                "Shards bin-packed by heap bytes (LPT). Oversized single tables "
+                "Shards bin-packed by estimated copy time (LPT). Oversized single tables "
                 "are kept whole and split within their job via "
                 "split_tables_larger_than; cross-shard range-splitting is out of "
                 "scope. Index/FK compute runs target-side, so index/fk pods are "

@@ -159,7 +159,10 @@ python -m pg_cyan.cli plan --inputs-dir ./artifacts --output-dir ./plan
 reads the artifacts already produced by the pre-migration stages from
 `--inputs-dir` (`source-pg-metrics.json` and `source-pg-largeobjects.json`
 required; `pg-source-parameters.json` / `constraints.json` optional), LPT
-bin-packs the tables into disjoint copy shards balanced by **heap bytes**, and
+bin-packs the tables into disjoint copy shards balanced by **estimated copy
+time** (`t(table) ≈ max(live_bytes/per_stream_bw, rows/per_stream_rows)`;
+degrades to heap bytes when the extended metrics are absent — see
+`pg_cyan/cost_model.py`), and
 writes `plan.json` plus one `shard-<n>.filters` per shard (pgcopydb `--filters`
 format with a disjoint `[include-only-table]` list). This is the `plan` step
 node in `deploy/k8s/`.

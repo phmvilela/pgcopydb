@@ -44,6 +44,8 @@ _TABLE_FIELDS = (
     "schema", "name", "relkind",
     "heap_bytes", "heap_pretty", "index_bytes", "index_pretty",
     "row_estimate",
+    # Cost-model inputs consumed by the planner. See also: pg_cyan/cost_model.py
+    "dead_tuple_ratio", "toast_bytes", "avg_row_width",
 )
 _TABLE_TOTALS_FIELDS = ("heap_bytes", "index_bytes", "total_bytes")
 

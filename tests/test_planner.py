@@ -13,16 +13,43 @@ import json
 
 import pytest
 
+from pg_cyan.cost_model import CostModel
 from pg_cyan.planner import PgCyanPlanner
 
 
-def _table(schema, name, heap_bytes, index_bytes=0):
+def _table(schema, name, heap_bytes, index_bytes=0, **cost_fields):
     return {
         "schema": schema, "name": name, "relkind": "r",
         "heap_bytes": heap_bytes, "heap_pretty": f"{heap_bytes} bytes",
         "index_bytes": index_bytes, "index_pretty": f"{index_bytes} bytes",
         "row_estimate": 0.0,
+        **cost_fields,
     }
+
+
+def _heap_lpt(tables, n):
+    """Baseline: plain heap-bytes LPT packing, for comparison."""
+    shards = [[] for _ in range(n)]
+    loads = [0] * n
+    for t in sorted(tables, key=lambda x: x["heap_bytes"], reverse=True):
+        i = loads.index(min(loads))
+        shards[i].append(t)
+        loads[i] += t["heap_bytes"]
+    return shards
+
+
+def _keys(shards):
+    """Normalize a packing to a comparable set of per-shard key sets."""
+    return sorted(
+        tuple(sorted(f'{t["schema"]}.{t["name"]}' for t in shard))
+        for shard in shards
+    )
+
+
+def _cost_imbalance(shards, model):
+    """Max-min of per-shard total copy time under ``model``."""
+    loads = [sum(model.estimate_seconds(t) for t in shard) for shard in shards]
+    return max(loads) - min(loads)
 
 
 SAMPLE_TABLES = [
@@ -78,6 +105,48 @@ def test_bin_pack_balances_heap_bytes():
     # LPT keeps the two shards within the largest single table of each other.
     assert abs(loads[0] - loads[1]) <= max(planner._heap_bytes(t) for t in SAMPLE_TABLES)
     assert sum(loads) == sum(planner._heap_bytes(t) for t in SAMPLE_TABLES)
+
+
+# ------------------------------------------------------ time-based cost weight
+
+def test_cost_packing_beats_heap_packing_on_a_skewed_schema():
+    # A bloated table (huge heap, mostly dead tuples) plus three tight tables.
+    # Heap-bytes LPT isolates the bloated table on its own shard and crams the
+    # rest together, leaving the shards badly imbalanced by *copy time*; the
+    # time-based weight sees through the bloat and balances the real work.
+    model = CostModel(per_stream_bytes_per_sec=1000.0, per_stream_rows_per_sec=1000.0)
+    tables = [
+        _table("public", "bloated", 10_000, dead_tuple_ratio=0.9),  # ~1000 live
+        _table("public", "a", 1_000),
+        _table("public", "b", 1_000),
+        _table("public", "c", 1_000),
+    ]
+    planner = PgCyanPlanner(cost_model_=model)
+
+    cost_shards = planner.bin_pack(tables, 2)
+    heap_shards = _heap_lpt(tables, 2)
+
+    assert _cost_imbalance(cost_shards, model) < _cost_imbalance(heap_shards, model)
+    # The bloated table no longer gets a shard to itself.
+    assert _keys(cost_shards) != _keys(heap_shards)
+
+
+def test_narrow_hot_table_is_not_undercosted():
+    # A tiny-heap, billion-row table would look free to a byte packer; the
+    # rows term must make it the costliest object so it isn't buried.
+    model = CostModel(per_stream_bytes_per_sec=1000.0, per_stream_rows_per_sec=1000.0)
+    planner = PgCyanPlanner(cost_model_=model)
+    hot = _table("public", "events", 100, row_estimate=1_000_000)
+    fat = _table("public", "archive", 5_000)
+    assert planner._cost(hot) > planner._cost(fat)
+
+
+def test_cost_packing_matches_heap_packing_without_extended_fields(tmp_path):
+    # With only heap_bytes present (no dead ratio / rows), the cost is a constant
+    # rescaling of heap bytes, so the assignment is identical to plain heap-bytes
+    # packing -- the graceful-degradation guarantee.
+    planner = PgCyanPlanner()
+    assert _keys(planner.bin_pack(SAMPLE_TABLES, 3)) == _keys(_heap_lpt(SAMPLE_TABLES, 3))
 
 
 def test_validate_disjoint_rejects_overlap():
@@ -154,6 +223,23 @@ def test_plan_writes_plan_and_disjoint_filters(tmp_path):
         all_listed.extend(listed)
     assert len(all_listed) == len(set(all_listed))  # disjoint
     assert set(all_listed) == {f'{t["schema"]}.{t["name"]}' for t in SAMPLE_TABLES}
+
+
+def test_plan_records_cost_model_and_per_shard_seconds(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, lob_count=0)
+
+    planner = make_planner(inputs, output, shards=2)
+    assert planner.plan()["status"] == "success"
+
+    plan = json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+    assert plan["cost_model"]["weight"] == "estimated_copy_seconds"
+    assert plan["cost_model"]["constants"]["per_stream_bytes_per_sec"] > 0
+    # Every shard carries its estimated copy time, and they sum to the total.
+    per_shard = [s["est_copy_seconds"] for s in plan["data_shards"]]
+    assert all(s >= 0 for s in per_shard)
+    assert plan["totals"]["est_copy_seconds"] == pytest.approx(sum(per_shard))
 
 
 def test_plan_frozen_source_sets_not_consistent(tmp_path):
