@@ -46,6 +46,8 @@ _TABLE_FIELDS = (
     "row_estimate",
     # Cost-model inputs consumed by the planner. See also: pg_cyan/cost_model.py
     "dead_tuple_ratio", "toast_bytes", "avg_row_width",
+    # Split eligibility. See also: pg_cyan/splitting.py
+    "splittable_key",
 )
 _TABLE_TOTALS_FIELDS = ("heap_bytes", "index_bytes", "total_bytes")
 

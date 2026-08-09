@@ -90,6 +90,9 @@ class Budget:
         shard_count: Number of copy shards to produce.
         table_jobs: pgcopydb ``--table-jobs`` per shard (``shard_count * table_jobs``
             approximates ``c_star``).
+        max_table_jobs: Per-shard job ceiling -- the most COPY workers one shard
+            may run, so the most parallelism a single table can get from
+            within-shard splitting. See also: pg_cyan/splitting.py.
         terms: Every computable ceiling term, for explainability.
         clamps: Human-readable constraints that tightened the result.
         degraded: True when there was no capacity data and defaults were kept.
@@ -100,6 +103,7 @@ class Budget:
     per_stream_bytes_per_sec: float
     shard_count: int
     table_jobs: int
+    max_table_jobs: int
     terms: Dict[str, float] = field(default_factory=dict)
     clamps: List[str] = field(default_factory=list)
     degraded: bool = False
@@ -249,6 +253,7 @@ def compute_budget(
             per_stream_bytes_per_sec=per_stream,
             shard_count=shard_count,
             table_jobs=fallback_table_jobs,
+            max_table_jobs=fallback_table_jobs,
             terms={},
             clamps=[],
             degraded=True,
@@ -265,7 +270,7 @@ def compute_budget(
         clamps.append(f"max_concurrency={int(max_conc)}")
 
     c_star = max(1, int(c_star))
-    shard_count, table_jobs = _shape_shards(
+    shard_count, table_jobs, max_table_jobs = _shape_shards(
         c_star, constraints, cluster_capacity, table_count, fallback_table_jobs, clamps,
     )
 
@@ -275,6 +280,7 @@ def compute_budget(
         per_stream_bytes_per_sec=per_stream,
         shard_count=shard_count,
         table_jobs=table_jobs,
+        max_table_jobs=max_table_jobs,
         terms=terms,
         clamps=clamps,
         degraded=False,
@@ -329,4 +335,4 @@ def _shape_shards(
     shard_count = max(1, shard_count)
     # Refill jobs per shard from the final count, capped at the per-pod ceiling.
     table_jobs = min(max_tj, max(1, -(-c_star // shard_count)))  # ceil(c_star / shard_count)
-    return shard_count, table_jobs
+    return shard_count, table_jobs, max_tj

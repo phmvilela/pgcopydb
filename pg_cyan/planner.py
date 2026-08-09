@@ -36,19 +36,26 @@ Responsibilities (this ticket, per the resolved scope):
     CDC does not replicate large objects (see
     ``notes/PostgreSQL Logical Replication Limitations & Workarounds for LOBs.md``).
   * Record ``snapshot.mode``, publication name, and slot name for downstream steps.
-
-Deferred to follow-up work:
-  * **FK graph** is emitted as ``"status": "deferred"`` -- FK edges are not yet
-    collected by any artifact, and foreign-keys applies all constraints in one
-    non-sharded pass regardless. Real FK collection is a follow-up.
-  * **Range-splitting a single oversized table across shards** is out of scope: an
-    oversized table stays whole on its own shard and carries
-    ``split_tables_larger_than`` so pgcopydb splits it *within* its job.
   * **Concurrency budget:** when capacity artifacts are present, derive the
     parallel-stream budget ``C*`` and from it ``shard_count`` + per-shard
     ``table_jobs`` (see ``pg_cyan/capacity.py``); the per-stream throughput it
     finds also calibrates the copy-time cost model. With no capacity data the
     shard count falls back to ``shards`` (default 4, clamped to the table count).
+  * **Adaptive splitting:** a table whose estimated copy time exceeds the ideal
+    per-stream share (``total_cost / C*``) is marked for within-shard range
+    splitting -- the shard's ``table_jobs`` and ``split_tables_larger_than`` are
+    set so pgcopydb carves it into parallel ctid ranges. An un-splittable giant
+    stays whole and is reported as the ``single-table`` bottleneck (see
+    ``pg_cyan/splitting.py``).
+
+Deferred to follow-up work:
+  * **FK graph** is emitted as ``"status": "deferred"`` -- FK edges are not yet
+    collected by any artifact, and foreign-keys applies all constraints in one
+    non-sharded pass regardless. Real FK collection is a follow-up.
+  * **Cross-shard range-splitting** (the same table's rows spread over several
+    shards) needs per-range row filters the ``--filters`` format cannot express;
+    splitting stays *within* a shard's job. Emitting explicit range boundaries
+    (vs. the size threshold pgcopydb splits on) is likewise deferred.
 
 Follows the ``PgCyanParameters`` / ``PgCyanMetrics`` orchestrator pattern (see
 ``CLAUDE.md``): structured JSON logging via ``_log_event`` and graceful
@@ -65,7 +72,7 @@ import sys
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from pg_cyan import capacity, cost_model
+from pg_cyan import capacity, cost_model, splitting
 
 # Structured JSON logging (mirrors the other stages).
 logging.basicConfig(
@@ -332,9 +339,41 @@ class PgCyanPlanner:
         lines.extend(sorted(self._table_key(t) for t in shard_tables))
         return "\n".join(lines) + "\n"
 
-    def build_plan(self, shards: List[List[Dict]], budget: capacity.Budget) -> Dict:
+    def _apply_splits(
+        self, shard_tables: List[Dict], subtasks_by_table: Dict[str, int],
+        table_jobs: int, max_table_jobs: int,
+    ) -> tuple:
+        """
+        Refine a shard's ``table_jobs`` + split threshold for its split tables.
+
+        For shards holding a table the planner decided to split, raise
+        ``table_jobs`` enough to run its ranges in parallel and lower
+        ``split_tables_larger_than`` below the split tables so pgcopydb carves
+        them. Shards with no split table keep the configured defaults. See also:
+        pg_cyan/splitting.py.
+        """
+        subtasks = [subtasks_by_table[k]
+                    for t in shard_tables
+                    if (k := self._table_key(t)) in subtasks_by_table]
+        if not subtasks:
+            return table_jobs, self.split_tables_larger_than
+
+        jobs = min(max_table_jobs, max(table_jobs, max(subtasks)))
+        # Size-triggered ctid split needs the threshold below the split tables.
+        # Only positive heaps can be size-split; a zero-heap (row-bound) table
+        # keeps the default -- pgcopydb cannot size-split it.
+        heaps = [self._heap_bytes(t) for t in shard_tables
+                 if self._table_key(t) in subtasks_by_table and self._heap_bytes(t) > 0]
+        threshold = max(1, int(min(heaps) * 0.9)) if heaps else self.split_tables_larger_than
+        return jobs, threshold
+
+    def build_plan(
+        self, shards: List[List[Dict]], budget: capacity.Budget,
+        split_plan: splitting.SplitPlan,
+    ) -> Dict:
         """Assemble the ``plan.json`` payload from the bin-packed shards."""
         not_consistent = self.snapshot_mode != self.DEFAULT_SNAPSHOT_MODE
+        subtasks_by_table = split_plan.subtasks_by_table()
 
         data_shards = []
         index_shards = []
@@ -349,6 +388,8 @@ class PgCyanPlanner:
                 table_jobs = max(1, min(len(shard_tables), self.DEFAULT_TABLE_JOBS))
             else:
                 table_jobs = budget.table_jobs
+            table_jobs, split_threshold = self._apply_splits(
+                shard_tables, subtasks_by_table, table_jobs, budget.max_table_jobs)
             data_shards.append({
                 "name": f"shard-{i}",
                 "filter_file": filter_file,
@@ -356,11 +397,11 @@ class PgCyanPlanner:
                 "heap_bytes": heap_bytes,
                 "index_bytes": index_bytes,
                 # Estimated serial single-stream copy time for this shard's
-                # tables -- the balancing weight, not a makespan prediction
-                # (that needs the concurrency budget, which is not modelled yet).
+                # tables -- the balancing weight, not this shard's makespan
+                # (splitting + concurrency shorten the wall-clock; see splitting).
                 "est_copy_seconds": round(est_copy_seconds, 2),
                 "table_jobs": table_jobs,
-                "split_tables_larger_than": self.split_tables_larger_than,
+                "split_tables_larger_than": split_threshold,
                 "resources": dict(self.DEFAULT_SHARD_RESOURCES),
             })
             index_shards.append({
@@ -372,6 +413,14 @@ class PgCyanPlanner:
         total_heap = sum(s["heap_bytes"] for s in data_shards)
         total_index = sum(s["index_bytes"] for s in data_shards)
         total_cost = sum(s["est_copy_seconds"] for s in data_shards)
+        # An indivisible giant that floors the makespan is the bottleneck the
+        # operator must act on; otherwise it is whatever bound the stream budget.
+        if split_plan.single_table_floor:
+            bottleneck = "single-table"
+        elif budget.degraded:
+            bottleneck = "none"
+        else:
+            bottleneck = budget.binding_term
         return {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "component": "planner",
@@ -388,6 +437,8 @@ class PgCyanPlanner:
                 "est_copy_seconds": round(total_cost, 2),
             },
             "concurrency": budget.as_plan_block(),
+            "splitting": split_plan.as_plan_block(),
+            "bottleneck": bottleneck,
             "cost_model": {
                 "weight": "estimated_copy_seconds",
                 "constants": self.cost_model.as_dict(),
@@ -413,11 +464,12 @@ class PgCyanPlanner:
                 ),
             },
             "notes": (
-                "Shards bin-packed by estimated copy time (LPT). Oversized single tables "
-                "are kept whole and split within their job via "
-                "split_tables_larger_than; cross-shard range-splitting is out of "
-                "scope. Index/FK compute runs target-side, so index/fk pods are "
-                "thin -- scale target index_jobs + maintenance_work_mem instead."
+                "Shards bin-packed by estimated copy time (LPT). A table costlier "
+                "than the ideal per-stream share is split within its shard's job "
+                "via split_tables_larger_than (see splitting); cross-shard "
+                "range-splitting is out of scope. Index/FK compute runs "
+                "target-side, so index/fk pods are thin -- scale target "
+                "index_jobs + maintenance_work_mem instead."
             ),
         }
 
@@ -540,9 +592,16 @@ class PgCyanPlanner:
                         self.errors.append("No tables to plan")
                     else:
                         budget = self._resolve_budget(capacity_inputs, len(tables))
+                        split_plan = splitting.plan_splits(
+                            tables,
+                            c_star=budget.c_star,
+                            max_table_jobs=budget.max_table_jobs,
+                            cost_model=self.cost_model,
+                        )
                         shards = self.bin_pack(tables, budget.shard_count)
                         if self._validate_disjoint(shards, tables):
-                            ok = self._write_plan_files(shards, summary, len(tables), budget)
+                            ok = self._write_plan_files(
+                                shards, summary, len(tables), budget, split_plan)
                             if ok:
                                 return summary
         except Exception as e:
@@ -568,10 +627,11 @@ class PgCyanPlanner:
 
     def _write_plan_files(
         self, shards: List[List[Dict]], summary: Dict, table_count: int,
-        budget: capacity.Budget,
+        budget: capacity.Budget, split_plan: splitting.SplitPlan,
     ) -> bool:
         """Write plan.json + every shard-<n>.filters; update ``summary`` in place."""
-        plan_path = self._write_json(self.OUTPUT_FILENAME, self.build_plan(shards, budget))
+        plan_path = self._write_json(
+            self.OUTPUT_FILENAME, self.build_plan(shards, budget, split_plan))
         if not plan_path:
             return False
 

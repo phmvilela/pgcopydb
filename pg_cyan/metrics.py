@@ -82,7 +82,11 @@ _OBJECT_COUNTS_QUERY = """
 #     collector, so a bloated heap is not mistaken for copy volume;
 #   * ``toast_bytes``      -- the TOAST relation's size (a subset of heap_bytes),
 #     so detoast-heavy tables can be surcharged;
-#   * ``avg_row_width``    -- summed ``pg_stats.avg_width``.
+#   * ``avg_row_width``    -- summed ``pg_stats.avg_width``;
+#   * ``splittable_key``   -- a single-column integer PK column name if one
+#     exists, else ``ctid`` for an ordinary heap table, else ``none`` -- tells the
+#     planner whether an oversized table can be range-split. See also:
+#     pg_cyan/splitting.py.
 # All are optional to the planner and degrade gracefully when NULL/absent.
 _TABLE_SIZES_QUERY = """
     SELECT
@@ -103,7 +107,17 @@ _TABLE_SIZES_QUERY = """
         CASE WHEN c.reltoastrelid <> 0
              THEN pg_total_relation_size(c.reltoastrelid) ELSE 0 END AS toast_bytes,
         (SELECT COALESCE(sum(s.avg_width), 0) FROM pg_stats s
-         WHERE s.schemaname = n.nspname AND s.tablename = c.relname) AS avg_row_width
+         WHERE s.schemaname = n.nspname AND s.tablename = c.relname) AS avg_row_width,
+        COALESCE(
+            (SELECT a.attname
+               FROM pg_index i
+               JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+               JOIN pg_type ty ON ty.oid = a.atttypid
+              WHERE i.indrelid = c.oid AND i.indisprimary AND i.indnkeyatts = 1
+                AND ty.typname IN ('int2', 'int4', 'int8')
+              LIMIT 1),
+            CASE WHEN c.relkind = 'r' THEN 'ctid' ELSE 'none' END
+        ) AS splittable_key
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     LEFT JOIN pg_stat_all_tables st ON st.relid = c.oid

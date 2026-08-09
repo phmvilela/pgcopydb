@@ -272,6 +272,76 @@ def test_plan_without_capacity_degrades_to_static_shards(tmp_path):
     assert conc["binding_term"] == "none"
     # Static fallback: the requested shard count (clamped to the table set).
     assert plan["totals"]["shard_count"] == 4
+    # No budget -> no cost-driven splitting, and no meaningful bottleneck.
+    assert plan["splitting"]["enabled"] is False
+    assert plan["bottleneck"] == "none"
+
+
+def _skewed_tables(giant_key="id"):
+    gib = 1024 ** 3
+    return [
+        _table("public", "big", 100 * gib, splittable_key=giant_key),
+        _table("public", "a", 1 * gib, splittable_key="id"),
+        _table("public", "b", 1 * gib, splittable_key="id"),
+        _table("public", "c", 1 * gib, splittable_key="id"),
+    ]
+
+
+def _split_capacity(inputs):
+    _write_capacity(
+        inputs,
+        source_capacity={"max_connections": 16, "current_connections": 0},
+        network={"bandwidth_bytes_per_sec": 10 ** 12,
+                 "per_stream_bytes_per_sec": 100 * 1024 * 1024},
+        constraints={"max_table_jobs_per_shard": 8},
+    )
+
+
+def test_plan_splits_a_dominant_table_and_lowers_makespan(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, tables=_skewed_tables(), lob_count=0)
+    _split_capacity(inputs)
+
+    planner = make_planner(inputs, output)
+    assert planner.plan()["status"] == "success"
+
+    plan = json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+    sp = plan["splitting"]
+    assert sp["enabled"] is True
+    big = next(s for s in sp["splits"] if s["table"] == "public.big")
+    assert big["subtasks"] >= 2 and big["reason"] == "split"
+    # Splitting the dominant table shortens the predicted makespan.
+    assert sp["predicted_makespan_seconds"] < sp["makespan_without_splitting_seconds"]
+    # Not a single-table floor -> the bottleneck is the stream budget's binding term.
+    assert plan["bottleneck"] == "source_connections"
+    # The shard holding the split table carries a byte (int) split threshold.
+    assert any(isinstance(s["split_tables_larger_than"], int) for s in plan["data_shards"])
+
+    # Disjointness invariant still holds over the split plan.
+    listed = []
+    for i in range(plan["totals"]["shard_count"]):
+        body = (output / f"shard-{i}.filters").read_text()
+        listed.extend(ln for ln in body.splitlines()[1:] if ln)
+    assert len(listed) == len(set(listed))
+    assert set(listed) == {f'{t["schema"]}.{t["name"]}' for t in _skewed_tables()}
+
+
+def test_plan_flags_unsplittable_giant_as_single_table_bottleneck(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, tables=_skewed_tables(giant_key="none"), lob_count=0)
+    _split_capacity(inputs)
+
+    planner = make_planner(inputs, output)
+    assert planner.plan()["status"] == "success"
+
+    plan = json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+    assert plan["bottleneck"] == "single-table"
+    assert plan["splitting"]["single_table_floor"] is True
+    giant = next(s for s in plan["splitting"]["splits"] if s["table"] == "public.big")
+    assert giant["reason"] == "unsplittable_giant"
+    assert giant["subtasks"] == 1
 
 
 def test_plan_uses_capacity_budget_for_shard_shape(tmp_path):
