@@ -158,7 +158,9 @@ python -m pg_cyan.cli plan --inputs-dir ./artifacts --output-dir ./plan
 `plan` is a **pure offline transform** — it opens no database connection. It
 reads the artifacts already produced by the pre-migration stages from
 `--inputs-dir` (`source-pg-metrics.json` and `source-pg-largeobjects.json`
-required; `pg-source-parameters.json` / `constraints.json` optional), LPT
+required; `pg-source-parameters.json` / `constraints.json` and the
+`source-capacity.json` / `target-capacity.json` / `network.json` /
+`cluster-capacity.json` capacity artifacts optional), LPT
 bin-packs the tables into disjoint copy shards balanced by **estimated copy
 time** (`t(table) ≈ max(live_bytes/per_stream_bw, rows/per_stream_rows)`;
 degrades to heap bytes when the extended metrics are absent — see
@@ -170,9 +172,12 @@ node in `deploy/k8s/`.
 Before packing anything it runs a **large-object abort gate**: if the source
 has any large objects (`lob_count > 0`), it exits non-zero, writes no plan, and
 records why — pgcopydb's logical-replication CDC does not replicate large
-objects. Shard count is fixed at 4 for now (clamped to the table count);
-FK-graph collection and cross-shard range-splitting of an oversized table are
-deferred follow-ups.
+objects. When the capacity artifacts are present it derives the parallel-stream
+budget `C*` and from it the shard count and per-shard `table_jobs`
+(`min` of the source/target/network/cluster ceilings, clamped by
+`constraints.json`; see `pg_cyan/capacity.py`); with no capacity data the shard
+count falls back to 4 (clamped to the table count). FK-graph collection and
+cross-shard range-splitting of an oversized table are deferred follow-ups.
 
 | Outcome | File(s) written                                | Exit |
 |---------|------------------------------------------------|------|

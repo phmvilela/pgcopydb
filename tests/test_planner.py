@@ -77,6 +77,19 @@ def _write_inputs(inputs_dir, tables=SAMPLE_TABLES, lob_count=0,
         }))
 
 
+def _write_capacity(inputs_dir, **artifacts):
+    """Write the optional capacity artifacts (name without .json -> dict)."""
+    names = {
+        "constraints": PgCyanPlanner.CONSTRAINTS_FILENAME,
+        "source_capacity": PgCyanPlanner.SOURCE_CAPACITY_FILENAME,
+        "target_capacity": PgCyanPlanner.TARGET_CAPACITY_FILENAME,
+        "network": PgCyanPlanner.NETWORK_FILENAME,
+        "cluster_capacity": PgCyanPlanner.CLUSTER_CAPACITY_FILENAME,
+    }
+    for key, payload in artifacts.items():
+        (inputs_dir / names[key]).write_text(json.dumps(payload))
+
+
 def make_planner(inputs_dir, output_dir, **kwargs):
     return PgCyanPlanner(
         inputs_dir=str(inputs_dir), output_dir=str(output_dir),
@@ -240,6 +253,66 @@ def test_plan_records_cost_model_and_per_shard_seconds(tmp_path):
     per_shard = [s["est_copy_seconds"] for s in plan["data_shards"]]
     assert all(s >= 0 for s in per_shard)
     assert plan["totals"]["est_copy_seconds"] == pytest.approx(sum(per_shard))
+
+
+# ------------------------------------------------------- capacity budget (plan)
+
+def test_plan_without_capacity_degrades_to_static_shards(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, lob_count=0)
+
+    planner = make_planner(inputs, output, shards=4)
+    assert planner.plan()["status"] == "success"
+
+    plan = json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+    conc = plan["concurrency"]
+    assert conc["degraded"] is True
+    assert conc["c_star"] is None
+    assert conc["binding_term"] == "none"
+    # Static fallback: the requested shard count (clamped to the table set).
+    assert plan["totals"]["shard_count"] == 4
+
+
+def test_plan_uses_capacity_budget_for_shard_shape(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, lob_count=0)  # six tables
+    # Source connections cap the budget at C* = 6; two jobs/shard -> 3 shards.
+    _write_capacity(
+        inputs,
+        source_capacity={"max_connections": 6, "current_connections": 0},
+        network={"bandwidth_bytes_per_sec": 10**12, "per_stream_bytes_per_sec": 1024 * 1024},
+        constraints={"max_table_jobs_per_shard": 2},
+    )
+
+    planner = make_planner(inputs, output, shards=4)
+    assert planner.plan()["status"] == "success"
+
+    plan = json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+    conc = plan["concurrency"]
+    assert conc["degraded"] is False
+    assert conc["c_star"] == 6
+    assert conc["binding_term"] == "source_connections"
+    assert plan["totals"]["shard_count"] == 3
+    assert all(s["table_jobs"] == 2 for s in plan["data_shards"])
+
+
+def test_plan_network_probe_calibrates_the_cost_model(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, lob_count=0)
+    measured = 12 * 1024 * 1024
+    _write_capacity(inputs, network={"bandwidth_bytes_per_sec": 10**12,
+                                     "per_stream_bytes_per_sec": measured})
+
+    planner = make_planner(inputs, output)
+    assert planner.plan()["status"] == "success"
+
+    plan = json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+    # The measured single-stream throughput flows into the copy-time weight.
+    assert plan["cost_model"]["constants"]["per_stream_bytes_per_sec"] == measured
+    assert plan["concurrency"]["per_stream_bytes_per_sec"] == measured
 
 
 def test_plan_frozen_source_sets_not_consistent(tmp_path):

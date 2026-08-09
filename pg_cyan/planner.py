@@ -16,6 +16,9 @@ Inputs (read from ``--inputs-dir`` / ``$PG_INPUTS_DIR``):
   * ``source-pg-largeobjects.json`` -- large-object count; required for the abort gate.
   * ``pg-source-parameters.json``   -- instance parameters; optional.
   * ``constraints.json``            -- operator-supplied ceilings/overrides; optional.
+  * ``source-capacity.json`` / ``target-capacity.json`` / ``network.json`` /
+    ``cluster-capacity.json`` -- capacity artifacts sizing the concurrency
+    budget; all optional. See also: pg_cyan/capacity.py.
 
 Responsibilities (this ticket, per the resolved scope):
   * **Bin-pack** tables into N disjoint shards by **estimated copy time** (LPT
@@ -41,9 +44,11 @@ Deferred to follow-up work:
   * **Range-splitting a single oversized table across shards** is out of scope: an
     oversized table stays whole on its own shard and carries
     ``split_tables_larger_than`` so pgcopydb splits it *within* its job.
-  * Shard count is fixed at 4 (clamped down when fewer tables exist); smarter
-    capacity/budget-driven sizing is deferred. The cost model reweights the LPT
-    packer only -- it does not change how many shards are produced.
+  * **Concurrency budget:** when capacity artifacts are present, derive the
+    parallel-stream budget ``C*`` and from it ``shard_count`` + per-shard
+    ``table_jobs`` (see ``pg_cyan/capacity.py``); the per-stream throughput it
+    finds also calibrates the copy-time cost model. With no capacity data the
+    shard count falls back to ``shards`` (default 4, clamped to the table count).
 
 Follows the ``PgCyanParameters`` / ``PgCyanMetrics`` orchestrator pattern (see
 ``CLAUDE.md``): structured JSON logging via ``_log_event`` and graceful
@@ -52,6 +57,7 @@ the shard filter files are written; on any failure (missing/invalid input, LOB
 gate, empty table set, or write error) a ``plan-errors.json`` with an error
 message is written instead and no plan files are produced.
 """
+import dataclasses
 import json
 import logging
 import os
@@ -59,7 +65,7 @@ import sys
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from pg_cyan import cost_model
+from pg_cyan import capacity, cost_model
 
 # Structured JSON logging (mirrors the other stages).
 logging.basicConfig(
@@ -82,6 +88,12 @@ class PgCyanPlanner:
     LOBS_FILENAME = "source-pg-largeobjects.json"
     PARAMETERS_FILENAME = "pg-source-parameters.json"
     CONSTRAINTS_FILENAME = "constraints.json"
+    #: Optional capacity artifacts consumed to size the concurrency budget.
+    #: See also: pg_cyan/capacity.py.
+    SOURCE_CAPACITY_FILENAME = "source-capacity.json"
+    TARGET_CAPACITY_FILENAME = "target-capacity.json"
+    NETWORK_FILENAME = "network.json"
+    CLUSTER_CAPACITY_FILENAME = "cluster-capacity.json"
 
     #: Fixed default; smarter sizing is deferred.
     DEFAULT_SHARDS = 4
@@ -320,7 +332,7 @@ class PgCyanPlanner:
         lines.extend(sorted(self._table_key(t) for t in shard_tables))
         return "\n".join(lines) + "\n"
 
-    def build_plan(self, shards: List[List[Dict]]) -> Dict:
+    def build_plan(self, shards: List[List[Dict]], budget: capacity.Budget) -> Dict:
         """Assemble the ``plan.json`` payload from the bin-packed shards."""
         not_consistent = self.snapshot_mode != self.DEFAULT_SNAPSHOT_MODE
 
@@ -331,6 +343,12 @@ class PgCyanPlanner:
             heap_bytes = sum(self._heap_bytes(t) for t in shard_tables)
             index_bytes = sum(int(t.get("index_bytes") or 0) for t in shard_tables)
             est_copy_seconds = sum(self._cost(t) for t in shard_tables)
+            # A capacity budget sets table_jobs from C*; with no capacity data
+            # keep the static one-worker-per-table (capped) sizing.
+            if budget.degraded:
+                table_jobs = max(1, min(len(shard_tables), self.DEFAULT_TABLE_JOBS))
+            else:
+                table_jobs = budget.table_jobs
             data_shards.append({
                 "name": f"shard-{i}",
                 "filter_file": filter_file,
@@ -341,7 +359,7 @@ class PgCyanPlanner:
                 # tables -- the balancing weight, not a makespan prediction
                 # (that needs the concurrency budget, which is not modelled yet).
                 "est_copy_seconds": round(est_copy_seconds, 2),
-                "table_jobs": max(1, min(len(shard_tables), self.DEFAULT_TABLE_JOBS)),
+                "table_jobs": table_jobs,
                 "split_tables_larger_than": self.split_tables_larger_than,
                 "resources": dict(self.DEFAULT_SHARD_RESOURCES),
             })
@@ -369,6 +387,7 @@ class PgCyanPlanner:
                 "index_bytes": total_index,
                 "est_copy_seconds": round(total_cost, 2),
             },
+            "concurrency": budget.as_plan_block(),
             "cost_model": {
                 "weight": "estimated_copy_seconds",
                 "constants": self.cost_model.as_dict(),
@@ -437,6 +456,38 @@ class PgCyanPlanner:
 
     # ------------------------------------------------------------- orchestrate
 
+    def _resolve_budget(self, capacity_inputs: Dict, table_count: int) -> capacity.Budget:
+        """
+        Compute the concurrency budget and calibrate the cost model from it.
+
+        A network probe gives a real per-stream throughput, so when one is
+        present it replaces the cost model's default -- shard balance and the
+        stream budget then rest on the same number. See also: pg_cyan/capacity.py.
+        """
+        budget = capacity.compute_budget(
+            constraints=capacity_inputs["constraints"],
+            source_capacity=capacity_inputs["source_capacity"],
+            target_capacity=capacity_inputs["target_capacity"],
+            network=capacity_inputs["network"],
+            cluster_capacity=capacity_inputs["cluster_capacity"],
+            table_count=table_count,
+            fallback_shards=self.shards,
+            fallback_table_jobs=self.DEFAULT_TABLE_JOBS,
+        )
+        if capacity_inputs["network"]:
+            self.cost_model = dataclasses.replace(
+                self.cost_model,
+                per_stream_bytes_per_sec=budget.per_stream_bytes_per_sec,
+            )
+        self._log_event(
+            "concurrency_budget",
+            "warning" if budget.degraded else "success",
+            f"C*={budget.c_star} bound by {budget.binding_term}; "
+            f"{budget.shard_count} shard(s) x {budget.table_jobs} table_jobs",
+            budget.as_plan_block(),
+        )
+        return budget
+
     def plan(self) -> Dict:
         """
         Load inputs, run the LOB gate + bin-packer, and write plan/filters.
@@ -465,9 +516,15 @@ class PgCyanPlanner:
         try:
             metrics = self._read_json(self.METRICS_FILENAME, required=True)
             lobs = self._read_json(self.LOBS_FILENAME, required=True)
-            # Optional inputs are read for completeness/forward-compat; not yet used.
-            self._read_json(self.CONSTRAINTS_FILENAME, required=False)
+            constraints = self._read_json(self.CONSTRAINTS_FILENAME, required=False)
             self._read_json(self.PARAMETERS_FILENAME, required=False)
+            capacity_inputs = {
+                "constraints": constraints,
+                "source_capacity": self._read_json(self.SOURCE_CAPACITY_FILENAME, required=False),
+                "target_capacity": self._read_json(self.TARGET_CAPACITY_FILENAME, required=False),
+                "network": self._read_json(self.NETWORK_FILENAME, required=False),
+                "cluster_capacity": self._read_json(self.CLUSTER_CAPACITY_FILENAME, required=False),
+            }
 
             if metrics is not None and lobs is not None:
                 # LOB abort gate runs before any planning work.
@@ -482,10 +539,10 @@ class PgCyanPlanner:
                         )
                         self.errors.append("No tables to plan")
                     else:
-                        n = max(1, min(self.shards, len(tables)))
-                        shards = self.bin_pack(tables, n)
+                        budget = self._resolve_budget(capacity_inputs, len(tables))
+                        shards = self.bin_pack(tables, budget.shard_count)
                         if self._validate_disjoint(shards, tables):
-                            ok = self._write_plan_files(shards, summary, len(tables))
+                            ok = self._write_plan_files(shards, summary, len(tables), budget)
                             if ok:
                                 return summary
         except Exception as e:
@@ -509,9 +566,12 @@ class PgCyanPlanner:
         )
         return summary
 
-    def _write_plan_files(self, shards: List[List[Dict]], summary: Dict, table_count: int) -> bool:
+    def _write_plan_files(
+        self, shards: List[List[Dict]], summary: Dict, table_count: int,
+        budget: capacity.Budget,
+    ) -> bool:
         """Write plan.json + every shard-<n>.filters; update ``summary`` in place."""
-        plan_path = self._write_json(self.OUTPUT_FILENAME, self.build_plan(shards))
+        plan_path = self._write_json(self.OUTPUT_FILENAME, self.build_plan(shards, budget))
         if not plan_path:
             return False
 
