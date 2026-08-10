@@ -47,6 +47,11 @@ Responsibilities (this ticket, per the resolved scope):
     set so pgcopydb carves it into parallel ctid ranges. An un-splittable giant
     stays whole and is reported as the ``single-table`` bottleneck (see
     ``pg_cyan/splitting.py``).
+  * **Feasibility gate:** the predicted makespan is compared to the
+    WAL-retention deadline and maintenance window; an infeasible plan is refused
+    like the LOB gate (no plan, reasons in the error report). A ``resume`` block
+    of circuit-breaker thresholds + shard checkpoints is emitted for the
+    controller (see ``pg_cyan/feasibility.py``).
 
 Deferred to follow-up work:
   * **FK graph** is emitted as ``"status": "deferred"`` -- FK edges are not yet
@@ -72,7 +77,7 @@ import sys
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from pg_cyan import capacity, cost_model, splitting
+from pg_cyan import capacity, cost_model, feasibility, splitting
 
 # Structured JSON logging (mirrors the other stages).
 logging.basicConfig(
@@ -369,7 +374,7 @@ class PgCyanPlanner:
 
     def build_plan(
         self, shards: List[List[Dict]], budget: capacity.Budget,
-        split_plan: splitting.SplitPlan,
+        split_plan: splitting.SplitPlan, assessment: feasibility.Assessment,
     ) -> Dict:
         """Assemble the ``plan.json`` payload from the bin-packed shards."""
         not_consistent = self.snapshot_mode != self.DEFAULT_SNAPSHOT_MODE
@@ -438,6 +443,8 @@ class PgCyanPlanner:
             },
             "concurrency": budget.as_plan_block(),
             "splitting": split_plan.as_plan_block(),
+            "feasibility": assessment.feasibility_block(),
+            "resume": assessment.resume_block(),
             "bottleneck": bottleneck,
             "cost_model": {
                 "weight": "estimated_copy_seconds",
@@ -540,6 +547,35 @@ class PgCyanPlanner:
         )
         return budget
 
+    def _assess_feasibility(
+        self, split_plan: splitting.SplitPlan, capacity_inputs: Dict,
+        shards: List[List[Dict]],
+    ) -> feasibility.Assessment:
+        """
+        Gate the predicted makespan against the WAL/window deadlines.
+
+        On ``abort`` the reasons are recorded to ``self.errors`` so the failure
+        path writes them (with the numbers) and no plan is produced -- the same
+        refusal contract as the LOB gate. See also: pg_cyan/feasibility.py.
+        """
+        assessment = feasibility.assess(
+            split_plan.predicted_makespan_seconds,
+            source_capacity=capacity_inputs["source_capacity"],
+            constraints=capacity_inputs["constraints"],
+            shard_names=[f"shard-{i}" for i in range(len(shards))],
+        )
+        status_map = {"abort": "failure", "warn": "warning"}
+        self._log_event(
+            "feasibility",
+            status_map.get(assessment.status, "success"),
+            f"Feasibility {assessment.status}: " + "; ".join(assessment.reasons),
+            assessment.feasibility_block(),
+        )
+        if assessment.aborted:
+            for reason in assessment.reasons:
+                self.errors.append(f"Feasibility abort: {reason}")
+        return assessment
+
     def plan(self) -> Dict:
         """
         Load inputs, run the LOB gate + bin-packer, and write plan/filters.
@@ -600,10 +636,16 @@ class PgCyanPlanner:
                         )
                         shards = self.bin_pack(tables, budget.shard_count)
                         if self._validate_disjoint(shards, tables):
-                            ok = self._write_plan_files(
-                                shards, summary, len(tables), budget, split_plan)
-                            if ok:
-                                return summary
+                            assessment = self._assess_feasibility(
+                                split_plan, capacity_inputs, shards)
+                            # An infeasible plan is refused like the LOB gate: no
+                            # plan written, reasons recorded to the error report.
+                            if not assessment.aborted:
+                                ok = self._write_plan_files(
+                                    shards, summary, len(tables), budget,
+                                    split_plan, assessment)
+                                if ok:
+                                    return summary
         except Exception as e:
             # Malformed artifact (bad types, missing keys) -> degrade, never raise.
             self._log_event(
@@ -628,10 +670,11 @@ class PgCyanPlanner:
     def _write_plan_files(
         self, shards: List[List[Dict]], summary: Dict, table_count: int,
         budget: capacity.Budget, split_plan: splitting.SplitPlan,
+        assessment: feasibility.Assessment,
     ) -> bool:
         """Write plan.json + every shard-<n>.filters; update ``summary`` in place."""
         plan_path = self._write_json(
-            self.OUTPUT_FILENAME, self.build_plan(shards, budget, split_plan))
+            self.OUTPUT_FILENAME, self.build_plan(shards, budget, split_plan, assessment))
         if not plan_path:
             return False
 

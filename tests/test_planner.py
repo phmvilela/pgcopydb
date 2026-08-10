@@ -327,6 +327,77 @@ def test_plan_splits_a_dominant_table_and_lowers_makespan(tmp_path):
     assert set(listed) == {f'{t["schema"]}.{t["name"]}' for t in _skewed_tables()}
 
 
+# ---------------------------------------------------- feasibility gate (plan)
+
+def test_plan_passes_feasibility_and_emits_resume(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, tables=_skewed_tables(), lob_count=0)
+    _write_capacity(
+        inputs,
+        source_capacity={"max_connections": 16, "current_connections": 0,
+                         # Roomy WAL disk relative to the write rate -> passes.
+                         "wal_disk_free_bytes": 10 ** 15,
+                         "wal_generation_bytes_per_sec": 1_000_000},
+        network={"bandwidth_bytes_per_sec": 10 ** 12,
+                 "per_stream_bytes_per_sec": 100 * 1024 * 1024},
+        constraints={"max_table_jobs_per_shard": 8},
+    )
+
+    planner = make_planner(inputs, output)
+    assert planner.plan()["status"] == "success"
+
+    plan = json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+    assert plan["feasibility"]["status"] == "pass"
+    assert plan["feasibility"]["binding_deadline_source"] == "wal_retention"
+    resume = plan["resume"]
+    assert resume["enabled"] is True
+    assert resume["checkpoints"] == [f"shard-{i}" for i in range(plan["totals"]["shard_count"])]
+
+
+def test_plan_aborts_and_writes_no_plan_when_wal_deadline_breached(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, tables=_skewed_tables(), lob_count=0)
+    _write_capacity(
+        inputs,
+        source_capacity={"max_connections": 16, "current_connections": 0,
+                         # Tiny WAL disk + high write rate -> fills before copy ends.
+                         "wal_disk_free_bytes": 1024,
+                         "wal_generation_bytes_per_sec": 1_000_000_000},
+        network={"bandwidth_bytes_per_sec": 10 ** 12,
+                 "per_stream_bytes_per_sec": 100 * 1024 * 1024},
+    )
+
+    planner = make_planner(inputs, output)
+    summary = planner.plan()
+
+    assert summary["status"] == "failure"
+    # Refused like the LOB gate: no plan, reasons (with numbers) in the error.
+    assert not (output / PgCyanPlanner.OUTPUT_FILENAME).exists()
+    payload = json.loads((output / PgCyanPlanner.ERROR_FILENAME).read_text())
+    assert any("Feasibility abort" in e and "wal_retention" in e for e in payload["errors"])
+
+
+def test_plan_feasibility_is_noop_without_deadline_inputs(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, tables=_skewed_tables(), lob_count=0)
+    # Capacity present (so a budget is computed) but no WAL/window inputs.
+    _write_capacity(
+        inputs,
+        source_capacity={"max_connections": 16, "current_connections": 0},
+        network={"bandwidth_bytes_per_sec": 10 ** 12,
+                 "per_stream_bytes_per_sec": 100 * 1024 * 1024},
+    )
+
+    planner = make_planner(inputs, output)
+    assert planner.plan()["status"] == "success"
+
+    plan = json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+    assert plan["feasibility"]["status"] == "not_evaluated"
+
+
 def test_plan_flags_unsplittable_giant_as_single_table_bottleneck(tmp_path):
     inputs, output = tmp_path / "in", tmp_path / "out"
     inputs.mkdir()
