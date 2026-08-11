@@ -313,8 +313,11 @@ def test_plan_splits_a_dominant_table_and_lowers_makespan(tmp_path):
     assert big["subtasks"] >= 2 and big["reason"] == "split"
     # Splitting the dominant table shortens the predicted makespan.
     assert sp["predicted_makespan_seconds"] < sp["makespan_without_splitting_seconds"]
-    # Not a single-table floor -> the bottleneck is the stream budget's binding term.
-    assert plan["bottleneck"] == "source_connections"
+    # Not a single-table floor -> the bottleneck is the stream budget's binding
+    # term, canonicalized, with the raw term preserved in the attribution block.
+    assert plan["bottleneck"] == "source-connections"
+    assert plan["attribution"]["binding_term"] == "source_connections"
+    assert plan["attribution"]["remediation"]
     # The shard holding the split table carries a byte (int) split threshold.
     assert any(isinstance(s["split_tables_larger_than"], int) for s in plan["data_shards"])
 
@@ -454,6 +457,88 @@ def test_plan_network_probe_calibrates_the_cost_model(tmp_path):
     # The measured single-stream throughput flows into the copy-time weight.
     assert plan["cost_model"]["constants"]["per_stream_bytes_per_sec"] == measured
     assert plan["concurrency"]["per_stream_bytes_per_sec"] == measured
+
+
+# ------------------------------------------- explainability + calibration (plan)
+
+def _write_history(inputs_dir, observed_mib_per_sec=25.0, n=6, mib_each=500):
+    """A copylog-history.json of n wide tables copied at a fixed real rate."""
+    mib = 1024 * 1024
+    dur = mib_each / observed_mib_per_sec
+    (inputs_dir / PgCyanPlanner.HISTORY_FILENAME).write_text(json.dumps({
+        "component": "copylog-history",
+        "observations": [
+            {"schema": "public", "name": f"h{i}", "heap_bytes": mib_each * mib,
+             "row_estimate": 0, "duration_seconds": dur}
+            for i in range(n)
+        ],
+    }))
+
+
+def _run_plan(inputs, output):
+    planner = make_planner(inputs, output)
+    assert planner.plan()["status"] == "success"
+    return json.loads((output / PgCyanPlanner.OUTPUT_FILENAME).read_text())
+
+
+def test_plan_calibrates_cost_model_from_history_and_lengthens_prediction(tmp_path):
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    # Tables with real heap, so the bytes term drives the copy-time estimate.
+    tables = [_table("public", f"t{i}", heap_bytes=200 * 1024 * 1024) for i in range(4)]
+    _write_inputs(inputs, tables=tables, lob_count=0)
+
+    base = _run_plan(inputs, tmp_path / "out-base")
+
+    # History shows the real link is half as fast (25 MiB/s vs the 50 default).
+    _write_history(inputs, observed_mib_per_sec=25.0)
+    cal = _run_plan(inputs, tmp_path / "out-cal")
+
+    assert base["cost_model"]["calibration"]["source"] == "default"
+    assert cal["cost_model"]["calibration"]["source"] == "history"
+    # A slower calibrated throughput -> a longer predicted copy time.
+    assert cal["totals"]["est_copy_seconds"] > base["totals"]["est_copy_seconds"]
+    # Provenance records where the byte constant came from in each plan.
+    assert cal["cost_model"]["provenance"]["per_stream_bytes_per_sec"] == "history-calibrated"
+    assert base["cost_model"]["provenance"]["per_stream_bytes_per_sec"] == "default"
+    # And the replay error does not grow once calibrated.
+    err = cal["cost_model"]["calibration"]["predicted_error_ratio"]
+    assert err["before"] is not None and err["after"] <= err["before"]
+
+
+def test_plan_cost_model_block_is_auditable(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, lob_count=0)  # no history, no capacity
+
+    plan = _run_plan(inputs, output)
+    cm = plan["cost_model"]
+    assert cm["formula"] and cm["assumptions"]
+    assert set(cm["provenance"]) == {
+        "per_stream_bytes_per_sec", "per_stream_rows_per_sec", "toast_overhead_factor"}
+    # Absent history -> default constants (the documented fallback).
+    assert cm["calibration"]["source"] == "default"
+    assert cm["provenance"]["per_stream_bytes_per_sec"] == "default"
+    # The attribution block agrees with the top-level bottleneck.
+    assert plan["attribution"]["bottleneck"] == plan["bottleneck"]
+    assert plan["attribution"]["remediation"]
+
+
+def test_plan_bottleneck_is_canonical_with_capacity(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, lob_count=0)
+    # Target write throughput is the tightest ceiling -> canonical target-write.
+    _write_capacity(
+        inputs,
+        target_capacity={"max_connections": 500,
+                         "write_throughput_bytes_per_sec": 20 * 1024 * 1024},
+        network={"bandwidth_bytes_per_sec": 10**12},
+    )
+
+    plan = _run_plan(inputs, output)
+    assert plan["bottleneck"] == "target-write"
+    assert plan["attribution"]["binding_term"] == "target_write"
 
 
 def test_plan_frozen_source_sets_not_consistent(tmp_path):

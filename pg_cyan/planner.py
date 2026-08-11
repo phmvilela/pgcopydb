@@ -19,6 +19,9 @@ Inputs (read from ``--inputs-dir`` / ``$PG_INPUTS_DIR``):
   * ``source-capacity.json`` / ``target-capacity.json`` / ``network.json`` /
     ``cluster-capacity.json`` -- capacity artifacts sizing the concurrency
     budget; all optional. See also: pg_cyan/capacity.py.
+  * ``copylog-history.json``        -- prior per-table copy durations; calibrates
+    the cost-model throughput constants from real runs. Optional; absent history
+    keeps the default (or network-probe) constants. See also: pg_cyan/calibration.py.
 
 Responsibilities (this ticket, per the resolved scope):
   * **Bin-pack** tables into N disjoint shards by **estimated copy time** (LPT
@@ -52,6 +55,13 @@ Responsibilities (this ticket, per the resolved scope):
     like the LOB gate (no plan, reasons in the error report). A ``resume`` block
     of circuit-breaker thresholds + shard checkpoints is emitted for the
     controller (see ``pg_cyan/feasibility.py``).
+  * **Explainability + calibration:** the plan's ``bottleneck`` is attributed to
+    a canonical, actionable label with operator remediation (see
+    ``pg_cyan/attribution.py``), and the ``cost_model`` block is auditable --
+    constants, their provenance, the modelling assumptions, and the calibration
+    trail. The throughput constants are fitted from ``copylog-history.json`` so
+    each run's real durations shrink the next plan's makespan error (see
+    ``pg_cyan/calibration.py``).
 
 Deferred to follow-up work:
   * **FK graph** is emitted as ``"status": "deferred"`` -- FK edges are not yet
@@ -77,7 +87,7 @@ import sys
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from pg_cyan import capacity, cost_model, feasibility, splitting
+from pg_cyan import attribution, calibration, capacity, cost_model, feasibility, splitting
 
 # Structured JSON logging (mirrors the other stages).
 logging.basicConfig(
@@ -106,6 +116,9 @@ class PgCyanPlanner:
     TARGET_CAPACITY_FILENAME = "target-capacity.json"
     NETWORK_FILENAME = "network.json"
     CLUSTER_CAPACITY_FILENAME = "cluster-capacity.json"
+    #: Prior per-table copy durations; calibrates the cost-model throughput
+    #: constants from real runs. Optional. See also: pg_cyan/calibration.py.
+    HISTORY_FILENAME = "copylog-history.json"
 
     #: Fixed default; smarter sizing is deferred.
     DEFAULT_SHARDS = 4
@@ -372,9 +385,65 @@ class PgCyanPlanner:
         threshold = max(1, int(min(heaps) * 0.9)) if heaps else self.split_tables_larger_than
         return jobs, threshold
 
+    def _cost_model_block(
+        self, calibration_result: calibration.Calibration, network_present: bool,
+    ) -> Dict:
+        """
+        The auditable ``cost_model`` block: constants, where they came from, the
+        calibration trail, and the modelling assumptions.
+
+        Each throughput constant's provenance is the strongest signal that set it:
+        real copy history (calibrated) beats a bare network probe, which beats the
+        conservative default. See also: pg_cyan/cost_model.py, pg_cyan/calibration.py.
+        """
+        bytes_source = (
+            "history-calibrated" if calibration_result.blend_weight_bytes > 0
+            else ("network-probe" if network_present else "default"))
+        rows_source = (
+            "history-calibrated" if calibration_result.blend_weight_rows > 0
+            else "default")
+        return {
+            "weight": "estimated_copy_seconds",
+            "formula": (
+                "t(table) = max(live_bytes / per_stream_bytes_per_sec, "
+                "row_estimate / per_stream_rows_per_sec); live_bytes = "
+                "heap_bytes * (1 - dead_tuple_ratio), with the TOAST portion "
+                "surcharged by toast_overhead_factor"
+            ),
+            "constants": self.cost_model.as_dict(),
+            "provenance": {
+                "per_stream_bytes_per_sec": bytes_source,
+                "per_stream_rows_per_sec": rows_source,
+                "toast_overhead_factor": "default (neutral 1.0; not yet calibrated)",
+            },
+            "calibration": calibration_result.as_dict(),
+            "assumptions": [
+                "One COPY stream's effective throughput is min(network, "
+                "source-read, target-write); per_stream_bytes_per_sec models that "
+                "as one constant rather than the three ceilings separately.",
+                "COPY ships only live tuples: live_bytes = heap_bytes * "
+                "(1 - dead_tuple_ratio), so a bloated heap is discounted.",
+                "row_estimate bounds narrow, row-heavy tables whose cost is "
+                "per-row overhead not bytes; a non-positive estimate (never "
+                "analysed) drops the rows term.",
+                "toast_overhead_factor is neutral (1.0) until calibrated; TOAST "
+                "detoast read cost is not yet surcharged.",
+                "Degradation ladder: no extended metrics -> weight collapses to "
+                "heap_bytes; no network probe -> default per-stream rate; no "
+                "history -> default constants.",
+            ],
+            "note": (
+                "Shards are balanced by estimated single-stream copy time; the "
+                "same constants drive the makespan prediction and the concurrency "
+                "budget. Constants are auditable and calibratable -- see "
+                "provenance (where each came from) and calibration (the fit)."
+            ),
+        }
+
     def build_plan(
         self, shards: List[List[Dict]], budget: capacity.Budget,
         split_plan: splitting.SplitPlan, assessment: feasibility.Assessment,
+        calibration_result: calibration.Calibration, network_present: bool,
     ) -> Dict:
         """Assemble the ``plan.json`` payload from the bin-packed shards."""
         not_consistent = self.snapshot_mode != self.DEFAULT_SNAPSHOT_MODE
@@ -418,14 +487,9 @@ class PgCyanPlanner:
         total_heap = sum(s["heap_bytes"] for s in data_shards)
         total_index = sum(s["index_bytes"] for s in data_shards)
         total_cost = sum(s["est_copy_seconds"] for s in data_shards)
-        # An indivisible giant that floors the makespan is the bottleneck the
-        # operator must act on; otherwise it is whatever bound the stream budget.
-        if split_plan.single_table_floor:
-            bottleneck = "single-table"
-        elif budget.degraded:
-            bottleneck = "none"
-        else:
-            bottleneck = budget.binding_term
+        # Canonical bottleneck + remediation: a single-table floor takes
+        # precedence over the stream-budget term (see attribution).
+        attr = attribution.attribute(budget, split_plan)
         return {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "component": "planner",
@@ -445,20 +509,9 @@ class PgCyanPlanner:
             "splitting": split_plan.as_plan_block(),
             "feasibility": assessment.feasibility_block(),
             "resume": assessment.resume_block(),
-            "bottleneck": bottleneck,
-            "cost_model": {
-                "weight": "estimated_copy_seconds",
-                "constants": self.cost_model.as_dict(),
-                "note": (
-                    "Shards balanced by estimated single-stream copy time: "
-                    "t(table) = max(live_bytes/per_stream_bytes_per_sec, "
-                    "rows/per_stream_rows_per_sec), live_bytes = "
-                    "heap_bytes*(1-dead_tuple_ratio). Constants are calibratable; "
-                    "when the extended metrics fields are absent the weight "
-                    "degrades to heap_bytes. Concurrency budget and makespan "
-                    "prediction are not modelled yet."
-                ),
-            },
+            "bottleneck": attr.bottleneck,
+            "attribution": attr.as_dict(),
+            "cost_model": self._cost_model_block(calibration_result, network_present),
             "data_shards": data_shards,
             "index_shards": index_shards,
             "fk_graph": {
@@ -547,6 +600,29 @@ class PgCyanPlanner:
         )
         return budget
 
+    def _calibrate(self, history: Optional[Dict]) -> calibration.Calibration:
+        """
+        Calibrate the cost-model throughput constants from real copy durations.
+
+        Runs after ``_resolve_budget`` so the network-probe rate (when present) is
+        the shrinkage prior; a usable ``copylog-history.json`` then moves the
+        constants toward what prior runs actually achieved, and the calibrated
+        model replaces ``self.cost_model`` for splitting/packing/prediction. With
+        no history the base model is kept unchanged. See also: pg_cyan/calibration.py.
+        """
+        result = calibration.calibrate(history, base=self.cost_model)
+        if result.source == "history":
+            self.cost_model = result.model
+        self._log_event(
+            "cost_calibration",
+            "success" if result.source == "history" else "warning",
+            (f"Calibrated cost model from {result.observations} prior copy "
+             f"observation(s)" if result.source == "history"
+             else "No usable copy history; kept the base cost-model constants"),
+            result.as_dict(),
+        )
+        return result
+
     def _assess_feasibility(
         self, split_plan: splitting.SplitPlan, capacity_inputs: Dict,
         shards: List[List[Dict]],
@@ -613,6 +689,7 @@ class PgCyanPlanner:
                 "network": self._read_json(self.NETWORK_FILENAME, required=False),
                 "cluster_capacity": self._read_json(self.CLUSTER_CAPACITY_FILENAME, required=False),
             }
+            history = self._read_json(self.HISTORY_FILENAME, required=False)
 
             if metrics is not None and lobs is not None:
                 # LOB abort gate runs before any planning work.
@@ -628,6 +705,9 @@ class PgCyanPlanner:
                         self.errors.append("No tables to plan")
                     else:
                         budget = self._resolve_budget(capacity_inputs, len(tables))
+                        # Calibrate the cost model from real durations before it
+                        # weights splitting, packing, and the makespan prediction.
+                        calibration_result = self._calibrate(history)
                         split_plan = splitting.plan_splits(
                             tables,
                             c_star=budget.c_star,
@@ -643,7 +723,8 @@ class PgCyanPlanner:
                             if not assessment.aborted:
                                 ok = self._write_plan_files(
                                     shards, summary, len(tables), budget,
-                                    split_plan, assessment)
+                                    split_plan, assessment, calibration_result,
+                                    network_present=bool(capacity_inputs["network"]))
                                 if ok:
                                     return summary
         except Exception as e:
@@ -671,10 +752,13 @@ class PgCyanPlanner:
         self, shards: List[List[Dict]], summary: Dict, table_count: int,
         budget: capacity.Budget, split_plan: splitting.SplitPlan,
         assessment: feasibility.Assessment,
+        calibration_result: calibration.Calibration, network_present: bool,
     ) -> bool:
         """Write plan.json + every shard-<n>.filters; update ``summary`` in place."""
         plan_path = self._write_json(
-            self.OUTPUT_FILENAME, self.build_plan(shards, budget, split_plan, assessment))
+            self.OUTPUT_FILENAME, self.build_plan(
+                shards, budget, split_plan, assessment,
+                calibration_result, network_present))
         if not plan_path:
             return False
 
