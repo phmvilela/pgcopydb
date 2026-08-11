@@ -74,10 +74,12 @@ Deferred to follow-up work:
 
 Follows the ``PgCyanParameters`` / ``PgCyanMetrics`` orchestrator pattern (see
 ``CLAUDE.md``): structured JSON logging via ``_log_event`` and graceful
-degradation -- ``plan()`` never raises. On success a non-empty ``plan.json`` and
-the shard filter files are written; on any failure (missing/invalid input, LOB
-gate, empty table set, or write error) a ``plan-errors.json`` with an error
-message is written instead and no plan files are produced.
+degradation -- ``plan()`` never raises. On success a non-empty ``plan.json``, a
+human-readable ``plan-summary.md`` for pre-execution review (best-effort; see
+``pg_cyan/report.py``), and the shard filter files are written; on any failure
+(missing/invalid input, LOB gate, empty table set, or write error) a
+``plan-errors.json`` with an error message is written instead and no plan files
+are produced.
 """
 import dataclasses
 import json
@@ -87,7 +89,8 @@ import sys
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from pg_cyan import attribution, calibration, capacity, cost_model, feasibility, splitting
+from pg_cyan import (
+    attribution, calibration, capacity, cost_model, feasibility, report, splitting)
 
 # Structured JSON logging (mirrors the other stages).
 logging.basicConfig(
@@ -102,6 +105,9 @@ class PgCyanPlanner:
 
     #: Written on the happy path (non-empty).
     OUTPUT_FILENAME = "plan.json"
+    #: Human-readable rendering of the plan for pre-execution review. Best-effort:
+    #: a rendering failure is a warning, never a plan failure. See pg_cyan/report.py.
+    REPORT_FILENAME = "plan-summary.md"
     #: Written when anything goes wrong, with an error message.
     ERROR_FILENAME = "plan-errors.json"
 
@@ -660,6 +666,7 @@ class PgCyanPlanner:
             {
               "status": "success" | "failure",
               "output_file": <plan.json path or None>,
+              "report_file": <plan-summary.md path or None>,
               "error_file": <plan-errors.json path or None>,
               "shard_files": [<paths>],
               "shard_count": <int>,
@@ -670,6 +677,7 @@ class PgCyanPlanner:
         summary = {
             "status": "failure",
             "output_file": None,
+            "report_file": None,
             "error_file": None,
             "shard_files": [],
             "shard_count": 0,
@@ -754,11 +762,10 @@ class PgCyanPlanner:
         assessment: feasibility.Assessment,
         calibration_result: calibration.Calibration, network_present: bool,
     ) -> bool:
-        """Write plan.json + every shard-<n>.filters; update ``summary`` in place."""
-        plan_path = self._write_json(
-            self.OUTPUT_FILENAME, self.build_plan(
-                shards, budget, split_plan, assessment,
-                calibration_result, network_present))
+        """Write plan.json + plan-summary.md + every shard-<n>.filters; update ``summary``."""
+        plan = self.build_plan(
+            shards, budget, split_plan, assessment, calibration_result, network_present)
+        plan_path = self._write_json(self.OUTPUT_FILENAME, plan)
         if not plan_path:
             return False
 
@@ -769,9 +776,14 @@ class PgCyanPlanner:
                 return False
             shard_files.append(shard_path)
 
+        # Best-effort human-readable report: a rendering/write failure is logged
+        # as a warning but never fails the plan (plan.json is the deliverable).
+        report_path = self._write_report(plan)
+
         summary.update(
             status="success",
             output_file=plan_path,
+            report_file=report_path,
             shard_files=shard_files,
             shard_count=len(shards),
             table_count=table_count,
@@ -780,9 +792,29 @@ class PgCyanPlanner:
             "plan",
             "success",
             f"Wrote {self.OUTPUT_FILENAME} and {len(shard_files)} shard filter file(s)",
-            {"path": plan_path, "shard_count": len(shards), "table_count": table_count},
+            {"path": plan_path, "report": report_path,
+             "shard_count": len(shards), "table_count": table_count},
         )
         return True
+
+    def _write_report(self, plan: Dict) -> Optional[str]:
+        """
+        Render and write ``plan-summary.md``; return its path or ``None``.
+
+        Never raises and never fails the plan: the pre-execution report is a
+        review aid, so a rendering or write error is downgraded to a warning and
+        the plan still succeeds. See also: pg_cyan/report.py.
+        """
+        try:
+            return self._write_text(self.REPORT_FILENAME, report.render_plan_report(plan))
+        except Exception as e:  # noqa: BLE001 - the report must never sink the plan
+            self._log_event(
+                "write_report",
+                "warning",
+                f"Could not render the plan summary; plan.json is unaffected",
+                {"error": str(e)},
+            )
+            return None
 
 
 def plan_from_env() -> int:

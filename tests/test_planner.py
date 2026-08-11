@@ -541,6 +541,47 @@ def test_plan_bottleneck_is_canonical_with_capacity(tmp_path):
     assert plan["attribution"]["binding_term"] == "target_write"
 
 
+# --------------------------------------------------- human-readable report (plan)
+
+def test_plan_writes_human_readable_summary(tmp_path):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, lob_count=0)
+
+    planner = make_planner(inputs, output, shards=2)
+    summary = planner.plan()
+    assert summary["status"] == "success"
+
+    report_path = output / PgCyanPlanner.REPORT_FILENAME
+    assert report_path.exists()
+    assert summary["report_file"] == str(report_path)
+    text = report_path.read_text()
+    assert text.startswith("# Migration plan summary")
+    assert "## Shard layout" in text and "## Concurrency budget" in text
+
+
+def test_plan_survives_a_report_render_failure(tmp_path, monkeypatch):
+    inputs, output = tmp_path / "in", tmp_path / "out"
+    inputs.mkdir()
+    _write_inputs(inputs, lob_count=0)
+
+    # The report is a review aid: a rendering crash must not fail the plan.
+    from pg_cyan import report as report_mod
+
+    def _boom(_plan):
+        raise RuntimeError("render exploded")
+
+    monkeypatch.setattr(report_mod, "render_plan_report", _boom)
+
+    planner = make_planner(inputs, output, shards=2)
+    summary = planner.plan()
+    # plan.json is still the deliverable; only the summary is missing.
+    assert summary["status"] == "success"
+    assert summary["report_file"] is None
+    assert (output / PgCyanPlanner.OUTPUT_FILENAME).exists()
+    assert not (output / PgCyanPlanner.REPORT_FILENAME).exists()
+
+
 def test_plan_frozen_source_sets_not_consistent(tmp_path):
     inputs, output = tmp_path / "in", tmp_path / "out"
     inputs.mkdir()
