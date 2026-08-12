@@ -127,11 +127,18 @@ def get_provisioner() -> Provisioner:
     from app.k8s import K8sApplier
 
     follow_cdc = os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes")
+    # The out-of-cluster read-only observer bound into each per-migration
+    # namespace (defaults to the devcontainer's pgcyan-migration/pgcyan-viewer SA).
+    # Set either var empty to disable the stamp entirely.
+    viewer_sa = os.getenv("PGCYAN_VIEWER_SA", "pgcyan-viewer").strip()
+    viewer_ns = os.getenv("PGCYAN_VIEWER_NS", "pgcyan-migration").strip()
     return Provisioner(
         MANIFESTS_DIR,
         os.getenv("PGCYAN_MIGRATION_IMAGE"),
         K8sApplier(),
         follow_cdc=follow_cdc,
+        viewer_sa=viewer_sa or None,
+        viewer_ns=viewer_ns or None,
     )
 
 

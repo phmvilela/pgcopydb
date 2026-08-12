@@ -64,8 +64,12 @@ def test_provision_stands_up_a_parked_namespace(manifests_dir, fake_applier):
               "Service", "StatefulSet", "PodDisruptionBudget"):
         assert k in kinds, f"missing {k}"
 
-    # Every applied doc was retargeted -- the fixed namespace token is gone.
-    dumped = yaml.safe_dump_all(fake_applier.docs)
+    # Every retargeted doc dropped the fixed namespace token. The one deliberate
+    # exception is the external-observer binding (checked on its own below), whose
+    # subject must keep pointing at the fixed observer namespace.
+    retargeted = [d for d in fake_applier.docs
+                  if d.get("metadata", {}).get("name") != "pgcyan-viewer-external"]
+    dumped = yaml.safe_dump_all(retargeted)
     assert "pgcyan-migration" not in dumped
     assert ns in dumped
 
@@ -80,6 +84,30 @@ def test_provision_stands_up_a_parked_namespace(manifests_dir, fake_applier):
     assert env["PGCYAN_FOLLOW_CDC"] == ""
     assert env["PGCYAN_SHARDS"] == "6"
     assert "${" not in yaml.safe_dump(sts)
+
+
+def test_provision_binds_external_viewer_read_only(manifests_dir, fake_applier):
+    p = Provisioner(manifests_dir, "img:1", fake_applier)
+    ns = "pgcyan-mig-deadbeef01"
+    p.provision(_req(), migration_id="deadbeef01")
+
+    vb = next(d for d in fake_applier.docs
+              if d.get("kind") == "RoleBinding"
+              and d["metadata"]["name"] == "pgcyan-viewer-external")
+    # Bound INTO the dynamic namespace, reusing that namespace's read-only Role...
+    assert vb["metadata"]["namespace"] == ns
+    assert vb["roleRef"] == {
+        "apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "pgcyan-viewer"}
+    # ...but the subject stays the FIXED out-of-cluster observer (not retargeted).
+    assert vb["subjects"] == [{
+        "kind": "ServiceAccount", "name": "pgcyan-viewer", "namespace": "pgcyan-migration"}]
+
+
+def test_provision_external_viewer_is_disable_able(manifests_dir, fake_applier):
+    p = Provisioner(manifests_dir, "img:1", fake_applier, viewer_sa=None)
+    p.provision(_req(), migration_id="deadbeef01")
+    names = [d.get("metadata", {}).get("name") for d in fake_applier.docs]
+    assert "pgcyan-viewer-external" not in names
 
 
 def test_provision_follow_cdc_flag_sets_controller_env(manifests_dir, fake_applier):

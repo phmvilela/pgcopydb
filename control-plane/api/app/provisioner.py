@@ -15,6 +15,15 @@ re-declared here, so there is no drift. Two apply-time transforms:
 * **placeholder fill** — the ``${PGCYAN_*}`` env placeholders in the controller
   manifest are filled (image, wait-for-start=true, etc.).
 
+On top of the shared manifests it also stamps ONE extra RoleBinding: the
+out-of-cluster, read-only *observer* (the devcontainer's fixed ``pgcyan-viewer``
+SA) is bound into each dynamic namespace so an operator watching with that
+identity sees the per-migration namespaces the same way it sees the fixed
+integration-test one. It is built in code — NOT taken through ``retarget`` — so
+its subject keeps pointing at the observer's own namespace instead of being
+rewritten to the new one, and it reuses the per-namespace ``pgcyan-viewer`` Role
+so the read-only rules stay defined once (deploy/k8s/01-rbac.yaml).
+
 Kubernetes I/O goes through an injected ``applier`` so the provisioning logic
 (ordering, retarget, fill, secret contents) is unit-testable without a cluster.
 
@@ -32,6 +41,22 @@ NAMESPACE_TOKEN = "pgcyan-migration"
 #: Per-migration namespace naming, shared with the endpoint so it can reserve the
 #: registry row under the same name the provisioner will create.
 NAMESPACE_PREFIX = "pgcyan-mig-"
+
+#: Out-of-cluster read-only observer bound into every per-migration namespace.
+#: Defaults to the devcontainer's fixed viewer identity (deploy/k8s/01-rbac.yaml,
+#: ServiceAccount pgcyan-viewer in namespace pgcyan-migration). Overridable /
+#: disable-able from the control-plane env (see app/main.py).
+DEFAULT_VIEWER_NAMESPACE = "pgcyan-migration"
+DEFAULT_VIEWER_SERVICE_ACCOUNT = "pgcyan-viewer"
+
+#: The per-namespace read-only Role that 01-rbac.yaml stamps (retargeted) into
+#: each migration namespace; the external-observer binding reuses it so the
+#: read-only rules live in exactly one place.
+VIEWER_ROLE_NAME = "pgcyan-viewer"
+
+#: Name of the extra binding, distinct from the in-namespace ``pgcyan-viewer``
+#: RoleBinding 01-rbac.yaml already creates for the local viewer SA.
+EXTERNAL_VIEWER_BINDING_NAME = "pgcyan-viewer-external"
 
 
 def new_migration_id() -> str:
@@ -92,11 +117,40 @@ class Provisioner:
     """Provisions a parked per-migration namespace from the shared manifests."""
 
     def __init__(self, manifests_dir, migration_image: Optional[str], applier,
-                 *, follow_cdc: bool = False):
+                 *, follow_cdc: bool = False,
+                 viewer_sa: Optional[str] = DEFAULT_VIEWER_SERVICE_ACCOUNT,
+                 viewer_ns: Optional[str] = DEFAULT_VIEWER_NAMESPACE):
         self.manifests_dir = Path(manifests_dir)
         self.migration_image = migration_image
         self.applier = applier
         self.follow_cdc = follow_cdc
+        # The out-of-cluster observer to also bind read-only into each namespace.
+        # Both parts must be set to enable it; either empty disables the stamp.
+        self.viewer_sa = viewer_sa or None
+        self.viewer_ns = viewer_ns or None
+
+    def _external_viewer_binding(self, ns: str) -> dict:
+        """RoleBinding granting the out-of-cluster observer read-only sight of ns.
+
+        Binds the fixed observer SA (``self.viewer_ns``/``self.viewer_sa``) to the
+        per-namespace ``pgcyan-viewer`` Role. Returned as a plain dict and applied
+        WITHOUT retarget, so the subject namespace stays the observer's own.
+        """
+        return {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": EXTERNAL_VIEWER_BINDING_NAME, "namespace": ns},
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": VIEWER_ROLE_NAME,
+            },
+            "subjects": [{
+                "kind": "ServiceAccount",
+                "name": self.viewer_sa,
+                "namespace": self.viewer_ns,
+            }],
+        }
 
     def _docs(self, name: str, subs: Optional[Dict[str, str]] = None) -> List[dict]:
         text = (self.manifests_dir / name).read_text()
@@ -126,6 +180,14 @@ class Provisioner:
             for doc in self._docs(name):
                 retarget_namespace(doc, ns)
                 self.applier.apply_doc(doc)
+
+        # Bind the out-of-cluster read-only observer into this dynamic namespace
+        # so it can watch the migration exactly as it watches the fixed
+        # integration-test namespace. Stamped directly (never through retarget) so
+        # the subject keeps pointing at the observer's own namespace; it reuses the
+        # per-namespace pgcyan-viewer Role applied just above.
+        if self.viewer_sa and self.viewer_ns:
+            self.applier.apply_doc(self._external_viewer_binding(ns))
 
         # DB credentials the controller reads via envFrom (never in git).
         self.applier.create_secret(ns, "pgcyan-db-uris", {
