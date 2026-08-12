@@ -69,8 +69,11 @@ spec:
             - name: work
               mountPath: /work
           resources:
-            requests: { cpu: "250m", memory: "256Mi" }
-            limits:   { cpu: "1",    memory: "512Mi" }
+            # A short-lived, read-only metadata collector that co-schedules with
+            # the parked controller (it is the walk's first step), so keep the CPU
+            # request small enough to fit alongside it on a constrained node.
+            requests: { cpu: "50m", memory: "256Mi" }
+            limits:   { cpu: "1",   memory: "512Mi" }
       volumes:
         - name: work
           emptyDir: {}

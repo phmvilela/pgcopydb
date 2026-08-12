@@ -10,9 +10,10 @@ name: Integration tests
 #
 # ONE job, `migration`, runs the whole implemented pipeline end-to-end via the
 # folded controller -- no per-step jobs, no parallelism, no shared-object race.
-# It runs the the collect step collector (barrier), then stands up the controller
-# StatefulSet with PGCYAN_FOLLOW_CDC=true: the controller holds the consistent
-# snapshot in-pod and walks plan -> schema -> copy -> indexes -> foreign-keys,
+# It stands up the controller StatefulSet with PGCYAN_FOLLOW_CDC=true: the
+# controller holds the consistent snapshot in-pod and walks
+# collect -> plan -> schema -> copy -> sequences -> indexes -> foreign-keys
+# (the collect step publishes the planner inputs; no separate pre-apply),
 # then itself becomes the CDC consumer (`pgcopydb follow --resume` on its own
 # --dir, so follow reuses the slot). It then asserts: the combined pgcyan-copylog
 # ConfigMap is a `completed` copy with per-table row counts; the target has
@@ -209,24 +210,10 @@ jobs:
           # StatefulSet delete) -- clear it so this run gets a fresh --dir.
           kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
 
-      # the collect step (collect inputs) is NOT part of the controller walk (which starts
-      # at the planner, -1); run it + barrier first so the planner has its inputs.
-      - name: the collect step -- collect inputs (barrier)
-        run: |
-          set -euo pipefail
-          wait_job() {
-            local job="$1" timeout="${2:-900}" elapsed=0 done_s fail_s
-            while true; do
-              done_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
-              fail_s=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
-              [ "$done_s" = "True" ] && { echo "job/$job Complete"; return 0; }
-              [ "$fail_s" = "True" ] && { echo "::error::job/$job Failed"; return 1; }
-              [ "$elapsed" -ge "$timeout" ] && { echo "::error::job/$job timed out"; return 1; }
-              sleep 10; elapsed=$((elapsed + 10))
-            done
-          }
-          envsubst '${PGCYAN_IMAGE}' < deploy/k8s/25-job-collect-inputs.yaml | kubectl apply -f -
-          wait_job pgcyan-collect-inputs 900
+      # collect-inputs is the FIRST step of the controller's DAG walk (it
+      # publishes the pgcyan-planner-inputs ConfigMap the planner mounts), so it
+      # is no longer applied here -- the controller's orchestrator runs it, and
+      # barriers on it, before the planner. See pg_cyan/orchestrator.py.
 
       # Apply the controller StatefulSet. envsubst bakes the image + PGCYAN_STOP_AFTER
       # (empty = full walk) + PGCYAN_FOLLOW_CDC (=true, stream CDC after the walk)
