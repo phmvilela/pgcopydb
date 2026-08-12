@@ -363,6 +363,20 @@ def test_apply_creates_job():
                                                                  "namespace": "pgcyan-migration"}})]
 
 
+def test_apply_forces_orchestrator_namespace_over_manifest():
+    # Step manifests hardcode the fixed pgcyan-migration namespace, but a
+    # control-plane-provisioned run drives them from a pgcyan-mig-* namespace and
+    # can only create there. _apply must override the manifest's namespace, else
+    # the create is cross-namespace and Forbidden.
+    batch_api = FakeBatchApi()
+    orch = make_orchestrator(batch_api=batch_api, namespace="pgcyan-mig-abc123")
+    orch._apply({"kind": "Job", "metadata": {"name": "pgcyan-planner",
+                                             "namespace": "pgcyan-migration"}})
+    created_ns, _, body = batch_api.created[0]
+    assert created_ns == "pgcyan-mig-abc123"
+    assert body["metadata"]["namespace"] == "pgcyan-mig-abc123"
+
+
 def test_apply_treats_conflict_as_idempotent_noop():
     batch_api = FakeBatchApi(create_conflicts={"pgcyan-schema"})
     orch = make_orchestrator(batch_api=batch_api)

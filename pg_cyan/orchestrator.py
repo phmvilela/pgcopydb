@@ -423,7 +423,13 @@ class PgCyanOrchestrator:
         """Create ``doc`` in the cluster; treat "already exists" as idempotent no-op."""
         kind = doc.get("kind")
         metadata = doc.setdefault("metadata", {})
-        metadata.setdefault("namespace", self.namespace)
+        # Force the orchestrator's own namespace. Step manifests hardcode the
+        # fixed pgcyan-migration namespace, but the orchestrator can only create
+        # in the namespace it runs in -- so honouring a hardcoded value makes a
+        # control-plane-provisioned run (which runs in a pgcyan-mig-* namespace)
+        # fail Forbidden trying to create cross-namespace. Overriding, not
+        # setdefault, keeps apply consistent with the barrier reads below.
+        metadata["namespace"] = self.namespace
         namespace = metadata["namespace"]
         name = metadata.get("name")
 
