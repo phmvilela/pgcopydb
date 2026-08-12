@@ -44,9 +44,10 @@ Fails fast: the first step whose barrier does not resolve to success stops
 the walk immediately (``run()`` returns without applying later steps).
 
 ASSUMPTIONS (out of scope for this ticket, tracked in deploy/k8s/README.md):
-  * The namespace/RBAC/PVC/Secrets (00/01/10/20) and the input collector +
-    planner-inputs ConfigMap (11/25, the collect step) are already applied -- the
-    ticket's step list starts at the plan step.
+  * The namespace/RBAC/PVC/Secrets (00/01/10/20) are already applied -- the walk
+    stands up the workloads inside that namespace. The collect step (which
+    publishes the planner-inputs ConfigMap) is the FIRST step of the walk, so the
+    orchestrator owns it; callers no longer apply it out of band.
   * ``plan.json`` is read from the ``pgcyan-plan`` ConfigMap the planner Job
     itself publishes (``30-job-planner.yaml``'s ``kubectl apply``), fetched
     via the API *after* the plan step's barrier succeeds -- not mounted as a
@@ -163,6 +164,13 @@ class PgCyanOrchestrator:
     #: ConfigMap handoff. When ``snapshot_id`` is unset (standalone runs), no
     #: injection happens and the manifests' own env applies.
     STEPS: List[Dict] = [
+        # Collect the planner's inputs first: the read-only source collectors
+        # (metrics + large-object count) publish the pgcyan-planner-inputs
+        # ConfigMap the planner mounts. No snapshot -- the collectors read source
+        # metadata, not MVCC data. Its barrier means the ConfigMap exists before
+        # the planner is created, and the collector pod frees its slot before the
+        # planner runs. See also: deploy/k8s/25-job-collect-inputs.yaml
+        {"id": "collect", "name": "Collect", "manifest": "25-job-collect-inputs.yaml"},
         {"id": "plan", "name": "Plan", "manifest": "30-job-planner.yaml"},
         {"id": "schema", "name": "Schema", "manifest": "40-job-schema.yaml",
          "needs_snapshot": True},

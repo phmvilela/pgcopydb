@@ -244,7 +244,7 @@ def test_load_step_manifests_static_step_multi_doc():
 
 def test_load_step_manifests_templated_step_renders_pvc_and_job_per_shard():
     orch = make_orchestrator()
-    step = dict(PgCyanOrchestrator.STEPS[2])  # copy
+    step = dict(PgCyanOrchestrator.STEPS[3])  # copy
     assert step["id"] == "copy"
     docs = orch._load_step_manifests(step, plan=SAMPLE_PLAN)
     # one RWO work-dir PVC + one Job per shard, PVC first so it is
@@ -280,7 +280,7 @@ def test_load_step_manifests_index_template_renders_job_per_index_shard():
 
 def test_load_step_manifests_templated_step_requires_plan_entries():
     orch = make_orchestrator()
-    step = dict(PgCyanOrchestrator.STEPS[2])
+    step = dict(PgCyanOrchestrator.STEPS[3])
     with pytest.raises(OrchestratorError, match="data_shards"):
         orch._load_step_manifests(step, plan={"data_shards": []})
 
@@ -316,7 +316,7 @@ def test_static_manifest_image_placeholder_filled_runtime_vars_preserved():
 
 def test_templated_manifest_image_placeholder_filled():
     orch = make_orchestrator()
-    step = dict(PgCyanOrchestrator.STEPS[2])  # copy
+    step = dict(PgCyanOrchestrator.STEPS[3])  # copy
     docs = orch._load_step_manifests(step, plan=SAMPLE_PLAN)
     # Templated steps are multi-doc (a per-shard PVC precedes each Job); the
     # image placeholder lives on the Job containers.
@@ -483,6 +483,7 @@ def test_read_plan_configmap_bad_json_raises():
 
 def _all_jobs_complete_batch_api():
     return FakeBatchApi(job_outcomes={
+        "pgcyan-collect-inputs": ["complete"],
         "pgcyan-planner": ["complete"],
         "pgcyan-schema": ["complete"],
         "pgcyan-datashard-shard-0": ["complete"],
@@ -509,7 +510,7 @@ def test_run_happy_path_applies_all_steps_in_order():
     # No snapshot-holder step (controller holds it in-pod) and no CDC step (the
     # controller streams CDC itself after the walk). The sequence-sync the sequences step
     # sits between the data copy and the index builds.
-    assert [p["step"] for p in summary["steps"]] == ["plan", "schema", "copy", "sequences", "indexes", "foreign-keys"]
+    assert [p["step"] for p in summary["steps"]] == ["collect", "plan", "schema", "copy", "sequences", "indexes", "foreign-keys"]
     assert all(p["success"] for p in summary["steps"])
     # each DATA shard got its own RWO work-dir PVC stamped; the index shards are
     # pure psycopg2 and use emptyDir, so they stamp no PVC.
@@ -519,13 +520,35 @@ def test_run_happy_path_applies_all_steps_in_order():
     # data + index shards + fk + pre-data + planner Jobs were all created
     created_job_names = {name for _, name, _ in batch_api.created}
     assert created_job_names == {
-        "pgcyan-planner", "pgcyan-schema", "pgcyan-datashard-shard-0",
-        "pgcyan-datashard-shard-1", "pgcyan-sequences", "pgcyan-index-idx-0",
-        "pgcyan-index-idx-1", "pgcyan-foreign-keys",
+        "pgcyan-collect-inputs", "pgcyan-planner", "pgcyan-schema",
+        "pgcyan-datashard-shard-0", "pgcyan-datashard-shard-1", "pgcyan-sequences",
+        "pgcyan-index-idx-0", "pgcyan-index-idx-1", "pgcyan-foreign-keys",
     }
     # NO Deployment: the CDC follow-cdc Deployment is gone (controller streams CDC).
     created_deployment_names = {name for _, name, _ in apps_api.created}
     assert created_deployment_names == set()
+
+
+def test_collect_is_the_first_step_and_precedes_plan():
+    # Collect must run (and barrier) before the planner, which mounts the
+    # pgcyan-planner-inputs ConfigMap the collect step publishes.
+    assert PgCyanOrchestrator.STEPS[0]["id"] == "collect"
+    assert PgCyanOrchestrator.STEPS[1]["id"] == "plan"
+    # No snapshot injection: the collectors read source metadata, not MVCC data.
+    assert not PgCyanOrchestrator.STEPS[0].get("needs_snapshot")
+
+
+def test_run_applies_collect_job_before_planner():
+    batch_api = _all_jobs_complete_batch_api()
+    orch = make_orchestrator(batch_api=batch_api, apps_api=_all_deployments_ready_apps_api(),
+                              core_api=FakeCoreApi(plan=SAMPLE_PLAN))
+    summary = orch.run()
+    steps = [p["step"] for p in summary["steps"]]
+    assert steps[0] == "collect"
+    assert steps.index("collect") < steps.index("plan")
+    # The collect Job was applied (in creation order) before the planner.
+    created = [name for _, name, _ in batch_api.created]
+    assert created.index("pgcyan-collect-inputs") < created.index("pgcyan-planner")
 
 
 def test_run_fails_fast_and_stops_the_dag():
@@ -539,10 +562,10 @@ def test_run_fails_fast_and_stops_the_dag():
     summary = orch.run()
 
     assert summary["status"] == "failure"
-    # planner (-1) ran, pre-data (0) failed, nothing after attempted
-    assert [p["step"] for p in summary["steps"]] == ["plan", "schema"]
-    assert summary["steps"][0]["success"] is True   # planner
-    assert summary["steps"][1]["success"] is False  # pre-data
+    # collect + plan ran, schema failed, nothing after attempted
+    assert [p["step"] for p in summary["steps"]] == ["collect", "plan", "schema"]
+    assert summary["steps"][1]["success"] is True   # plan
+    assert summary["steps"][2]["success"] is False  # schema
     # the failing pre-data step halts the DAG: no data shards, no follow-cdc
     assert "pgcyan-datashard-shard-0" not in {n for _, n, _ in batch_api.created}
     assert "pgcyan-follow-cdc" not in {n for _, n, _ in apps_api.created}
@@ -559,7 +582,7 @@ def test_run_stops_before_reading_plan_if_earlier_step_fails():
     orch = make_orchestrator(batch_api=batch_api, core_api=ExplodingCoreApi())
     summary = orch.run()
     assert summary["status"] == "failure"
-    assert [p["step"] for p in summary["steps"]] == ["plan"]
+    assert [p["step"] for p in summary["steps"]] == ["collect", "plan"]
 
 
 def test_run_fails_fast_when_one_of_two_data_shards_fails():
@@ -575,7 +598,7 @@ def test_run_fails_fast_when_one_of_two_data_shards_fails():
     summary = orch.run()
 
     assert summary["status"] == "failure"
-    assert [p["step"] for p in summary["steps"]] == ["plan", "schema", "copy"]
+    assert [p["step"] for p in summary["steps"]] == ["collect", "plan", "schema", "copy"]
     data_step = summary["steps"][-1]
     assert data_step["success"] is False
     targets_by_name = {t["name"]: t for t in data_step["targets"]}
@@ -593,7 +616,7 @@ def _shard_env(job_doc):
 
 def test_data_shard_env_carries_plan_slot_and_publication():
     orch = make_orchestrator()
-    step = dict(PgCyanOrchestrator.STEPS[2])  # copy
+    step = dict(PgCyanOrchestrator.STEPS[3])  # copy
     docs = orch._load_step_manifests(step, plan=SAMPLE_PLAN)
     job = next(d for d in docs if d["kind"] == "Job")
     env = _shard_env(job)
@@ -820,7 +843,7 @@ def test_run_stop_after_step_two_skips_later_steps():
 
     assert summary["status"] == "success"
     assert summary["stopped_after"] == "copy"
-    assert [p["step"] for p in summary["steps"]] == ["plan", "schema", "copy"]
+    assert [p["step"] for p in summary["steps"]] == ["collect", "plan", "schema", "copy"]
     created = {name for _, name, _ in batch_api.created}
     assert "pgcyan-index-idx-0" not in created and "pgcyan-foreign-keys" not in created
     assert "pgcyan-follow-cdc" not in {name for _, name, _ in apps_api.created}
