@@ -217,8 +217,11 @@ sandboxes on demand — distinct from a single migration run. Two new trees:
   `host:port/db` labels — **never credentials** (those live in the k8s Secret).
   Its tests live under `control-plane/api/tests/` and are **not** collected by
   the repo-root `pytest` (run them from `control-plane/api`). **Built from the
-  repo-root context** (like the migration image) so it can bake in `deploy/k8s`:
-  `docker build -f control-plane/api/Dockerfile .`. The provisioner reads those
+  repo-root context** (like the migration image) so it can bake in `deploy/k8s`.
+  Both images are split into a rarely-rebuilt base (`Dockerfile.base`: heavy deps
+  — the migration one compiles pgcopydb, the control-plane one is python + pip
+  deps) and a thin app `Dockerfile` that does `FROM` the hash-tagged base, so a
+  normal commit skips the compile/pip install. The provisioner reads those
   baked manifests and only *retargets the namespace + fills `${PGCYAN_*}` env* at
   apply time — the migration YAML is never re-declared (no drift). The controller
   image it stamps in comes from the `PGCYAN_MIGRATION_IMAGE` env on the API pod.

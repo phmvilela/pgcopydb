@@ -1,0 +1,7 @@
+# Test-only deps for the pg_cyan package / migration image. Kept OUT of
+# requirements.txt so they are NOT baked into the runtime image (which only
+# needs the app deps) -- that keeps the image smaller and the base-layer pip
+# install faster. CI installs this file to run the unit suite.
+-r requirements.txt
+pytest==7.4.3
+pytest-cov==4.1.0

@@ -145,12 +145,16 @@ python -m pytest                       # tests
 ## Build the image (from the repo root)
 
 The build context is the **repo root** (like the migration image) so `deploy/k8s`
-can be baked in — pass the Dockerfile explicitly:
+can be baked in — pass the Dockerfile explicitly. The image is split into a base
+(python + pip deps, `Dockerfile.base`, rebuilt only when the deps change) and a
+thin app layer (`Dockerfile`) that does `FROM` the base, so build the base first:
 
 ```bash
-docker build -f control-plane/api/Dockerfile -t pgcyan-control-plane:dev .
-az acr build -r <acr> -f control-plane/api/Dockerfile \
-    --image pgcyan-control-plane:<tag> .
+docker build -f control-plane/api/Dockerfile.base -t pgcyan-control-plane-base:local .
+docker build -f control-plane/api/Dockerfile \
+    --build-arg BASE_IMAGE=pgcyan-control-plane-base:local -t pgcyan-control-plane:dev .
+# (CI keys the base tag on a hash of its deps and reuses it -- see
+#  .github/workflows/deploy-control-plane.yml.)
 ```
 
 Deployment manifests: [`../../deploy/control-plane/`](../../deploy/control-plane/).

@@ -46,19 +46,37 @@ command -v az >/dev/null || { echo "az CLI not found; install the Azure CLI" >&2
 LOGIN_SERVER="$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)"
 IMAGE="${LOGIN_SERVER}/${IMAGE_REPO}:${IMAGE_TAG}"
 
+# The image is split into a heavy, rarely-changing base (compiled pgcopydb +
+# kubectl + pip deps, Dockerfile.base) and a thin app layer (Dockerfile) that
+# does `FROM <base>`. Build the base first (keyed on a hash of its inputs so an
+# unchanged base is reused), then the app on top. See build.yml for the CI form.
+BASE_TAG="$(cat "${REPO_ROOT}/Dockerfile.base" "${REPO_ROOT}/requirements.txt" | sha256sum | cut -c1-16)"
+
 echo ">> Building ${IMAGE} (mode: ${MODE})"
 
 if [[ "${MODE}" == "acr" ]]; then
   # Server-side build in ACR Tasks; no local Docker required.
+  base="pgcyan-base:${BASE_TAG}"
+  if az acr repository show --name "${ACR_NAME}" --image "${base}" >/dev/null 2>&1; then
+    echo ">> Reusing published base ${base}"
+  else
+    echo ">> Building base ${base} (compiles pgcopydb + installs pip deps)"
+    az acr build --registry "${ACR_NAME}" --image "${base}" \
+      --file "${REPO_ROOT}/Dockerfile.base" "${REPO_ROOT}"
+  fi
   az acr build \
     --registry "${ACR_NAME}" \
     --image "${IMAGE_REPO}:${IMAGE_TAG}" \
+    --build-arg BASE_IMAGE="${LOGIN_SERVER}/${base}" \
     --file "${REPO_ROOT}/Dockerfile" \
     "${REPO_ROOT}"
 else
   command -v docker >/dev/null || { echo "docker not found; --local needs a Docker daemon" >&2; exit 1; }
   az acr login --name "${ACR_NAME}"
-  docker build -t "${IMAGE}" -f "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}"
+  base="pgcyan-base:${BASE_TAG}"
+  docker build -t "${base}" -f "${REPO_ROOT}/Dockerfile.base" "${REPO_ROOT}"
+  docker build -t "${IMAGE}" --build-arg BASE_IMAGE="${base}" \
+    -f "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}"
   docker push "${IMAGE}"
 fi
 

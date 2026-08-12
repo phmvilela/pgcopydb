@@ -32,8 +32,10 @@ on:
     branches: [main]
     paths:
       - "Dockerfile"
+      - "Dockerfile.base"
       - "requirements.txt"
       - "pg_cyan/**"
+      - "deploy/k8s/**"
       - ".github/workflows/build.yml"
   push:
     branches: [main]
@@ -53,15 +55,30 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image (load into local Docker)
+      # Base (compiled pgcopydb + kubectl + pip deps) -- GHA-cached, so the
+      # expensive compile only reruns when Dockerfile.base / requirements.txt
+      # actually change.
+      - name: Build base image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.base
           load: true
-          tags: pgcyan:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: pgcyan-base:ci
+          cache-from: type=gha,scope=base
+          cache-to: type=gha,mode=max,scope=base
+
+      # App image on top of the base -- the thin, per-commit layer. Built with a
+      # plain `docker build` (not buildx) so `FROM pgcyan-base:ci` resolves from
+      # the base just loaded into the local daemon; the layer is only COPYs, so it
+      # needs no registry cache.
+      - name: Build image (load into local Docker)
+        run: |
+          docker build \
+            --file Dockerfile \
+            --build-arg BASE_IMAGE=pgcyan-base:ci \
+            --tag pgcyan:ci \
+            .
 
       # Acceptance criteria, executed against the built image.
       - name: Acceptance -- pgcopydb --version
@@ -90,9 +107,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Resolve image tag (commit short SHA)
+      - name: Resolve image + base tags
         id: tag
-        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          # The base tag is keyed on the inputs that DEFINE the base (the pinned
+          # pgcopydb ref + kubectl version live in Dockerfile.base; the pip deps
+          # in requirements.txt). Change any of them -> new tag -> rebuild;
+          # otherwise the already-published base is reused, so the app build skips
+          # the pgcopydb compile + pip install entirely.
+          echo "base_tag=$(cat Dockerfile.base requirements.txt | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Guard -- require Azure identity secrets
         env:
@@ -110,17 +134,40 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push image (ACR Tasks), tagged by short SHA only
+      - name: Resolve ACR login server
+        id: acr
+        run: echo "login_server=$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)" >> "$GITHUB_OUTPUT"
+
+      # Build the base only if THIS dep set has not been published before. The
+      # tag existence IS the cache check -- an unchanged base (the common case)
+      # skips the pgcopydb compile + pip install here entirely.
+      - name: Build base image if not already published
+        run: |
+          set -euo pipefail
+          base="pgcyan-base:${{ steps.tag.outputs.base_tag }}"
+          if az acr repository show --name "${ACR_NAME}" --image "${base}" >/dev/null 2>&1; then
+            echo "Base ${base} already published -- reusing it."
+          else
+            echo "Base ${base} missing -- building it (compiles pgcopydb + installs pip deps)."
+            az acr build \
+              --registry "${ACR_NAME}" \
+              --image "${base}" \
+              --file Dockerfile.base \
+              .
+          fi
+
+      - name: Build and push image (ACR Tasks) on the base, tagged by short SHA only
         run: |
           az acr build \
             --registry "${ACR_NAME}" \
             --image "${IMAGE_REPO}:${{ steps.tag.outputs.short_sha }}" \
+            --build-arg BASE_IMAGE="${{ steps.acr.outputs.login_server }}/pgcyan-base:${{ steps.tag.outputs.base_tag }}" \
             --file Dockerfile \
             .
 
       - name: Report pushed image
         run: |
-          login_server="$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)"
+          login_server="${{ steps.acr.outputs.login_server }}"
           digest="$(az acr repository show --name "${ACR_NAME}" \
             --image "${IMAGE_REPO}:${{ steps.tag.outputs.short_sha }}" --query digest -o tsv)"
           {

@@ -1,0 +1,33 @@
+# Build-context excludes for BOTH images (migration + control-plane), which
+# each build from the repo root. Neither COPYs any of these, and terraform/
+# alone is ~240MB of provider binaries -- excluding them shrinks the
+# `az acr build` context upload from ~250MB to a few MB, and stops unrelated
+# edits (e.g. a local `terraform init`) from busting the Docker layer cache.
+#
+# NB: Docker does NOT read .gitignore, so this file is required separately.
+
+# VCS + CI + editor/agent config
+.git
+.github
+.claude
+.devcontainer
+
+# Large + irrelevant to any image
+terraform
+notes
+context
+scripts
+agent-workflow-steps
+
+# Tests + Python caches (never needed at runtime)
+tests
+control-plane/api/tests
+**/__pycache__
+**/*.pyc
+*.egg-info
+.pytest_cache
+.coverage
+
+# Docs
+README.md
+CLAUDE.md

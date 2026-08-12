@@ -1,0 +1,26 @@
+# pgcyan control-plane BASE image -- python + the API's pip deps.
+# ---------------------------------------------------------------------------
+# Split out from the app Dockerfile so a normal code commit does not re-install
+# pip deps: this base is rebuilt ONLY when the deps (requirements.txt) change.
+# CI keys the base tag on a hash of (this file + control-plane/api/requirements.txt)
+# and reuses the published base when that tag exists -- see
+# .github/workflows/deploy-control-plane.yml.
+#
+# BUILD CONTEXT = REPO ROOT (same as the app image), so the --file path is
+# control-plane/api/Dockerfile.base.
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PGCYAN_MANIFESTS_DIR=/app/deploy/k8s
+
+WORKDIR /app
+
+COPY control-plane/api/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Non-root runtime user (uid/gid 1000 == pod runAsUser/fsGroup). Created here so
+# the thin app image just COPYs code as this user and switches to it.
+RUN groupadd --gid 1000 app && useradd --uid 1000 --gid 1000 --no-create-home app

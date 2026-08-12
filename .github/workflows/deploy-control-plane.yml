@@ -90,6 +90,10 @@ jobs:
           [ -z "$mig" ] && mig="$sha"
           echo "short_sha=$sha" >> "$GITHUB_OUTPUT"
           echo "migration_tag=$mig" >> "$GITHUB_OUTPUT"
+          # Base tag keyed on the control-plane deps (Dockerfile.base +
+          # requirements.txt): unchanged deps -> the published base is reused, so
+          # the per-commit build skips pip install.
+          echo "base_tag=$(cat control-plane/api/Dockerfile.base control-plane/api/requirements.txt | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Azure login (OIDC, passwordless)
         uses: azure/login@v2
@@ -98,11 +102,33 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Resolve ACR login server
+        id: acr
+        run: echo "login_server=$(az acr show --name "${ACR_NAME}" --query loginServer -o tsv)" >> "$GITHUB_OUTPUT"
+
+      # Build the control-plane base only if these deps have not been published
+      # before (the tag existence is the cache check).
+      - name: Build control-plane base image if not already published
+        run: |
+          set -euo pipefail
+          base="${CONTROL_PLANE_REPO}-base:${{ steps.tags.outputs.base_tag }}"
+          if az acr repository show --name "${ACR_NAME}" --image "${base}" >/dev/null 2>&1; then
+            echo "Base ${base} already published -- reusing it."
+          else
+            echo "Base ${base} missing -- building it (installs pip deps)."
+            az acr build \
+              --registry "${ACR_NAME}" \
+              --image "${base}" \
+              --file control-plane/api/Dockerfile.base \
+              .
+          fi
+
       - name: Build + push the control-plane image (ACR Tasks, repo-root context)
         run: |
           az acr build \
             --registry "${ACR_NAME}" \
             --image "${CONTROL_PLANE_REPO}:${{ steps.tags.outputs.short_sha }}" \
+            --build-arg BASE_IMAGE="${{ steps.acr.outputs.login_server }}/${CONTROL_PLANE_REPO}-base:${{ steps.tags.outputs.base_tag }}" \
             --file control-plane/api/Dockerfile \
             .
 
