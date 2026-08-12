@@ -112,11 +112,16 @@ class MigrationDone(BaseModel):
     namespace: str
     state: str = "done"
     graceful: bool
+    #: Whether the controller dropped the source slot + publications before the
+    #: namespace was deleted. ``False`` means a leaked slot may remain (e.g. the
+    #: controller was unreachable) -- surfaced so the operator can reclaim it.
+    released: bool = False
     message: str
 
     model_config = ConfigDict(json_schema_extra={"examples": [
         {"id": "a1b2c3d4e5", "namespace": "pgcyan-mig-a1b2c3d4e5", "state": "done",
-         "graceful": True, "message": "stopped CDC and deleted the namespace"}]})
+         "graceful": True, "released": True,
+         "message": "released the source and deleted the namespace"}]})
 
 
 class MigrationStatus(BaseModel):

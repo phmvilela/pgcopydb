@@ -541,6 +541,52 @@ class PgCyanSnapshot:
             self.errors.append(f"Failed to drop stale publication: {str(e)}")
             return False
 
+    def _drop_publication(self, name: str) -> bool:
+        """``DROP PUBLICATION IF EXISTS <name>`` (idempotent). Never raises."""
+        if not self.conn:
+            self.errors.append("Cannot drop the publication: no source connection")
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("DROP PUBLICATION IF EXISTS {}").format(sql.Identifier(name))
+                )
+            self._log_event(
+                "drop_publication", "success", f"Dropped publication {name}",
+                {"publication": name},
+            )
+            return True
+        except PgError as e:
+            self._log_event(
+                "drop_publication", "failure", f"Failed to drop publication {name}",
+                {"publication": name, "error": str(e),
+                 "remediation": "Drop it manually: DROP PUBLICATION IF EXISTS \"<name>\";"},
+            )
+            self.errors.append(f"Failed to drop publication {name}: {str(e)}")
+            return False
+
+    def release(self) -> bool:
+        """
+        Drop the slot + both publications this holder created on the source.
+
+        The migration is done: reclaim the source-side state the k8s cascade
+        cannot (an orphaned slot pins WAL forever). Drops the replication slot,
+        pgcopydb's slot-named publication, and the holder's own
+        ``publication_name``. Opens a short-lived connection if one is not already
+        open.
+
+        The caller MUST have stopped the pgcopydb child first (``close()``), so
+        the slot is inactive -- ``drop_stale_slot`` refuses to drop an active
+        slot. Idempotent (``IF EXISTS`` / a missing slot is the happy path) and
+        never raises; returns ``True`` iff every drop succeeded.
+        """
+        if not self.conn and not self.connect():
+            return False
+        slot_ok = self.drop_stale_slot()
+        slot_pub_ok = self.drop_stale_publication()
+        own_pub_ok = self._drop_publication(self.publication_name)
+        return slot_ok and slot_pub_ok and own_pub_ok
+
     # --------------------------------------------------------------- snapshot
 
     def build_pgcopydb_command(self) -> List[str]:

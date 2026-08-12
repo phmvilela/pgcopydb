@@ -82,20 +82,23 @@ class FakeController:
 class FakeTeardown:
     """Stands in for the cluster teardown -- records namespaces, no real cluster.
 
-    Set ``graceful=False`` to simulate a controller that didn't stop in time, or
-    ``error=True`` to raise ``TeardownError``.
+    Set ``graceful=False`` to simulate a controller that didn't stop in time,
+    ``released=False`` to simulate an unreachable controller (source not released),
+    or ``error=True`` to raise ``TeardownError``.
     """
 
     def __init__(self):
         self.torn = []
         self.graceful = True
+        self.released = True
         self.error = False
 
     def teardown(self, namespace):
         self.torn.append(namespace)
         if self.error:
             raise TeardownError(f"teardown of {namespace} failed")
-        return {"namespace": namespace, "graceful": self.graceful}
+        return {"namespace": namespace, "graceful": self.graceful,
+                "released": self.released}
 
 
 @pytest.fixture

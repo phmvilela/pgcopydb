@@ -15,8 +15,8 @@ Endpoints:
 * ``POST /migrations/{id}/start``  -- proxy the controller's ``POST /start``.
 * ``GET /migrations/{id}/status``  -- aggregate the controller's ``/status``
   with the registry state.
-* ``POST /migrations/{id}/done``   -- stop CDC gracefully, delete the namespace,
-  free the singleton.
+* ``POST /migrations/{id}/done``   -- release the source (drop the slot +
+  publications), stop CDC gracefully, delete the namespace, free the singleton.
 
 ``PGCYAN_DATA_DIR`` (default ``/data``) is the mounted RWO volume that holds the
 SQLite registry; ``PGCYAN_MANIFESTS_DIR`` (default ``/app/deploy/k8s``) is where
@@ -158,10 +158,11 @@ def get_controller_client() -> ControllerClient:
 
 
 def get_teardown() -> Teardown:
-    """Cluster-backed teardown (scale-down + namespace delete). Overridden in tests."""
+    """Cluster-backed teardown (release source, scale-down, namespace delete).
+    Overridden in tests."""
     from app.k8s import K8sApplier
 
-    return Teardown(K8sApplier())
+    return Teardown(K8sApplier(), ControllerClient())
 
 
 @app.get("/health", tags=["health"], summary="Liveness / readiness probe")
@@ -381,7 +382,7 @@ def done_migration(
     row = _lookup(registry, migration_id)
     if row["state"] == "done":
         return MigrationDone(id=migration_id, namespace=row["namespace"],
-                             graceful=True, message="already torn down")
+                             graceful=True, released=True, message="already torn down")
 
     try:
         result = teardown.teardown(row["namespace"])
@@ -390,7 +391,14 @@ def done_migration(
 
     registry.set_state(migration_id, "done", _now())
     graceful = result["graceful"]
-    message = ("stopped CDC and deleted the namespace" if graceful else
-               "namespace deleted; controller did not confirm a clean stop in time")
+    released = result.get("released", False)
+    if not released:
+        message = ("namespace deleted, but the source was NOT released "
+                   "(controller unreachable) -- a leaked replication slot may remain")
+    elif graceful:
+        message = "released the source and deleted the namespace"
+    else:
+        message = ("released the source and deleted the namespace; "
+                   "controller did not confirm a clean stop in time")
     return MigrationDone(id=migration_id, namespace=row["namespace"],
-                         graceful=graceful, message=message)
+                         graceful=graceful, released=released, message=message)

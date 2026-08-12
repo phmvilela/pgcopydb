@@ -40,6 +40,24 @@ def test_start_posts_and_parses(monkeypatch):
     assert seen["url"].endswith("/start")
 
 
+def test_release_posts_with_long_timeout(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["method"] = req.get_method()
+        seen["timeout"] = timeout
+        return _Resp(200, b'{"released": true, "slot": "pgcyan_slot"}')
+
+    monkeypatch.setattr(cc.urllib.request, "urlopen", fake_urlopen)
+    code, body = ControllerClient().release("pgcyan-mig-x")
+    assert code == 200 and body["released"] is True
+    assert seen["method"] == "POST"
+    assert seen["url"].endswith("/release")
+    # release stops CDC before dropping, so it uses the long timeout, not the default.
+    assert seen["timeout"] == ControllerClient.RELEASE_TIMEOUT
+
+
 def test_http_error_surfaces_status(monkeypatch):
     def fake_urlopen(req, timeout=None):
         raise urllib.error.HTTPError(req.full_url, 404, "nf", {},

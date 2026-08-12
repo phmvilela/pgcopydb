@@ -344,6 +344,42 @@ def test_drop_stale_publication_reports_db_error(tmp_path):
     assert any("publication" in e for e in holder.errors)
 
 
+def test_release_drops_slot_and_both_publications(tmp_path):
+    # A finished migration: drop the (inactive) slot + BOTH publications the
+    # holder created -- the slot-named one and its own publication_name.
+    conn = _FakeConn(slot_exists=True, slot_active=False)
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot", publication_name="pgcyan_pub")
+    holder.conn = conn
+    assert holder.release() is True
+    assert conn.dropped_slots == ["pgcyan_slot"]
+    dropped_pubs = [e for e in conn.executed if "DROP PUBLICATION" in e]
+    assert len(dropped_pubs) == 2                       # slot-named + own
+    assert any("pgcyan_slot" in e for e in dropped_pubs)
+    assert any("pgcyan_pub" in e for e in dropped_pubs)
+
+
+def test_release_refuses_when_slot_still_active(tmp_path):
+    # If the consumer was not stopped first, the slot is active and must not be
+    # dropped -- release reports failure so teardown surfaces it.
+    conn = _FakeConn(slot_exists=True, slot_active=True, active_pid=99)
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot")
+    holder.conn = conn
+    assert holder.release() is False
+    assert conn.dropped_slots == []
+
+
+def test_release_opens_a_connection_when_none(monkeypatch, tmp_path):
+    # Called on a fresh holder (e.g. after close() nulled the connection): it must
+    # connect itself before dropping.
+    conn = _FakeConn(slot_exists=False)
+    monkeypatch.setattr(snapshot_module.psycopg2, "connect", lambda *a, **k: conn)
+    holder = _make_holder(tmp_path, slot_name="pgcyan_slot", publication_name="pgcyan_pub")
+    assert holder.conn is None
+    assert holder.release() is True
+    assert holder.conn is conn                          # connected on demand
+    assert len([e for e in conn.executed if "DROP PUBLICATION" in e]) == 2
+
+
 # ------------------------------------------------------------------ establish
 
 def test_establish_happy_path(monkeypatch, tmp_path):

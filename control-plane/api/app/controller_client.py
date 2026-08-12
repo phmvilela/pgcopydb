@@ -40,13 +40,14 @@ class ControllerClient:
     def __init__(self, timeout: float = 5.0):
         self.timeout = timeout
 
-    def _request(self, namespace: str, method: str, path: str) -> Tuple[int, Dict]:
+    def _request(self, namespace: str, method: str, path: str,
+                 timeout: float = None) -> Tuple[int, Dict]:
         url = controller_base_url(namespace) + path
         req = urllib.request.Request(url, method=method)
         if method == "POST":
             req.data = b""  # controller drains and ignores the body
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 return resp.status, _parse(resp.read())
         except urllib.error.HTTPError as exc:
             # A response with a non-2xx status -- surface it (e.g. controller 404).
@@ -62,6 +63,18 @@ class ControllerClient:
     def status(self, namespace: str) -> Tuple[int, Dict]:
         """GET /status from the controller."""
         return self._request(namespace, "GET", "/status")
+
+    #: Release stops any CDC stream (up to the pod grace window) then drops the
+    #: source slot + publications, so it needs far longer than the default.
+    RELEASE_TIMEOUT = 90.0
+
+    def release(self, namespace: str) -> Tuple[int, Dict]:
+        """POST /release on the controller -- drop the source slot + publications.
+
+        Idempotent server-side. Uses a long timeout because the controller may
+        stop an active CDC stream before dropping.
+        """
+        return self._request(namespace, "POST", "/release", timeout=self.RELEASE_TIMEOUT)
 
 
 def _parse(raw: bytes) -> Dict:

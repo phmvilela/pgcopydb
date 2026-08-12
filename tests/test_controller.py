@@ -31,15 +31,20 @@ class _FakeProc:
 
 
 class _FakeHolder:
-    def __init__(self, status="success", snapshot="SNAP-1", proc_alive=True):
+    def __init__(self, status="success", snapshot="SNAP-1", proc_alive=True,
+                 release_ok=True):
         self._summary = {"status": status, "snapshot_name": snapshot,
                          "slot": "pgcyan_slot", "publication": "pgcyan_pub"}
         self.proc = _FakeProc(proc_alive)
         # The controller hands these to the orchestrator for the CDC step.
         self.slot_name = "pgcyan_slot"
+        self.publication_name = "pgcyan_pub"
         self.plugin = "pgoutput"
         self.established = False
         self.closed = False
+        self._release_ok = release_ok
+        self.released = False
+        self.errors = []
 
     def establish(self):
         self.established = True
@@ -47,6 +52,12 @@ class _FakeHolder:
 
     def close(self):
         self.closed = True
+
+    def release(self):
+        self.released = True
+        if not self._release_ok:
+            self.errors = ["drop failed"]
+        return self._release_ok
 
 
 class _FakeOrchestrator:
@@ -341,6 +352,47 @@ def test_post_start_is_idempotent(tmp_path):
     ctl.state = "succeeded"                                       # already finished
     code, body = ctl.handle_api("POST", "/start")
     assert code == 200 and "finished" in body["message"]
+
+
+def test_post_release_stops_child_then_drops_source(tmp_path):
+    holder = _FakeHolder()
+    ctl = _make_controller(holder=holder, ready_file=str(tmp_path / "ready"))
+
+    code, body = ctl.handle_api("POST", "/release")
+    assert code == 200 and body["released"] is True
+    assert holder.closed is True      # the snapshot child was stopped (slot inactive)...
+    assert holder.released is True     # ...then the slot + publications were dropped
+    assert ctl._source_released is True
+
+
+def test_post_release_is_idempotent(tmp_path):
+    holder = _FakeHolder()
+    ctl = _make_controller(holder=holder, ready_file=str(tmp_path / "ready"))
+    assert ctl.handle_api("POST", "/release")[0] == 200
+
+    holder.released = False                        # prove the second call does NOT re-drop
+    code, body = ctl.handle_api("POST", "/release")
+    assert code == 200 and "already released" in body["message"]
+    assert holder.released is False
+
+
+def test_post_release_also_stops_cdc_when_streaming(tmp_path):
+    holder = _FakeHolder()
+    ctl = _make_controller(holder=holder, ready_file=str(tmp_path / "ready"))
+    ctl.cdc = _FakeFollow(slot_name="pgcyan_slot")   # we became the CDC consumer
+
+    code, _ = ctl.handle_api("POST", "/release")
+    assert code == 200
+    assert ctl.cdc.closed is True      # the follow stream (active consumer) was detached
+    assert holder.released is True
+
+
+def test_post_release_reports_failure_500(tmp_path):
+    holder = _FakeHolder(release_ok=False)
+    ctl = _make_controller(holder=holder, ready_file=str(tmp_path / "ready"))
+    code, body = ctl.handle_api("POST", "/release")
+    assert code == 500 and body["released"] is False
+    assert ctl._source_released is False           # not marked released -> teardown can retry
 
 
 def test_wait_to_start_holds_snapshot_until_start_signal(tmp_path):

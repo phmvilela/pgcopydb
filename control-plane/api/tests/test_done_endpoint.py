@@ -54,6 +54,22 @@ def test_done_reports_non_graceful_stop(client, fake_teardown):
     assert body["graceful"] is False
 
 
+def test_done_reports_source_released(client, fake_teardown):
+    mid = _provision(client)
+    body = client.post(f"/migrations/{mid}/done").json()
+    assert body["released"] is True
+    assert "released the source" in body["message"]
+
+
+def test_done_flags_source_not_released_when_controller_unreachable(client, fake_teardown):
+    mid = _provision(client)
+    fake_teardown.released = False          # controller unreachable at teardown
+    body = client.post(f"/migrations/{mid}/done").json()
+    assert body["state"] == "done"          # namespace still deleted
+    assert body["released"] is False
+    assert "NOT released" in body["message"]
+
+
 def test_done_unknown_migration_404(client):
     assert client.post("/migrations/nope/done").status_code == 404
 

@@ -45,7 +45,7 @@ mid-walk aborts the copy rather than "succeeding" against a dead snapshot.
 
 WAIT-TO-START: with ``PGCYAN_WAIT_FOR_START`` set, the controller does
 NOT snapshot on launch. It serves a small HTTP control API (``GET /status``,
-``GET /health``, ``POST /start``) on ``api_port`` (the ``pgcyan-controller``
+``GET /health``, ``POST /start``, ``POST /release``) on ``api_port`` (the ``pgcyan-controller``
 Service, :9999) and parks **before** taking the snapshot; it establishes the
 snapshot + walks only when ``POST /start`` arrives (see ``serve_and_run``). So a
 provisioned-but-idle pod holds no replication slot / snapshot on the source until
@@ -153,6 +153,10 @@ class PgCyanController:
         self._summary: Optional[Dict] = None
         #: Set by ``POST /start`` to release the pre-snapshot wait.
         self._start_requested = threading.Event()
+        #: Guards the one-shot source release (``POST /release``) so a retried or
+        #: concurrent call cannot double-drop / race the parked walk thread.
+        self._release_lock = threading.Lock()
+        self._source_released = False
         self._api_server: Optional[ThreadingHTTPServer] = None
 
         if core_api is None:
@@ -441,7 +445,8 @@ class PgCyanController:
         """Route a control-API request to ``(status_code, json_body)``.
 
         Pure logic (no sockets) so it is unit-testable; the HTTP handler is a thin
-        adapter over it. Routes: ``GET /status``, ``GET /health``, ``POST /start``.
+        adapter over it. Routes: ``GET /status``, ``GET /health``, ``POST /start``,
+        ``POST /release``.
         """
         path = (path.split("?", 1)[0]).rstrip("/") or "/"
         if method == "GET" and path in ("/status", "/"):
@@ -450,6 +455,8 @@ class PgCyanController:
             return 200, {"status": "ok", "state": self.state}
         if method == "POST" and path == "/start":
             return self._handle_start()
+        if method == "POST" and path == "/release":
+            return self._handle_release()
         return 404, {"error": "not found", "method": method, "path": path}
 
     def _handle_start(self) -> Tuple[int, Dict]:
@@ -462,6 +469,39 @@ class PgCyanController:
         self._log_event("start_signal", "success",
                         "Received POST /start; beginning the migration", {})
         return 202, {"state": "starting", "message": "migration start accepted"}
+
+    def _handle_release(self) -> Tuple[int, Dict]:
+        """Handle ``POST /release`` -- drop the source slot + publications.
+
+        The control plane calls this on teardown (``POST /migrations/{id}/done``)
+        so the source-side state the k8s cascade cannot reach is reclaimed before
+        the namespace is deleted. Works while parked (this runs on the API thread)
+        and whether or not CDC is streaming: any active consumer (the CDC follow
+        stream, or a still-running snapshot child) is stopped first so the slot is
+        inactive, then the drops run on a fresh connection. Idempotent -- a second
+        call after a successful release is a no-op.
+        """
+        with self._release_lock:
+            if self._source_released:
+                return 200, {"released": True, "message": "source already released"}
+            # Detach the slot's consumer so it is inactive and can be dropped: the
+            # CDC stream if we became the consumer, else the snapshot child (both
+            # close() calls are idempotent no-ops when nothing is running).
+            if self.cdc is not None:
+                self.cdc.close()
+            self.holder.close()
+            released = self.holder.release()
+            self._source_released = released
+            if released:
+                self._log_event(
+                    "release", "success",
+                    "Released source: dropped replication slot + publications",
+                    {"slot": self.holder.slot_name, "publication": self.holder.publication_name})
+                return 200, {"released": True, "slot": self.holder.slot_name}
+            self._log_event(
+                "release", "failure", "Failed to release the source",
+                {"errors": self.holder.errors})
+            return 500, {"released": False, "errors": self.holder.errors}
 
     def _make_request_handler(self):
         """Build a ``BaseHTTPRequestHandler`` bound to this controller."""
@@ -497,7 +537,7 @@ class PgCyanController:
         threading.Thread(target=server.serve_forever, name="pgcyan-control-api",
                          daemon=True).start()
         self._log_event("api", "success", f"Control API listening on :{self.api_port}",
-                        {"routes": ["GET /status", "GET /health", "POST /start"]})
+                        {"routes": ["GET /status", "GET /health", "POST /start", "POST /release"]})
         return server
 
     def _await_start(self) -> None:
