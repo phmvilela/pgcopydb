@@ -29,6 +29,7 @@ Kubernetes I/O goes through an injected ``applier`` so the provisioning logic
 
 See also: control-plane/api/app/k8s.py.
 """
+import json
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -73,6 +74,15 @@ def namespace_for(migration_id: str) -> str:
 RBAC_MANIFEST = "01-rbac.yaml"
 PVC_MANIFEST = "20-pvc-workdir.yaml"
 CONTROLLER_MANIFEST = "35-statefulset-controller.yaml"
+
+#: ConfigMap that carries the operator-declared capacity bundle into the
+#: namespace, and its single key. This is the exact declared-file shape the
+#: `capacity-inputs` provider reads (pg_cyan/capinputs.py): the collect step
+#: mounts it and explodes it into the planner-inputs ConfigMap. Delivering it is
+#: this component's job; consuming it in the DAG is a follow-up (like the
+#: collectors, it feeds the planner-inputs ConfigMap the same way).
+CAPACITY_CONFIGMAP = "pgcyan-capacity-declared"
+CAPACITY_DECLARED_KEY = "capacity-declared.json"
 
 
 class ProvisionError(Exception):
@@ -195,6 +205,10 @@ class Provisioner:
             "PGCOPYDB_TARGET_PGURI": req.target.to_pguri(),
         }, labels={"app.kubernetes.io/part-of": "pgcyan"})
 
+        # Operator-declared capacity bundle -> a namespace ConfigMap the planner
+        # side consumes (validated at the endpoint against the shared contract).
+        capacity_declared = self._deliver_capacity(req, ns, labels)
+
         # The controller, parked pre-snapshot (wait-to-start). Full walk on start
         # (STOP_AFTER empty); CDC off unless the control plane is configured for it.
         subs = {
@@ -212,4 +226,23 @@ class Provisioner:
                 _inject_env(doc, "PGCYAN_SHARDS", str(req.shards))
             self.applier.apply_doc(doc)
 
-        return {"id": mid, "namespace": ns}
+        return {"id": mid, "namespace": ns, "capacity_declared": capacity_declared}
+
+    def _deliver_capacity(self, req, ns: str, labels: Dict[str, str]) -> List[str]:
+        """Stamp the declared capacity bundle into the namespace as a ConfigMap.
+
+        Returns the delivered bundle keys (``[]`` when none were declared, so no
+        ConfigMap is created). The bundle is written verbatim under
+        ``capacity-declared.json`` -- the shape ``capacity-inputs`` reads.
+        """
+        capacity = getattr(req, "capacity", None)
+        bundle = capacity.to_bundle() if capacity is not None else {}
+        if not bundle:
+            return []
+        self.applier.apply_doc({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": CAPACITY_CONFIGMAP, "namespace": ns, "labels": labels},
+            "data": {CAPACITY_DECLARED_KEY: json.dumps(bundle, indent=2)},
+        })
+        return sorted(bundle)

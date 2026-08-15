@@ -1,8 +1,17 @@
 """Shared fixtures for the control-plane API tests."""
+import sys
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
+# The API vendors the shared, dependency-free capacity-input contract from the
+# repo's pg_cyan (baked into the image at build; see the Dockerfile). Put the
+# repo root on the path so these standalone tests import the same module the
+# running service does, rather than a copy.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from app.controller_client import ControllerUnreachable
 from app.main import (

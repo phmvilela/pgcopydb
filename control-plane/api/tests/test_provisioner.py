@@ -2,8 +2,10 @@
 import yaml
 import pytest
 
-from app.models import DbConn, MigrationRequest
+from app.models import CapacityInputs, DbConn, MigrationRequest
 from app.provisioner import (
+    CAPACITY_CONFIGMAP,
+    CAPACITY_DECLARED_KEY,
     Provisioner,
     ProvisionError,
     render_placeholders,
@@ -11,11 +13,12 @@ from app.provisioner import (
 )
 
 
-def _req(shards=None):
+def _req(shards=None, capacity=None):
     return MigrationRequest(
         source=DbConn(host="src", user="su", password="sp", database="sdb"),
         target=DbConn(host="tgt", user="tu", password="tp", database="tdb"),
         shards=shards,
+        capacity=capacity,
     )
 
 
@@ -46,7 +49,7 @@ def test_provision_stands_up_a_parked_namespace(manifests_dir, fake_applier):
     res = p.provision(_req(shards=6), migration_id="deadbeef01")
 
     ns = "pgcyan-mig-deadbeef01"
-    assert res == {"id": "deadbeef01", "namespace": ns}
+    assert res == {"id": "deadbeef01", "namespace": ns, "capacity_declared": []}
 
     # Namespace created first, carrying the migration-id label.
     assert fake_applier.namespaces[0][0] == ns
@@ -84,6 +87,35 @@ def test_provision_stands_up_a_parked_namespace(manifests_dir, fake_applier):
     assert env["PGCYAN_FOLLOW_CDC"] == ""
     assert env["PGCYAN_SHARDS"] == "6"
     assert "${" not in yaml.safe_dump(sts)
+
+
+def test_provision_delivers_declared_capacity_configmap(manifests_dir, fake_applier):
+    import json
+
+    cap = CapacityInputs(
+        source_capacity={"read_throughput_bytes_per_sec": 2e8, "max_connections": 500},
+        network={"bandwidth_bytes_per_sec": 1e9, "rtt_ms": 12},
+    )
+    p = Provisioner(manifests_dir, "acr/pgcyan:abc123", fake_applier)
+    res = p.provision(_req(capacity=cap), migration_id="deadbeef01")
+
+    assert res["capacity_declared"] == ["network", "source_capacity"]
+    cm = next(d for d in fake_applier.docs
+              if d.get("kind") == "ConfigMap"
+              and d["metadata"]["name"] == CAPACITY_CONFIGMAP)
+    assert cm["metadata"]["namespace"] == "pgcyan-mig-deadbeef01"
+    # The declared bundle is the exact shape `capacity-inputs` reads.
+    bundle = json.loads(cm["data"][CAPACITY_DECLARED_KEY])
+    assert bundle["network"]["bandwidth_bytes_per_sec"] == 1e9
+    assert set(bundle) == {"network", "source_capacity"}
+
+
+def test_provision_without_capacity_creates_no_capacity_configmap(manifests_dir, fake_applier):
+    p = Provisioner(manifests_dir, "acr/pgcyan:abc123", fake_applier)
+    res = p.provision(_req(), migration_id="deadbeef01")
+    assert res["capacity_declared"] == []
+    names = [d.get("metadata", {}).get("name") for d in fake_applier.docs]
+    assert CAPACITY_CONFIGMAP not in names
 
 
 def test_provision_binds_external_viewer_read_only(manifests_dir, fake_applier):

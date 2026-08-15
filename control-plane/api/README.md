@@ -40,13 +40,30 @@ kubectl port-forward -n pgcyan-system svc/pgcyan-control-plane-api 8080:80
 {
   "source": {"host": "src.pg", "user": "u", "password": "p", "database": "db"},
   "target": {"uri": "postgres://u:p@tgt.pg:5432/db?sslmode=require"},
-  "shards": 4
+  "shards": 4,
+  "capacity": {
+    "source_capacity": {"read_throughput_bytes_per_sec": 209715200, "max_connections": 500},
+    "network": {"bandwidth_bytes_per_sec": 1073741824, "rtt_ms": 12}
+  }
 }
 ```
 
 `source`/`target` accept either a full `uri` or discrete parts (`host`+`user`+
 `database` required; assembled into a URI with userinfo percent-encoded).
 `shards` is optional.
+
+`capacity` is optional: the operator-declared inputs the capacity-aware planner
+uses (`source_capacity`, `target_capacity`, `network`, `cluster_capacity`,
+`constraints`). Each is validated against the **shared contract**
+(`pg_cyan/capacity_contract.py`) — the same rules the planner reads by, so a
+rejected body is one the planner would also reject (invalid → `422` with
+field-level detail, before the singleton slot is claimed). Accepted objects are
+stamped into a `pgcyan-capacity-declared` ConfigMap in the migration namespace
+as the declared bundle the `capacity-inputs` provider consumes; the response's
+`capacity_declared` lists what was delivered. Only the **operator-declared**
+subset is accepted — machine-measured inputs (the network probe, live cluster
+capacity) and `copylog-history` are produced by collectors, which override a
+declared value when they supply a measured one.
 
 ## Layout
 

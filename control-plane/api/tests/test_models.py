@@ -2,7 +2,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.models import DbConn, MigrationRequest
+from app.models import CapacityInputs, DbConn, MigrationRequest
 
 
 def test_dbconn_from_parts_builds_percent_encoded_uri():
@@ -36,3 +36,29 @@ def test_migration_request_rejects_nonpositive_shards():
         MigrationRequest(source=src, target=tgt, shards=0)
     # None (omitted) is fine.
     assert MigrationRequest(source=src, target=tgt).shards is None
+
+
+def test_capacity_inputs_to_bundle_drops_absent_and_keys_by_contract():
+    cap = CapacityInputs(
+        source_capacity={"max_connections": 100},
+        network={"bandwidth_bytes_per_sec": 1e9},
+    )
+    bundle = cap.to_bundle()
+    assert set(bundle) == {"source_capacity", "network"}
+    assert "target_capacity" not in bundle  # absent -> omitted, not null
+
+
+def test_capacity_inputs_rejects_collector_owned_and_unknown_keys():
+    # copylog_history is collector-produced, not operator-declared.
+    with pytest.raises(ValidationError):
+        CapacityInputs(copylog_history={"observations": []})
+    with pytest.raises(ValidationError):
+        CapacityInputs(mystery={"x": 1})
+
+
+def test_migration_request_capacity_is_optional():
+    req = MigrationRequest(
+        source=DbConn(uri="postgres://u:p@h/db"),
+        target=DbConn(uri="postgres://u:p@h/db2"),
+    )
+    assert req.capacity is None

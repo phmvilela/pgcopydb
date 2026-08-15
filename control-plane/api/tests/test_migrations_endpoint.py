@@ -34,6 +34,35 @@ def test_post_migrations_rejects_incomplete_source(client):
     assert resp.status_code == 422
 
 
+def test_post_migrations_accepts_and_delivers_declared_capacity(client, fake_applier):
+    resp = _post(client, capacity={
+        "source_capacity": {"read_throughput_bytes_per_sec": 2e8, "max_connections": 500},
+        "network": {"bandwidth_bytes_per_sec": 1e9, "rtt_ms": 12},
+    })
+    assert resp.status_code == 201
+    assert sorted(resp.json()["capacity_declared"]) == ["network", "source_capacity"]
+    # The declared bundle was stamped into the namespace as a ConfigMap.
+    assert any(d.get("kind") == "ConfigMap"
+               and d["metadata"]["name"] == "pgcyan-capacity-declared"
+               for d in fake_applier.docs)
+
+
+def test_post_migrations_rejects_invalid_capacity_without_claiming_slot(client, registry):
+    # network with no throughput signal fails the shared contract.
+    resp = _post(client, capacity={"network": {"rtt_ms": 12}})
+    assert resp.status_code == 422
+    assert "network.json" in resp.json()["detail"]["capacity"]
+    # The singleton slot must be free -- a bad request never reserves it.
+    assert registry.list() == []
+    assert _post(client, shards=4).status_code == 201
+
+
+def test_post_migrations_rejects_collector_owned_capacity_key(client):
+    # copylog-history is machine-collected, not operator-declared -> not accepted.
+    resp = _post(client, capacity={"copylog_history": {"observations": []}})
+    assert resp.status_code == 422
+
+
 def test_singleton_rejects_second_while_active(client, registry):
     assert _post(client).status_code == 201
     resp = _post(client)  # one already active

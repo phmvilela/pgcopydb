@@ -1,5 +1,5 @@
 """Request/response models for the control-plane API."""
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -49,11 +49,49 @@ class DbConn(BaseModel):
         return f"{self.host}:{self.port}/{self.database}"
 
 
+class CapacityInputs(BaseModel):
+    """Operator-declared capacity objects for the capacity-aware planner.
+
+    Each is a free-form JSON object validated at the endpoint against the shared
+    contract (``pg_cyan/capacity_contract.py``) — the same rules the planner and
+    the collectors use, so what the API accepts is exactly what the planner reads.
+    The values are intentionally untyped here (``dict``) to avoid re-encoding the
+    contract in pydantic; only the operator-declared subset is accepted. The
+    machine-measured `copylog-history` is produced by a collector, not declared,
+    so it is deliberately not a field here (unknown keys are rejected).
+
+    Where a collector later supplies a measured value for the same input, it
+    overrides the declared one; until then the declared value is what the plan
+    uses. Absent inputs fall back to the planner's static defaults.
+    """
+    source_capacity: Optional[dict] = Field(default=None, description="source read ceiling, connections, WAL headroom")
+    target_capacity: Optional[dict] = Field(default=None, description="target write ceiling, connections")
+    network: Optional[dict] = Field(default=None, description="source<->cluster bandwidth + RTT")
+    cluster_capacity: Optional[dict] = Field(default=None, description="allocatable CPU, nodes, pods/node")
+    constraints: Optional[dict] = Field(default=None, description="operator clamp layer (tighten-only)")
+
+    model_config = ConfigDict(extra="forbid")
+
+    def to_bundle(self) -> dict:
+        """The present objects, keyed for ``capacity_contract`` / the declared file."""
+        present = {
+            "source_capacity": self.source_capacity,
+            "target_capacity": self.target_capacity,
+            "network": self.network,
+            "cluster_capacity": self.cluster_capacity,
+            "constraints": self.constraints,
+        }
+        return {k: v for k, v in present.items() if v is not None}
+
+
 class MigrationRequest(BaseModel):
-    """Body of ``POST /migrations``: source + target, optional shard count."""
+    """Body of ``POST /migrations``: source + target, optional shard count + capacity."""
     source: DbConn = Field(description="the source Postgres to migrate FROM")
     target: DbConn = Field(description="the target Postgres to migrate TO")
     shards: Optional[int] = Field(default=None, ge=1, description="copy shard count; planner default if omitted")
+    capacity: Optional[CapacityInputs] = Field(
+        default=None,
+        description="operator-declared capacity inputs; validated against the shared contract")
 
     model_config = ConfigDict(json_schema_extra={"examples": [{
         "source": {"host": "src.postgres.database.azure.com", "port": 5432,
@@ -61,6 +99,11 @@ class MigrationRequest(BaseModel):
         "target": {"uri": "postgres://migrator:s3cret@tgt.postgres.database.azure.com"
                           ":5432/appdb?sslmode=require"},
         "shards": 4,
+        "capacity": {
+            "source_capacity": {"read_throughput_bytes_per_sec": 209715200,
+                                "max_connections": 500},
+            "network": {"bandwidth_bytes_per_sec": 1073741824, "rtt_ms": 12},
+        },
     }]})
 
 
@@ -69,10 +112,12 @@ class MigrationCreated(BaseModel):
     id: str
     namespace: str
     state: str = "waiting-to-start"
+    #: Capacity objects delivered into the namespace for the planner (bundle keys).
+    capacity_declared: List[str] = []
 
     model_config = ConfigDict(json_schema_extra={"examples": [
         {"id": "a1b2c3d4e5", "namespace": "pgcyan-mig-a1b2c3d4e5",
-         "state": "waiting-to-start"}]})
+         "state": "waiting-to-start", "capacity_declared": ["network", "source_capacity"]}]})
 
 
 class MigrationRecord(BaseModel):
