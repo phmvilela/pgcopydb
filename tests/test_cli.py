@@ -16,6 +16,7 @@ from pg_cyan.sequences import PgCyanSequences as RealSequences
 from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
 from pg_cyan.predata import PgCyanPreData as RealPreData
+from pg_cyan.capinputs import PgCyanCapacityInputs as RealCapacityInputs
 
 
 class _StubChecker:
@@ -240,8 +241,23 @@ class _StubSequences(RealSequences):
                 "sequences_total": 0, "sequences_synced": 0, "errors": []}
 
 
+class _StubCapacityInputs(RealCapacityInputs):
+    """Records kwargs; failure when the declared filename is the 'bad' sentinel."""
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubCapacityInputs.last_kwargs = kwargs
+        self._ok = kwargs.get("declared_filename") != "bad.json"
+
+    def provide(self):
+        return {"status": "success" if self._ok else "failure",
+                "component": "capacity-inputs", "written": [], "skipped": {},
+                "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
+    monkeypatch.setattr(cli_module, "PgCyanCapacityInputs", _StubCapacityInputs)
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
     monkeypatch.setattr(cli_module, "PgCyanParameters", _StubExporter)
     monkeypatch.setattr(cli_module, "PgCyanMetrics", _StubMetricsCollector)
@@ -407,6 +423,25 @@ def test_plan_options_fall_back_to_env(runner, monkeypatch):
     runner.invoke(cli_module.cli, ["plan", "--output-dir", "ok_dir"])
     assert _StubPlanner.last_kwargs["inputs_dir"] == "/inputs"
     assert _StubPlanner.last_kwargs["shards"] == 7
+
+
+def test_capacity_inputs_exit_zero_on_success(runner):
+    result = runner.invoke(cli_module.cli, ["capacity-inputs", "--output-dir", "ok_dir"])
+    assert result.exit_code == 0
+    assert _StubCapacityInputs.last_kwargs["output_dir"] == "ok_dir"
+
+
+def test_capacity_inputs_exit_one_on_failure(runner):
+    result = runner.invoke(cli_module.cli, ["capacity-inputs", "--declared-filename", "bad.json"])
+    assert result.exit_code == 1
+
+
+def test_capacity_inputs_options_fall_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PG_INPUTS_DIR", "/inputs")
+    monkeypatch.setenv("PGCYAN_CAPACITY_DECLARED", "caps.json")
+    runner.invoke(cli_module.cli, ["capacity-inputs", "--output-dir", "ok_dir"])
+    assert _StubCapacityInputs.last_kwargs["inputs_dir"] == "/inputs"
+    assert _StubCapacityInputs.last_kwargs["declared_filename"] == "caps.json"
 
 
 def test_restore_predata_exit_zero_on_success(runner):

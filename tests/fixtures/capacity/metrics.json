@@ -1,0 +1,10 @@
+{
+  "component": "source-pg-metrics",
+  "status": "success",
+  "tables": [
+    {"schema": "public", "name": "events_a", "heap_bytes": 314572800, "index_bytes": 31457280, "row_estimate": 1000000, "dead_tuple_ratio": 0.0, "toast_bytes": 0, "splittable_key": "id"},
+    {"schema": "public", "name": "events_b", "heap_bytes": 314572800, "index_bytes": 31457280, "row_estimate": 1000000, "dead_tuple_ratio": 0.0, "toast_bytes": 0, "splittable_key": "id"},
+    {"schema": "public", "name": "events_c", "heap_bytes": 314572800, "index_bytes": 31457280, "row_estimate": 1000000, "dead_tuple_ratio": 0.0, "toast_bytes": 0, "splittable_key": "id"},
+    {"schema": "public", "name": "events_d", "heap_bytes": 314572800, "index_bytes": 31457280, "row_estimate": 1000000, "dead_tuple_ratio": 0.0, "toast_bytes": 0, "splittable_key": "id"}
+  ]
+}

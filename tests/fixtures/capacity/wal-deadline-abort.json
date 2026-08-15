@@ -1,0 +1,6 @@
+{
+  "network": {"bandwidth_bytes_per_sec": 1000000000000, "per_stream_bytes_per_sec": 52428800},
+  "source_capacity": {"read_throughput_bytes_per_sec": 157286400, "max_connections": 500, "current_connections": 0, "wal_disk_free_bytes": 1024, "wal_generation_bytes_per_sec": 1000000000},
+  "target_capacity": {"write_throughput_bytes_per_sec": 500000000000, "max_connections": 500},
+  "cluster_capacity": {"allocatable_cpu": 64, "cpu_per_stream": 0.25, "node_count": 4, "max_pods_per_node": 30}
+}

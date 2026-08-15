@@ -148,6 +148,33 @@ success (an empty database is not a failure).
 Files land in `--output-dir` (default `$PG_OUTPUT_DIR`, else the current
 directory).
 
+### Declare capacity inputs (optional)
+
+```bash
+# Turn an operator-declared bundle into the planner's capacity artifacts
+python -m pg_cyan.cli capacity-inputs --inputs-dir ./artifacts --output-dir ./artifacts
+```
+
+The capacity-aware planner reads a family of optional artifacts —
+`source-capacity.json`, `target-capacity.json`, `network.json`,
+`cluster-capacity.json`, `copylog-history.json` — to size the concurrency budget
+`C*`, gate on the WAL-retention deadline, and calibrate its cost model. Nothing
+collects them automatically yet, so `capacity-inputs` lets an operator **declare**
+them: it reads one bundle (`capacity-declared.json` by default) keyed by
+`source_capacity` / `target_capacity` / `network` / `cluster_capacity` /
+`copylog_history` / `constraints`, validates each sub-object against the shared
+contract (`pg_cyan/capacity_contract.py`), and writes the valid ones out as the
+canonical artifact files the planner reads. Invalid sub-objects are skipped so the
+planner degrades that term rather than trusting bad input; a missing bundle is a
+no-op (the planner keeps its static fallbacks). The same bundle shape is what the
+control-plane API accepts on `POST /migrations`, validated by the same contract.
+
+| Outcome | File(s) written                                   | Exit |
+|---------|---------------------------------------------------|------|
+| Success | the valid capacity artifacts + `capacity-inputs.json` | 0    |
+| Some skipped | valid artifacts + `capacity-inputs.json` (warning) | 0    |
+| Nothing usable | `capacity-inputs-errors.json`                | 1    |
+
 ### Plan the sharded migration
 
 ```bash
@@ -281,7 +308,8 @@ stage's `--help` and module docstring.
 | `PG_SOURCE_{HOST,PORT,USER,PASSWORD,DATABASE}` | `localhost`/`5432`/`postgres`/*(empty)*/`postgres` | Source connection (all collector stages) |
 | `PREFLIGHT_TIMEOUT_SECONDS`  | `30`        | Connection timeout               |
 | `PG_OUTPUT_DIR`              | `.`         | Output dir for generated JSON    |
-| `PG_INPUTS_DIR`              | `.`         | `plan`: dir holding source artifacts |
+| `PG_INPUTS_DIR`              | `.`         | `plan` / `capacity-inputs`: dir holding source artifacts |
+| `PGCYAN_CAPACITY_DECLARED`   | `capacity-declared.json` | `capacity-inputs`: operator-declared capacity bundle to read |
 | `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
 | `PGCYAN_SNAPSHOT_MODE`       | `coordinator-held` | `plan`: snapshot strategy |

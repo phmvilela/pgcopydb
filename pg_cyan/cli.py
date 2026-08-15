@@ -30,6 +30,7 @@ from pg_cyan.parameters import PgCyanParameters
 from pg_cyan.planner import PgCyanPlanner
 from pg_cyan.predata import PgCyanPreData
 from pg_cyan.preflight import PgCyanPreflight
+from pg_cyan.capinputs import PgCyanCapacityInputs
 from pg_cyan.postgres.conn import _source_default
 
 
@@ -243,6 +244,40 @@ def plan(inputs_dir: str, output_dir: str, shards: int, split_tables_larger_than
         summary = planner.plan()
         click.echo(json.dumps(summary, indent=2, default=str))
         sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="capacity-inputs")
+@click.option("--inputs-dir", default=lambda: os.getenv("PG_INPUTS_DIR", "."),
+              show_default="$PG_INPUTS_DIR",
+              help="Directory holding the declared capacity bundle.")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR",
+              help="Directory the validated capacity artifacts are written to.")
+@click.option("--declared-filename",
+              default=lambda: os.getenv("PGCYAN_CAPACITY_DECLARED",
+                                        PgCyanCapacityInputs.DECLARED_FILENAME),
+              show_default="$PGCYAN_CAPACITY_DECLARED",
+              help="The operator-declared bundle filename to read.")
+def capacity_inputs(inputs_dir: str, output_dir: str, declared_filename: str) -> None:
+    """Explode an operator-declared capacity bundle into validated planner artifacts.
+
+    Reads the declared bundle from ``--inputs-dir`` and writes each valid
+    sub-object (source/target capacity, network, cluster capacity, copylog
+    history, constraints) as the canonical artifact file the planner reads, plus a
+    ``capacity-inputs.json`` manifest. Invalid sub-objects are skipped so the
+    planner degrades that term rather than trusting bad input; a missing bundle is
+    a no-op. Exits non-zero only when nothing usable could be produced.
+    """
+    provider = PgCyanCapacityInputs(
+        inputs_dir=inputs_dir, output_dir=output_dir,
+        declared_filename=declared_filename,
+    )
+    try:
+        summary = provider.provide()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0 if summary["status"] in ("success", "warning") else 1)
     except KeyboardInterrupt:
         sys.exit(2)
 
