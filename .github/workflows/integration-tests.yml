@@ -199,7 +199,8 @@ jobs:
         run: |
           kubectl delete statefulset pgcyan-controller -n "$NS" --ignore-not-found --wait=true --cascade=foreground || true
           kubectl delete configmap -n "$NS" --ignore-not-found \
-            pgcyan-migration-state pgcyan-plan pgcyan-copylog pgcyan-snapshot || true
+            pgcyan-migration-state pgcyan-plan pgcyan-copylog pgcyan-snapshot \
+            pgcyan-capacity-declared pgcyan-planner-inputs || true
           # per-shard copy-log ConfigMaps are written by the worker (no owner-ref),
           # so clear them by label or they leak into the next run's aggregation.
           kubectl delete configmap -n "$NS" --ignore-not-found -l pgcyan.dev/copylog=shard || true
@@ -209,6 +210,18 @@ jobs:
           # the controller's own --dir PVC (volumeClaimTemplate; not cascaded by the
           # StatefulSet delete) -- clear it so this run gets a fresh --dir.
           kubectl delete pvc -n "$NS" --ignore-not-found --wait=false -l pgcyan.dev/component=controller || true
+
+      # Seed an operator-declared capacity bundle so the walk's collect step
+      # explodes it into the planner inputs and the plan comes out capacity-aware
+      # instead of the degraded static-shard fallback. This mirrors what
+      # POST /migrations (#142) writes into the namespace; here it is a committed
+      # fixture. Optional in production; seeded here so the capacity path is
+      # actually exercised and asserted below.
+      - name: Seed the declared capacity bundle (exercise the capacity-aware planner)
+        run: |
+          kubectl create configmap pgcyan-capacity-declared -n "$NS" \
+            --from-file=capacity-declared.json=deploy/k8s/testdata/capacity-declared.json \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       # collect-inputs is the FIRST step of the controller's DAG walk (it
       # publishes the pgcyan-planner-inputs ConfigMap the planner mounts), so it
@@ -276,6 +289,33 @@ jobs:
               sys.exit(1)
           print(f"copy log OK: {log['shard_count']} shard(s), {len(log['tables'])} tables, "
                 f"{log['row_count_total']} rows, slot={log['slot']}")
+          PY
+
+      # ACCEPTANCE (capacity wiring): the seeded declared bundle reached the
+      # planner via the collect step, so the plan is capacity-aware -- NOT the
+      # degraded static-shard fallback. A regression (bundle not mounted/exploded/
+      # published) shows up as degraded=true here, failing fast.
+      - name: Assert the plan is capacity-aware (declared bundle was consumed)
+        run: |
+          set -euo pipefail
+          kubectl get configmap pgcyan-plan -n "$NS" \
+            -o jsonpath='{.data.plan\.json}' > /tmp/plan.json \
+            || { echo "::error::pgcyan-plan ConfigMap not found"; exit 1; }
+          python3 - <<'PY'
+          import json, sys
+          plan = json.load(open("/tmp/plan.json"))
+          conc = plan.get("concurrency", {})
+          if conc.get("degraded") is not False:
+              print(f"::error::plan is degraded ({conc.get('degraded')!r}) -- the declared "
+                    "capacity bundle did not reach the planner (collect-step wiring)")
+              sys.exit(1)
+          feas = plan.get("feasibility", {}).get("status")
+          if feas == "abort":
+              print("::error::feasibility aborted -- the plan should not abort on the seeded bundle")
+              sys.exit(1)
+          print(f"capacity-aware plan OK: C*={conc.get('c_star')}, "
+                f"binding={conc.get('binding_term')}, bottleneck={plan.get('bottleneck')}, "
+                f"feasibility={feas}")
           PY
 
       # ACCEPTANCE: after the post-data steps the target has tables + data + secondary

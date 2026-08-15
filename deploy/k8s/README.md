@@ -21,7 +21,7 @@ and the collect input collector are assumed already applied).
 | `11-configmap-inputs.yaml`  | plan | ConfigMap | planner inputs (metrics/params/constraints) |
 | `12-configmap-plan.yaml`  | plan | ConfigMap | planner OUTPUT: `plan.json` + per-shard `--filters` |
 | `20-pvc-workdir.yaml` | — | PVC (RWO ×3) | per-workload pgcopydb `--dir` disks (schema/foreign-keys/follow); shards get one each, stamped by the templates — issue #58 |
-| `25-job-collect-inputs.yaml`  | collect | Job | collectors hit the source DB → write the inputs ConfigMap |
+| `25-job-collect-inputs.yaml`  | collect | Job | collectors hit the source DB, then `capacity-inputs` explodes any declared bundle (optional `pgcyan-capacity-declared` ConfigMap, #142) → writes the inputs ConfigMap |
 | `30-job-planner.yaml`  | plan | Job | runs the planner (`pg_cyan.cli plan`) |
 | `35-statefulset-controller.yaml` | — (drives all) | StatefulSet(1)+Service+PDB | `pg_cyan.cli run-migration`: the folded snapshot-holder + DAG orchestrator (#70). HOLDS the consistent snapshot in-pod and walks plan→schema→copy→sequences→indexes→foreign-keys→follow, injecting `SNAPSHOT_ID` into the pods and owning every workload (delete it → cascade) |
 | `40-job-schema.yaml`  | schema | Job | `pg_cyan.cli schema`: pre-data schema only (tables/sequences) — NO secondary indexes, PK/unique, FK, or triggers (those are post-data, #28); the controller injects `SNAPSHOT_ID` so the dump pins to the same instant the shards copy |
