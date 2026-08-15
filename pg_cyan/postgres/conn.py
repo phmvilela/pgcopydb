@@ -18,21 +18,21 @@ from typing import Dict, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 
-def source_conn_defaults() -> Dict[str, object]:
-    """Resolve the source connection settings for the introspection stages.
+def _conn_defaults(uri_env: str, prefix: str) -> Dict[str, object]:
+    """Resolve psycopg2 connection settings from a pgcopydb URI or discrete vars.
 
-    Prefers a single ``PGCOPYDB_SOURCE_PGURI`` (e.g.
-    ``postgres://user:pw@host:5432/db?sslmode=require``); when it is absent,
-    falls back to the discrete ``PG_SOURCE_*`` vars (same defaults as before).
-    URI userinfo/path components are percent-decoded (the URI is built with the
-    parts URL-encoded). ``sslmode`` comes from the URI query (or ``PGSSLMODE``)
-    and is ``None`` when unspecified — psycopg2's connect omits it in that case.
+    Prefers a single ``$<uri_env>`` (e.g.
+    ``postgres://user:pw@host:5432/db?sslmode=require``); when it is absent, falls
+    back to the discrete ``$<prefix>_HOST``/``_PORT``/``_USER``/``_PASSWORD``/
+    ``_DATABASE`` vars. URI userinfo/path components are percent-decoded (the URI
+    is built with the parts URL-encoded). ``sslmode`` comes from the URI query (or
+    ``PGSSLMODE``) and is ``None`` when unspecified — psycopg2 omits it then.
 
     Returns:
         Dict with ``host``/``port``/``user``/``password``/``database`` and
         ``sslmode`` (``Optional[str]``).
     """
-    uri = os.getenv("PGCOPYDB_SOURCE_PGURI")
+    uri = os.getenv(uri_env)
     if uri:
         parts = urlparse(uri)
         db = parts.path.lstrip("/")
@@ -46,22 +46,36 @@ def source_conn_defaults() -> Dict[str, object]:
             "sslmode": sslmode or os.getenv("PGSSLMODE"),
         }
     return {
-        "host": os.getenv("PG_SOURCE_HOST", "localhost"),
-        "port": int(os.getenv("PG_SOURCE_PORT", "5432")),
-        "user": os.getenv("PG_SOURCE_USER", "postgres"),
-        "password": os.getenv("PG_SOURCE_PASSWORD", ""),
-        "database": os.getenv("PG_SOURCE_DATABASE", "postgres"),
+        "host": os.getenv(f"{prefix}_HOST", "localhost"),
+        "port": int(os.getenv(f"{prefix}_PORT", "5432")),
+        "user": os.getenv(f"{prefix}_USER", "postgres"),
+        "password": os.getenv(f"{prefix}_PASSWORD", ""),
+        "database": os.getenv(f"{prefix}_DATABASE", "postgres"),
         "sslmode": os.getenv("PGSSLMODE"),
     }
 
 
-def _source_default(field: str):
-    """Return a zero-arg callable resolving one source setting at parse time.
+def source_conn_defaults() -> Dict[str, object]:
+    """Source connection settings: ``PGCOPYDB_SOURCE_PGURI`` else ``PG_SOURCE_*``."""
+    return _conn_defaults("PGCOPYDB_SOURCE_PGURI", "PG_SOURCE")
 
-    Used as a click option ``default`` so the URI is consulted lazily when the
-    command runs (not at import), mirroring the existing ``os.getenv`` lambdas.
-    """
+
+def target_conn_defaults() -> Dict[str, object]:
+    """Target connection settings: ``PGCOPYDB_TARGET_PGURI`` else ``PG_TARGET_*``."""
+    return _conn_defaults("PGCOPYDB_TARGET_PGURI", "PG_TARGET")
+
+
+def _source_default(field: str):
+    """Zero-arg callable resolving one source setting at click parse time."""
     def _get() -> Optional[object]:
         return source_conn_defaults()[field]
+
+    return _get
+
+
+def _target_default(field: str):
+    """Zero-arg callable resolving one target setting at click parse time."""
+    def _get() -> Optional[object]:
+        return target_conn_defaults()[field]
 
     return _get

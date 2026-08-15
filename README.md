@@ -211,6 +211,22 @@ is omitted (it can't feed the deadline alone). Like the other collectors it is
 **optional**: a failure preserves the existing artifact, writes
 `source-capacity-errors.json`, and still exits 0. Tunable via `--wal-sample-seconds`.
 
+### Collect target capacity (optional)
+
+```bash
+# Merge the target's connection headroom into target-capacity.json
+python -m pg_cyan.cli target-capacity --output-dir ./artifacts
+```
+
+`target-capacity` is the source collector's mirror for the **target**: it reads
+`max_connections` / `current_connections` from the target catalog (the
+`target_connections` budget term, which bounds total `table_jobs` across shards)
+and **merges** them into any existing `target-capacity.json`, preserving a
+declared/cloud `write_throughput_bytes_per_sec` (the write ceiling, an Azure/SKU
+property). It connects to the **target** (`PGCOPYDB_TARGET_PGURI` / `PG_TARGET_*`).
+Optional: a failure preserves the existing artifact, writes
+`target-capacity-errors.json`, and still exits 0.
+
 ### Plan the sharded migration
 
 ```bash

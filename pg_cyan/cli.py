@@ -33,7 +33,8 @@ from pg_cyan.preflight import PgCyanPreflight
 from pg_cyan.capinputs import PgCyanCapacityInputs
 from pg_cyan.netprobe import PgCyanNetworkProbe
 from pg_cyan.sourcecap import PgCyanSourceCapacity
-from pg_cyan.postgres.conn import _source_default
+from pg_cyan.targetcap import PgCyanTargetCapacity
+from pg_cyan.postgres.conn import _source_default, _target_default
 
 
 @click.group()
@@ -337,6 +338,45 @@ def source_capacity(host: str, port: int, user: str, password: str, database: st
         host=host, port=port, user=user, password=password, database=database,
         sslmode=sslmode, timeout=timeout, output_dir=output_dir,
         wal_sample_seconds=wal_sample_seconds,
+    )
+    try:
+        summary = collector.collect()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="target-capacity")
+@click.option("--host", default=_target_default("host"),
+              show_default="$PGCOPYDB_TARGET_PGURI / $PG_TARGET_HOST", help="Target host.")
+@click.option("--port", type=int, default=_target_default("port"),
+              show_default="from URI / $PG_TARGET_PORT", help="Target port.")
+@click.option("--user", default=_target_default("user"),
+              show_default="from URI / $PG_TARGET_USER", help="Target user.")
+@click.option("--password", default=_target_default("password"),
+              show_default="from URI / $PG_TARGET_PASSWORD", help="Target password.")
+@click.option("--database", default=_target_default("database"),
+              show_default="from URI / $PG_TARGET_DATABASE", help="Target database.")
+@click.option("--sslmode", default=_target_default("sslmode"),
+              show_default="from URI / $PGSSLMODE", help="libpq sslmode.")
+@click.option("--timeout", type=int,
+              default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
+              show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Connect timeout (seconds).")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR", help="Directory target-capacity.json is written to.")
+def target_capacity(host: str, port: int, user: str, password: str, database: str,
+                    sslmode: str, timeout: int, output_dir: str) -> None:
+    """Fill the catalog fields of target-capacity.json (connection headroom).
+
+    Measures the TARGET's ``max_connections``/``current_connections`` and
+    **merges** them into any existing ``target-capacity.json`` (preserving a
+    declared/cloud ``write_throughput_bytes_per_sec``). An **optional** collector:
+    a failure preserves the existing artifact and still exits 0.
+    """
+    collector = PgCyanTargetCapacity(
+        host=host, port=port, user=user, password=password, database=database,
+        sslmode=sslmode, timeout=timeout, output_dir=output_dir,
     )
     try:
         summary = collector.collect()

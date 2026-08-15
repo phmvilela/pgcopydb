@@ -63,3 +63,23 @@ def test_uri_missing_parts_use_defaults(monkeypatch):
     assert d["password"] == ""
     assert d["database"] == "postgres"
     assert d["sslmode"] is None
+
+
+def test_target_conn_defaults_prefers_target_uri(monkeypatch):
+    from pg_cyan.postgres.conn import target_conn_defaults
+    monkeypatch.setenv("PGCOPYDB_TARGET_PGURI",
+                       "postgres://tu:tp@thost:6544/tdb?sslmode=require")
+    monkeypatch.setenv("PG_TARGET_HOST", "ignored")
+    d = target_conn_defaults()
+    assert (d["host"], d["port"], d["user"], d["database"], d["sslmode"]) == (
+        "thost", 6544, "tu", "tdb", "require")
+
+
+def test_target_conn_defaults_falls_back_to_discrete(monkeypatch):
+    from pg_cyan.postgres.conn import target_conn_defaults
+    monkeypatch.delenv("PGCOPYDB_TARGET_PGURI", raising=False)
+    monkeypatch.setenv("PG_TARGET_HOST", "th")
+    monkeypatch.setenv("PG_TARGET_USER", "tu")
+    monkeypatch.setenv("PG_TARGET_DATABASE", "td")
+    d = target_conn_defaults()
+    assert (d["host"], d["user"], d["database"]) == ("th", "tu", "td")
