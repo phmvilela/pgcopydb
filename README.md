@@ -227,6 +227,22 @@ property). It connects to the **target** (`PGCOPYDB_TARGET_PGURI` / `PG_TARGET_*
 Optional: a failure preserves the existing artifact, writes
 `target-capacity-errors.json`, and still exits 0.
 
+### Collect cluster capacity (optional)
+
+```bash
+# Aggregate the cluster's node allocatable CPU + pod capacity (in-cluster)
+python -m pg_cyan.cli cluster-capacity --output-dir ./artifacts
+```
+
+`cluster-capacity` reads the **Kubernetes API** (not Postgres): it lists the
+cluster's Ready, schedulable nodes and sums their allocatable CPU + max pod
+capacity into `cluster-capacity.json`, feeding the planner's `k8s_cpu` C* term and
+the shard pod cap. It **merges** into any existing artifact (preserving a declared
+`cpu_per_stream`). Reading nodes is cluster-scoped, so the collect ServiceAccount
+needs the `pgcyan-node-reader` ClusterRole (`nodes: get,list`; see
+`deploy/k8s/01-rbac.yaml`). Optional: no in-cluster config / missing RBAC / API
+error preserves the existing artifact and still exits 0.
+
 ### Plan the sharded migration
 
 ```bash

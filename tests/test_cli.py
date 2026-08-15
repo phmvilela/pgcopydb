@@ -20,6 +20,7 @@ from pg_cyan.capinputs import PgCyanCapacityInputs as RealCapacityInputs
 from pg_cyan.netprobe import PgCyanNetworkProbe as RealNetworkProbe
 from pg_cyan.sourcecap import PgCyanSourceCapacity as RealSourceCapacity
 from pg_cyan.targetcap import PgCyanTargetCapacity as RealTargetCapacity
+from pg_cyan.clustercap import PgCyanClusterCapacity as RealClusterCapacity
 
 
 class _StubChecker:
@@ -294,12 +295,25 @@ class _StubTargetCapacity(RealTargetCapacity):
                 "output_file": "target-capacity.json", "error_file": None, "errors": []}
 
 
+class _StubClusterCapacity(RealClusterCapacity):
+    """Records kwargs; the collector is optional and always exits 0."""
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubClusterCapacity.last_kwargs = kwargs
+
+    def collect(self):
+        return {"status": "success", "component": "cluster-capacity",
+                "output_file": "cluster-capacity.json", "error_file": None, "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanCapacityInputs", _StubCapacityInputs)
     monkeypatch.setattr(cli_module, "PgCyanNetworkProbe", _StubNetworkProbe)
     monkeypatch.setattr(cli_module, "PgCyanSourceCapacity", _StubSourceCapacity)
     monkeypatch.setattr(cli_module, "PgCyanTargetCapacity", _StubTargetCapacity)
+    monkeypatch.setattr(cli_module, "PgCyanClusterCapacity", _StubClusterCapacity)
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
     monkeypatch.setattr(cli_module, "PgCyanParameters", _StubExporter)
     monkeypatch.setattr(cli_module, "PgCyanMetrics", _StubMetricsCollector)
@@ -532,6 +546,12 @@ def test_target_capacity_host_falls_back_to_target_env(runner, monkeypatch):
     monkeypatch.delenv("PGCOPYDB_TARGET_PGURI", raising=False)
     runner.invoke(cli_module.cli, ["target-capacity", "--output-dir", "ok_dir"])
     assert _StubTargetCapacity.last_kwargs["host"] == "envtarget"
+
+
+def test_cluster_capacity_exit_zero_and_wires_output_dir(runner):
+    result = runner.invoke(cli_module.cli, ["cluster-capacity", "--output-dir", "ok_dir"])
+    assert result.exit_code == 0
+    assert _StubClusterCapacity.last_kwargs["output_dir"] == "ok_dir"
 
 
 def test_restore_predata_exit_zero_on_success(runner):

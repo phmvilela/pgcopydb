@@ -34,6 +34,7 @@ from pg_cyan.capinputs import PgCyanCapacityInputs
 from pg_cyan.netprobe import PgCyanNetworkProbe
 from pg_cyan.sourcecap import PgCyanSourceCapacity
 from pg_cyan.targetcap import PgCyanTargetCapacity
+from pg_cyan.clustercap import PgCyanClusterCapacity
 from pg_cyan.postgres.conn import _source_default, _target_default
 
 
@@ -378,6 +379,27 @@ def target_capacity(host: str, port: int, user: str, password: str, database: st
         host=host, port=port, user=user, password=password, database=database,
         sslmode=sslmode, timeout=timeout, output_dir=output_dir,
     )
+    try:
+        summary = collector.collect()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="cluster-capacity")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR", help="Directory cluster-capacity.json is written to.")
+def cluster_capacity(output_dir: str) -> None:
+    """Aggregate node allocatable capacity into cluster-capacity.json.
+
+    Lists the cluster's Ready, schedulable nodes (in-cluster) and sums their
+    allocatable CPU + pod capacity for the planner's ``k8s_cpu`` term and pod cap,
+    **merging** into any existing artifact. An **optional** collector: no
+    in-cluster config / node-list RBAC / API error preserves the existing artifact
+    and still exits 0, so it never breaks the walk.
+    """
+    collector = PgCyanClusterCapacity(output_dir=output_dir)
     try:
         summary = collector.collect()
         click.echo(json.dumps(summary, indent=2, default=str))

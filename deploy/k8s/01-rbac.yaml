@@ -99,6 +99,34 @@ roleRef:
   name: pgcyan-orchestrator
   apiGroup: rbac.authorization.k8s.io
 ---
+# --- pgcyan-node-reader: read-only, cluster-scoped node listing ----------------
+# The collect step's `cluster-capacity` collector aggregates node allocatable CPU
+# + pod capacity into cluster-capacity.json. Nodes are cluster-scoped, so this is
+# a ClusterRole (not a namespaced Role). It grants ONLY get/list/watch on nodes --
+# no writes, no other resources. The collector is optional and degrades if this is
+# absent, so a cluster that withholds it just falls back (no k8s_cpu term).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgcyan-node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgcyan-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: pgcyan-orchestrator
+    namespace: pgcyan-migration
+roleRef:
+  kind: ClusterRole
+  name: pgcyan-node-reader
+  apiGroup: rbac.authorization.k8s.io
+---
 # --- pgcyan-worker: one narrow grant so a data shard can publish its copy log --
 # The data shards write their per-table copy log to a pgcyan-copylog-<shard>
 # ConfigMap, which the orchestrator reads to build the combined

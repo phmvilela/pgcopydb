@@ -24,6 +24,9 @@
 #   * `pg_cyan.cli target-capacity`       -> merges the TARGET's connection
 #     headroom into target-capacity.json (connects via PGCOPYDB_TARGET_PGURI);
 #     optional, merge-not-clobber.
+#   * `pg_cyan.cli cluster-capacity`      -> aggregates node allocatable CPU + pod
+#     capacity into cluster-capacity.json (lists nodes via the in-cluster API,
+#     needs the pgcyan-node-reader ClusterRole); optional.
 # then publishes them into the ConfigMap with kubectl (needs the orchestrator
 # RBAC: configmaps create/patch). Each collector exits non-zero on failure and
 # writes a *-errors.json instead, so a connection/query failure fails this Job
@@ -86,6 +89,9 @@ spec:
               # Same for the TARGET's connection headroom (connects to the target
               # via PGCOPYDB_TARGET_PGURI). Optional, merge-not-clobber.
               python -m pg_cyan.cli target-capacity --output-dir=/work
+              # Aggregate node allocatable CPU + pod capacity (lists nodes via the
+              # in-cluster API; needs the pgcyan-node-reader ClusterRole). Optional.
+              python -m pg_cyan.cli cluster-capacity --output-dir=/work
               set -- --from-file=source-pg-metrics.json=/work/source-pg-metrics.json \
                      --from-file=source-pg-largeobjects.json=/work/source-pg-largeobjects.json
               for a in source-capacity target-capacity network cluster-capacity constraints copylog-history; do
