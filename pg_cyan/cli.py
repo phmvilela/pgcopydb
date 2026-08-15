@@ -31,6 +31,7 @@ from pg_cyan.planner import PgCyanPlanner
 from pg_cyan.predata import PgCyanPreData
 from pg_cyan.preflight import PgCyanPreflight
 from pg_cyan.capinputs import PgCyanCapacityInputs
+from pg_cyan.netprobe import PgCyanNetworkProbe
 from pg_cyan.postgres.conn import _source_default
 
 
@@ -244,6 +245,56 @@ def plan(inputs_dir: str, output_dir: str, shards: int, split_tables_larger_than
         summary = planner.plan()
         click.echo(json.dumps(summary, indent=2, default=str))
         sys.exit(0 if summary["status"] == "success" else 1)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="network-probe")
+@click.option("--host", default=_source_default("host"),
+              show_default="$PGCOPYDB_SOURCE_PGURI / $PG_SOURCE_HOST", help="Source host.")
+@click.option("--port", type=int, default=_source_default("port"),
+              show_default="from URI / $PG_SOURCE_PORT", help="Source port.")
+@click.option("--user", default=_source_default("user"),
+              show_default="from URI / $PG_SOURCE_USER", help="Source user.")
+@click.option("--password", default=_source_default("password"),
+              show_default="from URI / $PG_SOURCE_PASSWORD", help="Source password.")
+@click.option("--database", default=_source_default("database"),
+              show_default="from URI / $PG_SOURCE_DATABASE", help="Source database.")
+@click.option("--sslmode", default=_source_default("sslmode"),
+              show_default="from URI / $PGSSLMODE", help="libpq sslmode.")
+@click.option("--timeout", type=int,
+              default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
+              show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Per-connect timeout (seconds).")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR", help="Directory network.json is written to.")
+@click.option("--streams", type=int,
+              default=lambda: int(os.getenv("PGCYAN_NET_STREAMS", "4")),
+              show_default="$PGCYAN_NET_STREAMS", help="Parallel streams for the bandwidth probe.")
+@click.option("--stream-bytes", type=int,
+              default=lambda: int(os.getenv("PGCYAN_NET_STREAM_BYTES", str(16 * 1024 * 1024))),
+              show_default="$PGCYAN_NET_STREAM_BYTES", help="Approx bytes generated per stream.")
+@click.option("--rtt-samples", type=int,
+              default=lambda: int(os.getenv("PGCYAN_NET_RTT_SAMPLES", "5")),
+              show_default="$PGCYAN_NET_RTT_SAMPLES", help="TCP connects; the min is the RTT.")
+def network_probe(host: str, port: int, user: str, password: str, database: str,
+                  sslmode: str, timeout: int, output_dir: str, streams: int,
+                  stream_bytes: int, rtt_samples: int) -> None:
+    """Measure the source<->cluster path and emit the network.json capacity artifact.
+
+    Measures RTT (TCP connect) and effective throughput (timed COPY, single +
+    parallel streams), then writes ``network.json`` for the capacity-aware
+    planner. An **optional** collector: a probe failure leaves any declared
+    ``network.json`` in place and still exits 0, so it never breaks the walk.
+    """
+    prober = PgCyanNetworkProbe(
+        host=host, port=port, user=user, password=password, database=database,
+        sslmode=sslmode, timeout=timeout, output_dir=output_dir,
+        streams=streams, stream_bytes=stream_bytes, rtt_samples=rtt_samples,
+    )
+    try:
+        summary = prober.probe()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0)
     except KeyboardInterrupt:
         sys.exit(2)
 

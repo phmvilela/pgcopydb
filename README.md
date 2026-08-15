@@ -175,6 +175,23 @@ control-plane API accepts on `POST /migrations`, validated by the same contract.
 | Some skipped | valid artifacts + `capacity-inputs.json` (warning) | 0    |
 | Nothing usable | `capacity-inputs-errors.json`                | 1    |
 
+### Probe the network path (optional)
+
+```bash
+# Measure the source<->cluster path and write network.json
+python -m pg_cyan.cli network-probe --output-dir ./artifacts
+```
+
+`network-probe` is the first automated capacity **collector**: it measures the
+source path from where it runs and writes `network.json` for the planner —
+**RTT** (min of a few TCP connects to the source port; ICMP is often blocked),
+**per-stream throughput** (one timed `COPY … TO STDOUT` of generated data), and
+**aggregate bandwidth** (`--streams` parallel COPYs). A measured value overrides a
+declared one. It is **optional**: any probe failure leaves an existing (declared)
+`network.json` untouched, writes `network-errors.json`, and still exits 0 — so it
+never breaks the migration walk. Tunable via `--streams` / `--stream-bytes` /
+`--rtt-samples`.
+
 ### Plan the sharded migration
 
 ```bash
@@ -310,6 +327,7 @@ stage's `--help` and module docstring.
 | `PG_OUTPUT_DIR`              | `.`         | Output dir for generated JSON    |
 | `PG_INPUTS_DIR`              | `.`         | `plan` / `capacity-inputs`: dir holding source artifacts |
 | `PGCYAN_CAPACITY_DECLARED`   | `capacity-declared.json` | `capacity-inputs`: operator-declared capacity bundle to read |
+| `PGCYAN_NET_STREAMS` / `PGCYAN_NET_STREAM_BYTES` / `PGCYAN_NET_RTT_SAMPLES` | `4` / `16Mi` / `5` | `network-probe`: parallel streams, bytes/stream, TCP RTT samples |
 | `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
 | `PGCYAN_SNAPSHOT_MODE`       | `coordinator-held` | `plan`: snapshot strategy |

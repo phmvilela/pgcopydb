@@ -17,6 +17,7 @@ from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
 from pg_cyan.planner import PgCyanPlanner as RealPlanner
 from pg_cyan.predata import PgCyanPreData as RealPreData
 from pg_cyan.capinputs import PgCyanCapacityInputs as RealCapacityInputs
+from pg_cyan.netprobe import PgCyanNetworkProbe as RealNetworkProbe
 
 
 class _StubChecker:
@@ -255,9 +256,22 @@ class _StubCapacityInputs(RealCapacityInputs):
                 "errors": []}
 
 
+class _StubNetworkProbe(RealNetworkProbe):
+    """Records kwargs; the probe is optional and always exits 0."""
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubNetworkProbe.last_kwargs = kwargs
+
+    def probe(self):
+        return {"status": "success", "component": "network-probe",
+                "output_file": "network.json", "error_file": None, "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanCapacityInputs", _StubCapacityInputs)
+    monkeypatch.setattr(cli_module, "PgCyanNetworkProbe", _StubNetworkProbe)
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
     monkeypatch.setattr(cli_module, "PgCyanParameters", _StubExporter)
     monkeypatch.setattr(cli_module, "PgCyanMetrics", _StubMetricsCollector)
@@ -442,6 +456,23 @@ def test_capacity_inputs_options_fall_back_to_env(runner, monkeypatch):
     runner.invoke(cli_module.cli, ["capacity-inputs", "--output-dir", "ok_dir"])
     assert _StubCapacityInputs.last_kwargs["inputs_dir"] == "/inputs"
     assert _StubCapacityInputs.last_kwargs["declared_filename"] == "caps.json"
+
+
+def test_network_probe_exit_zero_and_wires_options(runner):
+    result = runner.invoke(cli_module.cli, [
+        "network-probe", "--host", "srchost", "--output-dir", "ok_dir", "--streams", "6"])
+    assert result.exit_code == 0
+    assert _StubNetworkProbe.last_kwargs["host"] == "srchost"
+    assert _StubNetworkProbe.last_kwargs["output_dir"] == "ok_dir"
+    assert _StubNetworkProbe.last_kwargs["streams"] == 6
+
+
+def test_network_probe_options_fall_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PGCYAN_NET_STREAMS", "3")
+    monkeypatch.setenv("PGCYAN_NET_RTT_SAMPLES", "9")
+    runner.invoke(cli_module.cli, ["network-probe", "--output-dir", "ok_dir"])
+    assert _StubNetworkProbe.last_kwargs["streams"] == 3
+    assert _StubNetworkProbe.last_kwargs["rtt_samples"] == 9
 
 
 def test_restore_predata_exit_zero_on_success(runner):
