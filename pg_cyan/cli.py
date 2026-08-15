@@ -32,6 +32,7 @@ from pg_cyan.predata import PgCyanPreData
 from pg_cyan.preflight import PgCyanPreflight
 from pg_cyan.capinputs import PgCyanCapacityInputs
 from pg_cyan.netprobe import PgCyanNetworkProbe
+from pg_cyan.sourcecap import PgCyanSourceCapacity
 from pg_cyan.postgres.conn import _source_default
 
 
@@ -293,6 +294,52 @@ def network_probe(host: str, port: int, user: str, password: str, database: str,
     )
     try:
         summary = prober.probe()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="source-capacity")
+@click.option("--host", default=_source_default("host"),
+              show_default="$PGCOPYDB_SOURCE_PGURI / $PG_SOURCE_HOST", help="Source host.")
+@click.option("--port", type=int, default=_source_default("port"),
+              show_default="from URI / $PG_SOURCE_PORT", help="Source port.")
+@click.option("--user", default=_source_default("user"),
+              show_default="from URI / $PG_SOURCE_USER", help="Source user.")
+@click.option("--password", default=_source_default("password"),
+              show_default="from URI / $PG_SOURCE_PASSWORD", help="Source password.")
+@click.option("--database", default=_source_default("database"),
+              show_default="from URI / $PG_SOURCE_DATABASE", help="Source database.")
+@click.option("--sslmode", default=_source_default("sslmode"),
+              show_default="from URI / $PGSSLMODE", help="libpq sslmode.")
+@click.option("--timeout", type=int,
+              default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
+              show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Connect timeout (seconds).")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR", help="Directory source-capacity.json is written to.")
+@click.option("--wal-sample-seconds", type=float,
+              default=lambda: float(os.getenv("PGCYAN_WAL_SAMPLE_SECONDS", "2")),
+              show_default="$PGCYAN_WAL_SAMPLE_SECONDS",
+              help="Interval over which the WAL generation rate is sampled.")
+def source_capacity(host: str, port: int, user: str, password: str, database: str,
+                    sslmode: str, timeout: int, output_dir: str,
+                    wal_sample_seconds: float) -> None:
+    """Fill the catalog fields of source-capacity.json (connections + WAL rate).
+
+    Measures ``max_connections``/``current_connections`` and the live WAL
+    generation rate, then **merges** them into any existing ``source-capacity.json``
+    (preserving declared/cloud ``read_throughput_bytes_per_sec`` /
+    ``wal_disk_free_bytes``). An **optional** collector: a failure preserves the
+    existing artifact and still exits 0, so it never breaks the walk.
+    """
+    collector = PgCyanSourceCapacity(
+        host=host, port=port, user=user, password=password, database=database,
+        sslmode=sslmode, timeout=timeout, output_dir=output_dir,
+        wal_sample_seconds=wal_sample_seconds,
+    )
+    try:
+        summary = collector.collect()
         click.echo(json.dumps(summary, indent=2, default=str))
         sys.exit(0)
     except KeyboardInterrupt:

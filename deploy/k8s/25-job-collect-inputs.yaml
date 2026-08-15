@@ -18,6 +18,9 @@
 #   * `pg_cyan.cli network-probe`         -> network.json (RTT + throughput),
 #     measured over the source connection; overrides a declared network.json. An
 #     optional collector: a probe failure exits 0 and keeps any declared value.
+#   * `pg_cyan.cli source-capacity`       -> merges the source's catalog fields
+#     (connections + WAL generation rate) into source-capacity.json, preserving
+#     declared/cloud fields; also optional (a failure exits 0, keeps the artifact).
 # then publishes them into the ConfigMap with kubectl (needs the orchestrator
 # RBAC: configmaps create/patch). Each collector exits non-zero on failure and
 # writes a *-errors.json instead, so a connection/query failure fails this Job
@@ -73,6 +76,10 @@ spec:
               # value overrides the declared one. Optional: a probe failure exits 0
               # and leaves any declared network.json in place, so the walk survives.
               python -m pg_cyan.cli network-probe --output-dir=/work
+              # Merge the source's catalog fields (connections + WAL rate) into
+              # source-capacity.json, preserving declared/cloud fields. Optional:
+              # a failure exits 0 and keeps any existing source-capacity.json.
+              python -m pg_cyan.cli source-capacity --output-dir=/work
               set -- --from-file=source-pg-metrics.json=/work/source-pg-metrics.json \
                      --from-file=source-pg-largeobjects.json=/work/source-pg-largeobjects.json
               for a in source-capacity target-capacity network cluster-capacity constraints copylog-history; do

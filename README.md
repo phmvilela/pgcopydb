@@ -192,6 +192,25 @@ declared one. It is **optional**: any probe failure leaves an existing (declared
 never breaks the migration walk. Tunable via `--streams` / `--stream-bytes` /
 `--rtt-samples`.
 
+### Collect source capacity (optional)
+
+```bash
+# Merge the source's catalog fields into source-capacity.json
+python -m pg_cyan.cli source-capacity --output-dir ./artifacts
+```
+
+`source-capacity` fills the Postgres-catalog half of `source-capacity.json`:
+`max_connections` / `current_connections` (the `source_connections` budget term)
+and the live **WAL generation rate** (sampled from `pg_current_wal_lsn()`, the
+write rate the WAL-retention deadline needs). It **merges** into any existing
+`source-capacity.json`, so declared/cloud fields — the source read ceiling
+(`read_throughput_bytes_per_sec`) and WAL disk free (`wal_disk_free_bytes`), which
+come from the Azure API or declared inputs — are preserved; a measured value
+overrides a declared one. A WAL rate with no `wal_disk_free_bytes` to pair it with
+is omitted (it can't feed the deadline alone). Like the other collectors it is
+**optional**: a failure preserves the existing artifact, writes
+`source-capacity-errors.json`, and still exits 0. Tunable via `--wal-sample-seconds`.
+
 ### Plan the sharded migration
 
 ```bash
@@ -328,6 +347,7 @@ stage's `--help` and module docstring.
 | `PG_INPUTS_DIR`              | `.`         | `plan` / `capacity-inputs`: dir holding source artifacts |
 | `PGCYAN_CAPACITY_DECLARED`   | `capacity-declared.json` | `capacity-inputs`: operator-declared capacity bundle to read |
 | `PGCYAN_NET_STREAMS` / `PGCYAN_NET_STREAM_BYTES` / `PGCYAN_NET_RTT_SAMPLES` | `4` / `16Mi` / `5` | `network-probe`: parallel streams, bytes/stream, TCP RTT samples |
+| `PGCYAN_WAL_SAMPLE_SECONDS`   | `2`         | `source-capacity`: interval for sampling the WAL generation rate |
 | `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
 | `PGCYAN_SNAPSHOT_MODE`       | `coordinator-held` | `plan`: snapshot strategy |

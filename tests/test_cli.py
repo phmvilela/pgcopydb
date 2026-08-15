@@ -18,6 +18,7 @@ from pg_cyan.planner import PgCyanPlanner as RealPlanner
 from pg_cyan.predata import PgCyanPreData as RealPreData
 from pg_cyan.capinputs import PgCyanCapacityInputs as RealCapacityInputs
 from pg_cyan.netprobe import PgCyanNetworkProbe as RealNetworkProbe
+from pg_cyan.sourcecap import PgCyanSourceCapacity as RealSourceCapacity
 
 
 class _StubChecker:
@@ -268,10 +269,23 @@ class _StubNetworkProbe(RealNetworkProbe):
                 "output_file": "network.json", "error_file": None, "errors": []}
 
 
+class _StubSourceCapacity(RealSourceCapacity):
+    """Records kwargs; the collector is optional and always exits 0."""
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        _StubSourceCapacity.last_kwargs = kwargs
+
+    def collect(self):
+        return {"status": "success", "component": "source-capacity",
+                "output_file": "source-capacity.json", "error_file": None, "errors": []}
+
+
 @pytest.fixture
 def runner(monkeypatch):
     monkeypatch.setattr(cli_module, "PgCyanCapacityInputs", _StubCapacityInputs)
     monkeypatch.setattr(cli_module, "PgCyanNetworkProbe", _StubNetworkProbe)
+    monkeypatch.setattr(cli_module, "PgCyanSourceCapacity", _StubSourceCapacity)
     monkeypatch.setattr(cli_module, "PgCyanPreflight", _StubChecker)
     monkeypatch.setattr(cli_module, "PgCyanParameters", _StubExporter)
     monkeypatch.setattr(cli_module, "PgCyanMetrics", _StubMetricsCollector)
@@ -473,6 +487,22 @@ def test_network_probe_options_fall_back_to_env(runner, monkeypatch):
     runner.invoke(cli_module.cli, ["network-probe", "--output-dir", "ok_dir"])
     assert _StubNetworkProbe.last_kwargs["streams"] == 3
     assert _StubNetworkProbe.last_kwargs["rtt_samples"] == 9
+
+
+def test_source_capacity_exit_zero_and_wires_options(runner):
+    result = runner.invoke(cli_module.cli, [
+        "source-capacity", "--host", "srchost", "--output-dir", "ok_dir",
+        "--wal-sample-seconds", "1.5"])
+    assert result.exit_code == 0
+    assert _StubSourceCapacity.last_kwargs["host"] == "srchost"
+    assert _StubSourceCapacity.last_kwargs["output_dir"] == "ok_dir"
+    assert _StubSourceCapacity.last_kwargs["wal_sample_seconds"] == 1.5
+
+
+def test_source_capacity_options_fall_back_to_env(runner, monkeypatch):
+    monkeypatch.setenv("PGCYAN_WAL_SAMPLE_SECONDS", "4")
+    runner.invoke(cli_module.cli, ["source-capacity", "--output-dir", "ok_dir"])
+    assert _StubSourceCapacity.last_kwargs["wal_sample_seconds"] == 4.0
 
 
 def test_restore_predata_exit_zero_on_success(runner):
