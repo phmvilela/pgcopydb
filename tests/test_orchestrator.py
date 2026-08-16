@@ -680,9 +680,11 @@ def test_merge_copy_logs_unions_disjoint_tables_and_sums_rows():
     orch = make_orchestrator()
     logs = [
         {"shard": "shard-0", "slot": "pgcyan_slot", "publication": "pgcyan_pub",
-         "snapshot": "0000000A-1", "tables": {"public.orders": 10, "public.customers": 20}},
+         "snapshot": "0000000A-1", "tables": {"public.orders": 10, "public.customers": 20},
+         "duration_seconds": 4.0, "table_jobs": 2, "row_count_total": 30},
         {"shard": "shard-1", "slot": "pgcyan_slot", "publication": "pgcyan_pub",
-         "snapshot": "0000000A-1", "tables": {"shop.items": 30}},
+         "snapshot": "0000000A-1", "tables": {"shop.items": 30},
+         "duration_seconds": 6.0, "table_jobs": 2, "row_count_total": 30},
     ]
     merged = orch._merge_copy_logs(logs)
     assert merged["status"] == "completed"
@@ -694,6 +696,9 @@ def test_merge_copy_logs_unions_disjoint_tables_and_sums_rows():
     assert merged["row_count_total"] == 60
     assert merged["tables"]["shop.items"] == 30
     assert merged["warnings"] == []
+    # Per-shard timing is carried through for the copylog-history producer (#147).
+    assert [s["shard"] for s in merged["shard_summaries"]] == ["shard-0", "shard-1"]
+    assert merged["shard_summaries"][0]["duration_seconds"] == 4.0
 
 
 def test_merge_copy_logs_flags_snapshot_disagreement():

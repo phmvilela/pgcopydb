@@ -623,6 +623,9 @@ class PgCyanOrchestrator:
         warnings: List[str] = []
         singletons: Dict[str, set] = {"slot": set(), "publication": set(), "snapshot": set()}
         shard_names: List[str] = []
+        # Per-shard timing carried through for the copylog-history producer (#147);
+        # the merged tables map loses the per-shard duration/parallelism otherwise.
+        shard_summaries: List[Dict] = []
 
         for log in shard_logs:
             shard_names.append(str(log.get("shard")))
@@ -634,6 +637,13 @@ class PgCyanOrchestrator:
                 if name in tables:
                     warnings.append(f"Table {name} appeared in more than one shard log")
                 tables[name] = count
+            if log.get("duration_seconds") is not None:
+                shard_summaries.append({
+                    "shard": log.get("shard"),
+                    "duration_seconds": log.get("duration_seconds"),
+                    "table_jobs": log.get("table_jobs"),
+                    "row_count_total": log.get("row_count_total"),
+                })
 
         for field, values in singletons.items():
             if len(values) > 1:
@@ -649,6 +659,7 @@ class PgCyanOrchestrator:
             "snapshot": next(iter(singletons["snapshot"]), None),
             "shard_count": len(shard_logs),
             "shards": sorted(shard_names),
+            "shard_summaries": shard_summaries,
             "table_count": len(tables),
             "row_count_total": sum(counted) if counted else 0,
             "tables": tables,

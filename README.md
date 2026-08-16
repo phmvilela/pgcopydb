@@ -243,6 +243,24 @@ needs the `pgcyan-node-reader` ClusterRole (`nodes: get,list`; see
 `deploy/k8s/01-rbac.yaml`). Optional: no in-cluster config / missing RBAC / API
 error preserves the existing artifact and still exits 0.
 
+### Build calibration history (optional)
+
+```bash
+# Aggregate completed copy runs' durations into copylog-history.json
+python -m pg_cyan.cli copylog-history --copylog ./copylogs --output-dir ./artifacts
+```
+
+`copylog-history` closes the planner's self-calibration loop: the copy step now
+records each shard's `duration_seconds` + `table_jobs`, and this producer turns
+completed runs' copylogs into the `copylog-history.json` that #118's calibration
+reads to fit the throughput constants from **real runs** (dormant until now, since
+nothing produced it). Each shard becomes one observation normalized to a
+single-stream equivalent (`duration × table_jobs`); volume is `rows` (and
+`live_bytes` when a `--metrics` artifact is supplied). Retention is windowed
+(`--max-runs`). It reads per-shard `migration-copy-log.json` files or the combined
+copylog's `shard_summaries`, and appends to any existing history. Pure transform;
+a run with no usable durations leaves the history unchanged.
+
 ### Plan the sharded migration
 
 ```bash
@@ -380,6 +398,7 @@ stage's `--help` and module docstring.
 | `PGCYAN_CAPACITY_DECLARED`   | `capacity-declared.json` | `capacity-inputs`: operator-declared capacity bundle to read |
 | `PGCYAN_NET_STREAMS` / `PGCYAN_NET_STREAM_BYTES` / `PGCYAN_NET_RTT_SAMPLES` | `4` / `16Mi` / `5` | `network-probe`: parallel streams, bytes/stream, TCP RTT samples |
 | `PGCYAN_WAL_SAMPLE_SECONDS`   | `2`         | `source-capacity`: interval for sampling the WAL generation rate |
+| `PGCYAN_COPYLOG_PATH` / `PGCYAN_METRICS_PATH` / `PGCYAN_HISTORY_MAX_RUNS` | `.` / *(unset)* / `20` | `copylog-history`: copylog input, optional metrics for byte volume, retention window |
 | `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
 | `PGCYAN_SNAPSHOT_MODE`       | `coordinator-held` | `plan`: snapshot strategy |

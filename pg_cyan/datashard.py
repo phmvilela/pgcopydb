@@ -65,6 +65,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+from time import perf_counter
 from typing import Dict, List, Optional, Tuple
 
 import psycopg2
@@ -170,6 +171,9 @@ class PgCyanDataShard:
         self.work_dir = work_dir
         self.output_dir = output_dir if output_dir is not None else work_dir
         self.table_jobs = table_jobs
+        #: Wall-clock of the shard's COPY, filled by _run_copy; feeds the copylog
+        #: so the copylog-history producer can calibrate throughput (#147).
+        self._copy_duration_seconds: Optional[float] = None
         self.split_tables_larger_than = split_tables_larger_than
         self.count_rows = count_rows
         # Default the per-shard ConfigMap name off the shard name so the manifest
@@ -296,6 +300,7 @@ class PgCyanDataShard:
         cmd = self.build_copy_command()
         self._log_event("copy", "success", "Running pgcopydb copy table-data",
                         {"command": " ".join(cmd)})
+        t0 = perf_counter()
         try:
             result = subprocess.run(  # noqa: S603 -- fixed argv, no shell
                 cmd,
@@ -333,7 +338,10 @@ class PgCyanDataShard:
             )
             self.errors.append(f"Copy failed (rc={result.returncode}): {tail}")
             return False
-        self._log_event("copy", "success", "Copy completed", {"returncode": 0})
+        self._copy_duration_seconds = perf_counter() - t0
+        self._log_event("copy", "success", "Copy completed",
+                        {"returncode": 0,
+                         "duration_seconds": round(self._copy_duration_seconds, 2)})
         return True
 
     # ----------------------------------------------------------- row counts
@@ -425,6 +433,12 @@ class PgCyanDataShard:
             "tables": tables,
             "table_count": len(tables),
             "row_count_total": sum(counted) if counted else 0,
+            # Raw material for the copylog-history producer (#147): the shard's
+            # COPY wall-clock and its intra-shard parallelism, so the throughput
+            # constant can be fitted from real runs (#118 calibration).
+            "duration_seconds": (round(self._copy_duration_seconds, 2)
+                                 if self._copy_duration_seconds is not None else None),
+            "table_jobs": self.table_jobs,
             "command": " ".join(self.build_copy_command()),
         }
 

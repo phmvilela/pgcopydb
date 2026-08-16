@@ -554,6 +554,20 @@ def test_cluster_capacity_exit_zero_and_wires_output_dir(runner):
     assert _StubClusterCapacity.last_kwargs["output_dir"] == "ok_dir"
 
 
+def test_copylog_history_produces_and_exits_zero(runner, tmp_path):
+    import json
+    log = {"component": "data-shard", "shard": "shard-0", "duration_seconds": 5,
+           "table_jobs": 2, "row_count_total": 100, "tables": {"public.a": 100}}
+    (tmp_path / "migration-copy-log.json").write_text(json.dumps(log))
+    result = runner.invoke(cli_module.cli, [
+        "copylog-history", "--copylog", str(tmp_path / "migration-copy-log.json"),
+        "--output-dir", str(tmp_path), "--run-id", "cli-run"])
+    assert result.exit_code == 0
+    hist = json.loads((tmp_path / "copylog-history.json").read_text())
+    assert hist["runs"][0]["run_id"] == "cli-run"
+    assert hist["runs"][0]["observations"][0]["duration_seconds"] == 10.0  # 5 x 2
+
+
 def test_restore_predata_exit_zero_on_success(runner):
     result = runner.invoke(cli_module.cli, [
         "schema", "--target-pguri", "postgres://good/db",

@@ -262,6 +262,10 @@ def test_run_happy_path_writes_and_publishes(tmp_path, filter_file, monkeypatch)
     assert log["snapshot"] == "0000000A-1"
     assert log["tables"] == {"public.orders": 10, "public.customers": 20, "shop.items": 30}
     assert log["row_count_total"] == 60
+    # Raw material for the copylog-history producer (#147): a timed copy records a
+    # duration, and the shard's intra-shard parallelism is captured.
+    assert isinstance(log["duration_seconds"], (int, float)) and log["duration_seconds"] >= 0
+    assert log["table_jobs"] == PgCyanDataShard.DEFAULT_TABLE_JOBS
 
     # the pgcopydb child was `copy table-data`, and kubectl published the log
     assert any(c[:3] == ["pgcopydb", "copy", "table-data"] for c in recorder)

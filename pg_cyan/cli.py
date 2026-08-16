@@ -35,6 +35,7 @@ from pg_cyan.netprobe import PgCyanNetworkProbe
 from pg_cyan.sourcecap import PgCyanSourceCapacity
 from pg_cyan.targetcap import PgCyanTargetCapacity
 from pg_cyan.clustercap import PgCyanClusterCapacity
+from pg_cyan.copyloghistory import PgCyanCopylogHistory
 from pg_cyan.postgres.conn import _source_default, _target_default
 
 
@@ -383,6 +384,42 @@ def target_capacity(host: str, port: int, user: str, password: str, database: st
         summary = collector.collect()
         click.echo(json.dumps(summary, indent=2, default=str))
         sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="copylog-history")
+@click.option("--copylog", "copylog_path",
+              default=lambda: os.getenv("PGCYAN_COPYLOG_PATH", "."),
+              show_default="$PGCYAN_COPYLOG_PATH",
+              help="A migration-copy-log.json file, or a directory of them.")
+@click.option("--metrics", "metrics_path",
+              default=lambda: os.getenv("PGCYAN_METRICS_PATH"),
+              show_default="$PGCYAN_METRICS_PATH",
+              help="Optional source-pg-metrics.json to enrich observations with byte volume.")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR", help="Directory copylog-history.json is written to.")
+@click.option("--max-runs", type=int,
+              default=lambda: int(os.getenv("PGCYAN_HISTORY_MAX_RUNS",
+                                            str(PgCyanCopylogHistory.DEFAULT_MAX_RUNS))),
+              show_default="$PGCYAN_HISTORY_MAX_RUNS", help="Retention window (most recent runs).")
+@click.option("--run-id", default=lambda: os.getenv("PGCYAN_RUN_ID"),
+              show_default="$PGCYAN_RUN_ID", help="Opaque id for this run's history entry.")
+def copylog_history(copylog_path: str, metrics_path: str, output_dir: str,
+                    max_runs: int, run_id: str) -> None:
+    """Append a completed run's copy observations to copylog-history.json.
+
+    Reads the copy step's per-shard logs (``migration-copy-log.json``, which carry
+    ``duration_seconds`` + ``table_jobs``), normalizes each shard to a
+    single-stream-equivalent observation, and appends a windowed run entry to
+    ``copylog-history.json`` for the next run's planner to calibrate from. Pure
+    transform; a run with no usable durations leaves the history unchanged.
+    """
+    from pg_cyan.copyloghistory import produce_copylog_history_from_env
+    try:
+        code = produce_copylog_history_from_env(
+            copylog_path, metrics_path, output_dir, max_runs, run_id)
+        sys.exit(code)
     except KeyboardInterrupt:
         sys.exit(2)
 
