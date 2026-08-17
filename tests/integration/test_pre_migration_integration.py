@@ -4,8 +4,8 @@ source-parameters, and source-pg-largeobjects.
 
 Run against a real PostgreSQL server -- connection settings come from the
 same ``PG_SOURCE_*`` / ``PG_OUTPUT_DIR`` environment variables the CLI reads
-(see ``pg_cyan/metrics.py::collect_metrics_from_env`` and
-``pg_cyan/parameters.py::export_parameters_from_env``). Excluded from the
+(see ``pg_cyan/collect/metrics.py::collect_metrics_from_env`` and
+``pg_cyan/plan/parameters.py::export_parameters_from_env``). Excluded from the
 default DB-free suite (see CLAUDE.md) via the ``integration`` marker; run
 explicitly:
 
@@ -26,9 +26,9 @@ import os
 
 import pytest
 
-from pg_cyan.lobs import PgCyanLobs
-from pg_cyan.metrics import PgCyanMetrics
-from pg_cyan.parameters import PgCyanParameters
+from pg_cyan.copy.lobs import PgCyanLobs
+from pg_cyan.collect.metrics import PgCyanMetrics
+from pg_cyan.plan.parameters import PgCyanParameters
 
 pytestmark = pytest.mark.integration
 
@@ -44,9 +44,9 @@ _TABLE_FIELDS = (
     "schema", "name", "relkind",
     "heap_bytes", "heap_pretty", "index_bytes", "index_pretty",
     "row_estimate",
-    # Cost-model inputs consumed by the planner. See also: pg_cyan/cost_model.py
+    # Cost-model inputs consumed by the planner. See also: pg_cyan/collect/cost_model.py
     "dead_tuple_ratio", "toast_bytes", "avg_row_width",
-    # Split eligibility. See also: pg_cyan/splitting.py
+    # Split eligibility. See also: pg_cyan/collect/splitting.py
     "splittable_key",
 )
 _TABLE_TOTALS_FIELDS = ("heap_bytes", "index_bytes", "total_bytes")

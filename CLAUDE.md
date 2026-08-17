@@ -26,7 +26,7 @@ built yet.
 
 ## Architecture & the authoritative pattern
 
-The **code is the source of truth** for design. `pg_cyan/preflight.py` and its
+The **code is the source of truth** for design. `pg_cyan/plan/preflight.py` and its
 `PgCyanPreflight` class define the canonical shape for a stage orchestrator.
 Follow it; do not introduce a competing per-check "write one JSON file per
 check" pattern even if older notes describe one.

@@ -1,8 +1,8 @@
 """
 Shared graceful-shutdown helper for the long-lived pgcopydb children.
 
-Both the snapshot holder (see ``pg_cyan/snapshot.py``) and the CDC follow stream
-(see ``pg_cyan/follow.py``) run a long-lived ``pgcopydb`` child inside the
+Both the snapshot holder (see ``pg_cyan/copy/snapshot.py``) and the CDC follow stream
+(see ``pg_cyan/copy/follow.py``) run a long-lived ``pgcopydb`` child inside the
 controller pod and must stop it cleanly on SIGTERM -- closing the source
 replication connection / releasing the slot -- before the kubelet force-kills the
 pod at ``terminationGracePeriodSeconds`` (60s; see

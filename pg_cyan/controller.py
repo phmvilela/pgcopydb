@@ -72,9 +72,9 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
 
-from pg_cyan.follow import PgCyanFollow
+from pg_cyan.copy.follow import PgCyanFollow
 from pg_cyan.orchestrator import PgCyanOrchestrator
-from pg_cyan.snapshot import PgCyanSnapshot, _holder_from_env
+from pg_cyan.copy.snapshot import PgCyanSnapshot, _holder_from_env
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),

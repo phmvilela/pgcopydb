@@ -106,7 +106,7 @@ class _FakeProcWithPid(_FakeProc):
 
     ``pgcopydb follow`` forks prefetch/catchup workers that share its process
     group and only THEY check for SIGTERM while actively streaming (see
-    ``pg_cyan/follow.py`` and ``shutdown._signal_group_or_proc``) -- so the
+    ``pg_cyan/copy/follow.py`` and ``shutdown._signal_group_or_proc``) -- so the
     fix signals the whole group, not just this one pid.
     """
 

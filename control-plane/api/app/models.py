@@ -53,7 +53,7 @@ class CapacityInputs(BaseModel):
     """Operator-declared capacity objects for the capacity-aware planner.
 
     Each is a free-form JSON object validated at the endpoint against the shared
-    contract (``pg_cyan/capacity_contract.py``) — the same rules the planner and
+    contract (``pg_cyan/collect/capacity_contract.py``) — the same rules the planner and
     the collectors use, so what the API accepts is exactly what the planner reads.
     The values are intentionally untyped here (``dict``) to avoid re-encoding the
     contract in pydantic; only the operator-declared subset is accepted. The

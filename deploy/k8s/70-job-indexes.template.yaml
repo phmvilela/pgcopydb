@@ -23,7 +23,7 @@
 # index/constraint defs, apply to the target); it holds no pgcopydb catalog, so it
 # only needs a scratch dir for the one small output JSON. An emptyDir suffices --
 # no managed-disk PVC, no fsGroup (only the pgcopydb steps need those).
-# See also: pg_cyan/postindex.py
+# See also: pg_cyan/copy/postindex.py
 apiVersion: batch/v1
 kind: Job
 metadata:

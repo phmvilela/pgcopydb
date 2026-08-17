@@ -9,18 +9,18 @@ import pytest
 from click.testing import CliRunner
 
 from pg_cyan import cli as cli_module
-from pg_cyan.datashard import PgCyanDataShard as RealDataShard
-from pg_cyan.postfk import PgCyanForeignKeys as RealForeignKeys
-from pg_cyan.postindex import PgCyanPostIndex as RealPostIndex
-from pg_cyan.sequences import PgCyanSequences as RealSequences
+from pg_cyan.copy.datashard import PgCyanDataShard as RealDataShard
+from pg_cyan.copy.postfk import PgCyanForeignKeys as RealForeignKeys
+from pg_cyan.copy.postindex import PgCyanPostIndex as RealPostIndex
+from pg_cyan.copy.sequences import PgCyanSequences as RealSequences
 from pg_cyan.orchestrator import PgCyanOrchestrator as RealOrchestrator
-from pg_cyan.planner import PgCyanPlanner as RealPlanner
-from pg_cyan.predata import PgCyanPreData as RealPreData
-from pg_cyan.capinputs import PgCyanCapacityInputs as RealCapacityInputs
-from pg_cyan.netprobe import PgCyanNetworkProbe as RealNetworkProbe
-from pg_cyan.sourcecap import PgCyanSourceCapacity as RealSourceCapacity
-from pg_cyan.targetcap import PgCyanTargetCapacity as RealTargetCapacity
-from pg_cyan.clustercap import PgCyanClusterCapacity as RealClusterCapacity
+from pg_cyan.plan.planner import PgCyanPlanner as RealPlanner
+from pg_cyan.copy.predata import PgCyanPreData as RealPreData
+from pg_cyan.collect.capinputs import PgCyanCapacityInputs as RealCapacityInputs
+from pg_cyan.collect.netprobe import PgCyanNetworkProbe as RealNetworkProbe
+from pg_cyan.collect.sourcecap import PgCyanSourceCapacity as RealSourceCapacity
+from pg_cyan.collect.targetcap import PgCyanTargetCapacity as RealTargetCapacity
+from pg_cyan.collect.clustercap import PgCyanClusterCapacity as RealClusterCapacity
 
 
 class _StubChecker:

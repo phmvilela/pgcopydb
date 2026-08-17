@@ -5,7 +5,7 @@ description: Use when adding a new pg_cyan stage or migration step — a new PgC
 
 # Add a pg_cyan stage / migration step
 
-`pg_cyan/preflight.py` (`PgCyanPreflight`) is the canonical shape; every stage is
+`pg_cyan/plan/preflight.py` (`PgCyanPreflight`) is the canonical shape; every stage is
 a `PgCyan<Stage>` class. **Follow the existing code — the module docstrings are
 the source of truth.** Pick the closest sibling to copy: a **collector** that
 talks to a DB (`metrics.py`, `parameters.py`, `lobs.py`), a **pgcopydb wrapper**
@@ -32,8 +32,11 @@ that drives subprocesses (`predata.py`, `datashard.py`, `snapshot.py`), or an
 - **A warning is not a blocker** — increment the pass counter for warnings; only
   real problems flip readiness / fail.
 
-## the snapshot step. **New stage class** `pg_cyan/<stage>.py` — copy the closest sibling; keep
-   `_log_event`, the two-file output, and the never-raise `run()`.
+## the snapshot step. **New stage class** `pg_cyan/<group>/<stage>.py` — modules are grouped by
+   DAG phase: `collect/` (source & capacity gathering), `plan/` (planner + preflight/report),
+   `copy/` (schema/data transfer & post-data rebuild); the orchestrator classes
+   (`cli`, `orchestrator`, `controller`, `shutdown`) stay at the package root. Copy the closest
+   sibling in the matching group; keep `_log_event`, the two-file output, and the never-raise `run()`.
 2. **CLI subcommand** in `pg_cyan/cli.py` — a thin click command mirroring an
    existing one. Every option gets an env fallback
    (`default=lambda: os.getenv("PGCYAN_...")`); convert click's empty-string

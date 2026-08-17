@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dynamic = ["dependencies"]
 
 [tool.setuptools]
-packages = ["pg_cyan", "pg_cyan.cloud", "pg_cyan.cloud.azure", "pg_cyan.postgres"]
+packages = ["pg_cyan", "pg_cyan.collect", "pg_cyan.plan", "pg_cyan.copy", "pg_cyan.cloud", "pg_cyan.cloud.azure", "pg_cyan.postgres"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }

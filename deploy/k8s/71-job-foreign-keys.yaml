@@ -24,7 +24,7 @@
 #
 # This is the last hard barrier before the source and target are schema- and
 # data-equivalent (modulo any CDC still catching up in the follow step).
-# See also: pg_cyan/postfk.py
+# See also: pg_cyan/copy/postfk.py
 apiVersion: batch/v1
 kind: Job
 metadata:

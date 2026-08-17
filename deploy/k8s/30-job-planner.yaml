@@ -7,7 +7,7 @@
 # (plan.json + shard-<n>.filters). It does not touch Postgres data; it only
 # reads the already-collected metadata and produces a plan.
 #
-# The planner is `python -m pg_cyan.cli plan` (see also: pg_cyan/planner.py):
+# The planner is `python -m pg_cyan.cli plan` (see also: pg_cyan/plan/planner.py):
 #   * loads /inputs/*.json (source-pg-metrics + source-pg-largeobjects, plus the
 #     optional parameters/constraints),
 #   * runs the LOB abort gate -- if the source has any large objects it exits

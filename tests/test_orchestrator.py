@@ -16,7 +16,7 @@ import pytest
 import yaml
 from kubernetes.client.rest import ApiException
 
-from pg_cyan.datashard import PgCyanDataShard
+from pg_cyan.copy.datashard import PgCyanDataShard
 from pg_cyan.orchestrator import OrchestratorError, PgCyanOrchestrator
 
 
@@ -660,7 +660,7 @@ def test_data_shard_substitutions_request_falls_back_to_limit():
 
 def test_planner_default_shard_request_below_limit():
     # The default the planner emits must keep the request schedulable (< limit).
-    from pg_cyan.planner import PgCyanPlanner
+    from pg_cyan.plan.planner import PgCyanPlanner
     r = PgCyanPlanner.DEFAULT_SHARD_RESOURCES
     assert r["cpu_request"] == "100m" and r["cpu"] == "1"
     assert r["memory_request"] == "256Mi" and r["memory"] == "1Gi"

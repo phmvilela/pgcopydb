@@ -3,7 +3,7 @@
 **Question:** issue [#23](https://github.com/berenguel/pgcyan/issues/23) says
 *"Prefer driving pgcopydb (thin wrapper) over hand-rolled
 `CREATE_REPLICATION_SLOT` SQL."* Given that, why does the implementation
-(`pg_cyan/snapshot.py`, `PgCyanSnapshot`) contain any custom Python at all?
+(`pg_cyan/copy/snapshot.py`, `PgCyanSnapshot`) contain any custom Python at all?
 
 **Short answer:** the slot + snapshot creation *is* pgcopydb-driven, exactly as
 the ticket asks — the custom Python only covers the things pgcopydb's `snapshot`

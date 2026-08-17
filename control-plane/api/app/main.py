@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import List
 
 from fastapi import Depends, FastAPI, HTTPException
-from pg_cyan import capacity_contract
+from pg_cyan.collect import capacity_contract
 
 from app.controller_client import ControllerClient, ControllerUnreachable
 from app.models import (
@@ -217,7 +217,7 @@ def create_migration(
     See also: control-plane/api/app/provisioner.py.
     """
     # Validate any operator-declared capacity objects with the SHARED contract
-    # (pg_cyan/capacity_contract.py) -- the same rules the planner reads by -- so a
+    # (pg_cyan/collect/capacity_contract.py) -- the same rules the planner reads by -- so a
     # rejected request is one the planner would also reject. Done before the
     # singleton reservation so a malformed body never claims the slot.
     if req.capacity is not None:

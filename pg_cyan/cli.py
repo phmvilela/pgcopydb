@@ -19,23 +19,23 @@ import click
 
 from pg_cyan import __version__
 from pg_cyan.controller import PgCyanController
-from pg_cyan.datashard import PgCyanDataShard
-from pg_cyan.postfk import PgCyanForeignKeys
-from pg_cyan.sequences import PgCyanSequences
-from pg_cyan.postindex import PgCyanPostIndex
-from pg_cyan.lobs import PgCyanLobs
-from pg_cyan.metrics import PgCyanMetrics
+from pg_cyan.copy.datashard import PgCyanDataShard
+from pg_cyan.copy.postfk import PgCyanForeignKeys
+from pg_cyan.copy.sequences import PgCyanSequences
+from pg_cyan.copy.postindex import PgCyanPostIndex
+from pg_cyan.copy.lobs import PgCyanLobs
+from pg_cyan.collect.metrics import PgCyanMetrics
 from pg_cyan.orchestrator import PgCyanOrchestrator
-from pg_cyan.parameters import PgCyanParameters
-from pg_cyan.planner import PgCyanPlanner
-from pg_cyan.predata import PgCyanPreData
-from pg_cyan.preflight import PgCyanPreflight
-from pg_cyan.capinputs import PgCyanCapacityInputs
-from pg_cyan.netprobe import PgCyanNetworkProbe
-from pg_cyan.sourcecap import PgCyanSourceCapacity
-from pg_cyan.targetcap import PgCyanTargetCapacity
-from pg_cyan.clustercap import PgCyanClusterCapacity
-from pg_cyan.copyloghistory import PgCyanCopylogHistory
+from pg_cyan.plan.parameters import PgCyanParameters
+from pg_cyan.plan.planner import PgCyanPlanner
+from pg_cyan.copy.predata import PgCyanPreData
+from pg_cyan.plan.preflight import PgCyanPreflight
+from pg_cyan.collect.capinputs import PgCyanCapacityInputs
+from pg_cyan.collect.netprobe import PgCyanNetworkProbe
+from pg_cyan.collect.sourcecap import PgCyanSourceCapacity
+from pg_cyan.collect.targetcap import PgCyanTargetCapacity
+from pg_cyan.collect.clustercap import PgCyanClusterCapacity
+from pg_cyan.collect.copyloghistory import PgCyanCopylogHistory
 from pg_cyan.postgres.conn import _source_default, _target_default
 
 
@@ -415,7 +415,7 @@ def copylog_history(copylog_path: str, metrics_path: str, output_dir: str,
     ``copylog-history.json`` for the next run's planner to calibrate from. Pure
     transform; a run with no usable durations leaves the history unchanged.
     """
-    from pg_cyan.copyloghistory import produce_copylog_history_from_env
+    from pg_cyan.collect.copyloghistory import produce_copylog_history_from_env
     try:
         code = produce_copylog_history_from_env(
             copylog_path, metrics_path, output_dir, max_runs, run_id)
@@ -783,7 +783,7 @@ def run_migration(namespace: str, in_cluster: bool, stop_after: str,
     a small control API (`GET /status`, `POST /start`) and parks pre-snapshot,
     establishing the snapshot + walking only when `POST /start` arrives.
     """
-    from pg_cyan.snapshot import _holder_from_env
+    from pg_cyan.copy.snapshot import _holder_from_env
     holder = _holder_from_env()
     controller = PgCyanController(holder=holder, namespace=namespace,
                                   in_cluster=in_cluster, stop_after=stop_after or None,

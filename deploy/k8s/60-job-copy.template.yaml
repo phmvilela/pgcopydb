@@ -23,7 +23,7 @@
 # table-data` -- NOT `pgcopydb clone`. the schema step restores the schema and the post-data steps
 # builds the indexes/constraints, so this step copies the HEAP and nothing else.
 # `clone` would re-run both schema sections and collide with the schema step/3.
-# See also: pg_cyan/datashard.py, notes/migration-steps-lessons-learned.md
+# See also: pg_cyan/copy/datashard.py, notes/migration-steps-lessons-learned.md
 #
 # INTRA-TABLE SPLIT: `--split-tables-larger-than` lets a single shard further
 # parallelise a giant table across `--table-jobs` processes via integer-range or
@@ -124,7 +124,7 @@ spec:
           # extension/ownership walls). --skip-vacuum + no index build fall out of
           # `copy table-data`; the wrapper adds --resume so a
           # backed-off pod continues on its RWO disk.
-          # See also: pg_cyan/datashard.py, notes/migration-steps-lessons-learned.md
+          # See also: pg_cyan/copy/datashard.py, notes/migration-steps-lessons-learned.md
           command: ["python", "-m", "pg_cyan.cli", "copy"]
           envFrom:
             - secretRef:

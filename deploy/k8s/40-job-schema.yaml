@@ -23,7 +23,7 @@
 # that snapshot in its own pod and INJECTS `SNAPSHOT_ID` into this Job's env at
 # apply time (no `pgcyan-snapshot` ConfigMap). The wrapper pins `dump schema` to
 # it, exactly like the data shards.
-# See also: pg_cyan/predata.py
+# See also: pg_cyan/copy/predata.py
 apiVersion: batch/v1
 kind: Job
 metadata:

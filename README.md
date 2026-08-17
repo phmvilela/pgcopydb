@@ -163,7 +163,7 @@ collects them automatically yet, so `capacity-inputs` lets an operator **declare
 them: it reads one bundle (`capacity-declared.json` by default) keyed by
 `source_capacity` / `target_capacity` / `network` / `cluster_capacity` /
 `copylog_history` / `constraints`, validates each sub-object against the shared
-contract (`pg_cyan/capacity_contract.py`), and writes the valid ones out as the
+contract (`pg_cyan/collect/capacity_contract.py`), and writes the valid ones out as the
 canonical artifact files the planner reads. Invalid sub-objects are skipped so the
 planner degrades that term rather than trusting bad input; a missing bundle is a
 no-op (the planner keeps its static fallbacks). The same bundle shape is what the
@@ -277,7 +277,7 @@ required; `pg-source-parameters.json` / `constraints.json` and the
 bin-packs the tables into disjoint copy shards balanced by **estimated copy
 time** (`t(table) ≈ max(live_bytes/per_stream_bw, rows/per_stream_rows)`;
 degrades to heap bytes when the extended metrics are absent — see
-`pg_cyan/cost_model.py`), and
+`pg_cyan/collect/cost_model.py`), and
 writes `plan.json` plus one `shard-<n>.filters` per shard (pgcopydb `--filters`
 format with a disjoint `[include-only-table]` list). This is the `plan` step
 node in `deploy/k8s/`.
@@ -288,7 +288,7 @@ records why — pgcopydb's logical-replication CDC does not replicate large
 objects. When the capacity artifacts are present it derives the parallel-stream
 budget `C*` and from it the shard count and per-shard `table_jobs`
 (`min` of the source/target/network/cluster ceilings, clamped by
-`constraints.json`; see `pg_cyan/capacity.py`); with no capacity data the shard
+`constraints.json`; see `pg_cyan/collect/capacity.py`); with no capacity data the shard
 count falls back to 4 (clamped to the table count). FK-graph collection and
 cross-shard range-splitting of an oversized table are deferred follow-ups.
 

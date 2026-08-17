@@ -77,7 +77,7 @@ CONTROLLER_MANIFEST = "35-statefulset-controller.yaml"
 
 #: ConfigMap that carries the operator-declared capacity bundle into the
 #: namespace, and its single key. This is the exact declared-file shape the
-#: `capacity-inputs` provider reads (pg_cyan/capinputs.py): the collect step
+#: `capacity-inputs` provider reads (pg_cyan/collect/capinputs.py): the collect step
 #: mounts it and explodes it into the planner-inputs ConfigMap. Delivering it is
 #: this component's job; consuming it in the DAG is a follow-up (like the
 #: collectors, it feeds the planner-inputs ConfigMap the same way).

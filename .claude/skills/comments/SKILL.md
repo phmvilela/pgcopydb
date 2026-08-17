@@ -49,7 +49,7 @@ Prefer:
 
 ```python
 # COPY leaves target sequences at their start, so reset them to the source values.
-# See also: pg_cyan/sequences.py
+# See also: pg_cyan/copy/sequences.py
 def reset_sequences(self): ...
 ```
 

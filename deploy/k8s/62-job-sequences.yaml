@@ -15,7 +15,7 @@
 # sub-commands no-op in our standalone per-pod --dir. This is pure psycopg2 (read
 # source pg_sequences, setval on the target) -- no pgcopydb catalog, so an
 # emptyDir for the one small output JSON suffices.
-# See also: pg_cyan/sequences.py
+# See also: pg_cyan/copy/sequences.py
 apiVersion: batch/v1
 kind: Job
 metadata:

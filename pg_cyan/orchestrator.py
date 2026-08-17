@@ -17,7 +17,7 @@ Implements the step walk from ``deploy/k8s/README.md`` /
     plan -> schema -> copy (xN) -> sequences -> indexes (xM) -> foreign-keys
 
 There is no CDC step: under Option A the controller streams CDC itself after
-the walk (see ``pg_cyan/controller.py`` / ``pg_cyan/follow.py``). There is no
+the walk (see ``pg_cyan/controller.py`` / ``pg_cyan/copy/follow.py``). There is no
 snapshot-holder step: the CONTROLLER that drives this orchestrator
 (``pg_cyan/controller.py``) holds the consistent snapshot in its OWN pod and
 passes the id in via ``snapshot_id``, which the orchestrator injects as
@@ -68,7 +68,7 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
 
-from pg_cyan.datashard import PgCyanDataShard
+from pg_cyan.copy.datashard import PgCyanDataShard
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
