@@ -44,6 +44,13 @@ metadata:
   #     --role "Monitoring Reader" --scope <source-server-resource-id>
   # The collector is optional and degrades per-field if either grant is
   # missing -- see pg_cyan/collect/sourcecap_azure.py.
+  #
+  # The `target-capacity-azure` collector (#164, the target-side mirror) reads
+  # the TARGET server's storage/SKU only -- no Monitor metric, so just `Reader`
+  # SCOPED TO THE TARGET SERVER RESOURCE is needed:
+  #   az role assignment create --assignee <orchestrator-mi-client-id> \
+  #     --role Reader --scope <target-server-resource-id>
+  # Optional and degrades the same way -- see pg_cyan/collect/targetcap_azure.py.
 ---
 apiVersion: v1
 kind: ServiceAccount

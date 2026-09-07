@@ -263,6 +263,26 @@ property). It connects to the **target** (`PGCOPYDB_TARGET_PGURI` / `PG_TARGET_*
 Optional: a failure preserves the existing artifact, writes
 `target-capacity-errors.json`, and still exits 0.
 
+### Collect target capacity — Azure cloud half (optional)
+
+```bash
+# Merge the target's Azure-cloud write-throughput ceiling into target-capacity.json
+python -m pg_cyan.cli target-capacity-azure --output-dir ./artifacts
+```
+
+`target-capacity-azure` is the target-side mirror of `source-capacity-azure`: it
+reads the target Flexible Server's provisioned storage/SKU and **merges**
+`write_throughput_bytes_per_sec` (the `target_write` term of `C*`) into any
+existing `target-capacity.json`, preserving declared/catalog fields. Unlike the
+source side there's no paired field to wait on (no WAL-deadline equivalent), so
+a measured value is written as soon as the SDK reports a throughput for the
+server's storage tier — an unsupported tier just omits it. Needs
+`PGCYAN_TARGET_AZURE_RESOURCE_ID` and an Azure credential
+(`DefaultAzureCredential` / Workload Identity) with `Reader` on that resource
+(no `Monitoring Reader` needed — no Monitor metric is read). Optional: a missing
+resource id, a credential failure, or any Azure API error preserves the
+existing artifact, writes `target-capacity-azure-errors.json`, and still exits 0.
+
 ### Collect cluster capacity (optional)
 
 ```bash
@@ -436,6 +456,7 @@ stage's `--help` and module docstring.
 | `PGCYAN_NET_WARMUP_FRACTION` | `0.2` | `network-probe`: fraction of each transfer discarded as warm-up before rating it |
 | `PGCYAN_WAL_SAMPLE_SECONDS`   | `2`         | `source-capacity`: interval for sampling the WAL generation rate |
 | `PGCYAN_SOURCE_AZURE_RESOURCE_ID` | *(unset)* | `source-capacity-azure`: the source Flexible Server's Azure resource id |
+| `PGCYAN_TARGET_AZURE_RESOURCE_ID` | *(unset)* | `target-capacity-azure`: the target Flexible Server's Azure resource id |
 | `PGCYAN_COPYLOG_PATH` / `PGCYAN_METRICS_PATH` / `PGCYAN_HISTORY_MAX_RUNS` | `.` / *(unset)* / `20` | `copylog-history`: copylog input, optional metrics for byte volume, retention window |
 | `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |
