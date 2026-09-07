@@ -69,7 +69,19 @@ copydb_fetch_schema_and_prepare_specs(CopyDataSpec *specs)
 
 	bool preparedSnapshot = false;
 
-	if (specs->resume && specs->consistent)
+	/*
+	 * Whether this call is reusing a snapshot connection/transaction that a
+	 * CALLER already established (e.g. cli_copy_table_data calling
+	 * copydb_prepare_snapshot() before us) rather than one WE open here.
+	 * When true and preparedSnapshot is false, the connection at
+	 * specs->sourceSnapshot.pgsql is still owned by that caller, who will
+	 * close it later with their own copydb_close_snapshot() call -- we must
+	 * not commit/finish it out from under them (see the "time to finish the
+	 * transaction" block below).
+	 */
+	bool reusingSharedSnapshot = specs->resume && specs->consistent;
+
+	if (reusingSharedSnapshot)
 	{
 		log_debug("re-use snapshot \"%s\"", specs->sourceSnapshot.snapshot);
 
@@ -143,6 +155,21 @@ copydb_fetch_schema_and_prepare_specs(CopyDataSpec *specs)
 			/* errors have already been logged */
 			return false;
 		}
+	}
+	else if (reusingSharedSnapshot)
+	{
+		/*
+		 * We're reusing a snapshot connection/transaction a caller already
+		 * prepared (and did NOT prepare it ourselves just above, or we'd be
+		 * in the preparedSnapshot branch instead) -- e.g. cli_copy_table_data
+		 * calls copydb_prepare_snapshot() before us and its own
+		 * copydb_close_snapshot() after us, keeping the same connection open
+		 * across the whole COPY. Committing/finishing it here would leave
+		 * that later copydb_close_snapshot() call trying to commit an
+		 * already-closed connection ("BUG: call to pgsql_commit() without
+		 * holding an open multi statement connection"). Leave it open; its
+		 * preparer owns closing it.
+		 */
 	}
 	else
 	{
