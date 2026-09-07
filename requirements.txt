@@ -4,6 +4,8 @@ psycopg2-binary==2.9.9
 # Azure SDKs
 azure-identity==1.14.0
 azure-mgmt-rdbms==10.1.1
+azure-mgmt-postgresqlflexibleservers==2.0.0
+azure-mgmt-monitor==7.0.0
 
 # Configuration
 python-dotenv==1.0.0

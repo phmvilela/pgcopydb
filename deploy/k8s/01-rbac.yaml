@@ -31,6 +31,19 @@ metadata:
   # TODO: annotate with the Workload Identity client id once the planner app's
   # federated credential exists:
   #   azure.workload.identity/client-id: "<orchestrator-mi-client-id>"
+  #
+  # The `source-capacity-azure` collector (#154, runs as this SA in the collect
+  # Job, 25-job-collect-inputs.yaml) reads the source server's storage/SKU and
+  # its `storage_used` Monitor metric. This is AZURE IAM, not Kubernetes RBAC --
+  # grant the managed identity behind this SA's Workload Identity federation
+  # `Reader` (servers.get) and `Monitoring Reader` (the metric) roles SCOPED TO
+  # THE SOURCE SERVER RESOURCE, out of band, e.g.:
+  #   az role assignment create --assignee <orchestrator-mi-client-id> \
+  #     --role Reader --scope <source-server-resource-id>
+  #   az role assignment create --assignee <orchestrator-mi-client-id> \
+  #     --role "Monitoring Reader" --scope <source-server-resource-id>
+  # The collector is optional and degrades per-field if either grant is
+  # missing -- see pg_cyan/collect/sourcecap_azure.py.
 ---
 apiVersion: v1
 kind: ServiceAccount

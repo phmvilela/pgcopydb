@@ -33,6 +33,7 @@ from pg_cyan.plan.preflight import PgCyanPreflight
 from pg_cyan.collect.capinputs import PgCyanCapacityInputs
 from pg_cyan.collect.netprobe import PgCyanNetworkProbe
 from pg_cyan.collect.sourcecap import PgCyanSourceCapacity
+from pg_cyan.collect.sourcecap_azure import PgCyanSourceCapacityAzure
 from pg_cyan.collect.targetcap import PgCyanTargetCapacity
 from pg_cyan.collect.clustercap import PgCyanClusterCapacity
 from pg_cyan.collect.copyloghistory import PgCyanCopylogHistory
@@ -340,6 +341,37 @@ def source_capacity(host: str, port: int, user: str, password: str, database: st
         host=host, port=port, user=user, password=password, database=database,
         sslmode=sslmode, timeout=timeout, output_dir=output_dir,
         wal_sample_seconds=wal_sample_seconds,
+    )
+    try:
+        summary = collector.collect()
+        click.echo(json.dumps(summary, indent=2, default=str))
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(2)
+
+
+@cli.command(name="source-capacity-azure")
+@click.option("--resource-id", default=lambda: os.getenv("PGCYAN_SOURCE_AZURE_RESOURCE_ID"),
+              show_default="$PGCYAN_SOURCE_AZURE_RESOURCE_ID",
+              help="The source server's Azure resource id (Flexible Server).")
+@click.option("--timeout", type=int,
+              default=lambda: int(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "30")),
+              show_default="$PREFLIGHT_TIMEOUT_SECONDS", help="Azure API connect timeout (seconds).")
+@click.option("--output-dir", default=lambda: os.getenv("PG_OUTPUT_DIR", "."),
+              show_default="$PG_OUTPUT_DIR", help="Directory source-capacity.json is written to.")
+def source_capacity_azure(resource_id: str, timeout: int, output_dir: str) -> None:
+    """Fill the Azure-cloud fields of source-capacity.json (read ceiling + WAL disk free).
+
+    Reads the source Flexible Server's provisioned storage/SKU and the
+    ``storage_used`` Monitor metric, then **merges**
+    ``read_throughput_bytes_per_sec`` / ``wal_disk_free_bytes`` into any existing
+    ``source-capacity.json`` (preserving declared/catalog fields). Needs
+    ``PGCYAN_SOURCE_AZURE_RESOURCE_ID`` and an Azure credential (Workload
+    Identity). An **optional** collector: a missing resource id or any Azure API
+    failure preserves the existing artifact and still exits 0.
+    """
+    collector = PgCyanSourceCapacityAzure(
+        resource_id=resource_id, output_dir=output_dir, timeout=timeout,
     )
     try:
         summary = collector.collect()

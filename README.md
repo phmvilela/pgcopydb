@@ -211,6 +211,33 @@ is omitted (it can't feed the deadline alone). Like the other collectors it is
 **optional**: a failure preserves the existing artifact, writes
 `source-capacity-errors.json`, and still exits 0. Tunable via `--wal-sample-seconds`.
 
+### Collect source capacity — Azure cloud half (optional)
+
+```bash
+# Merge the source's Azure-cloud fields into source-capacity.json
+python -m pg_cyan.cli source-capacity-azure --output-dir ./artifacts
+```
+
+`source-capacity-azure` fills the two `source-capacity.json` fields the Postgres
+catalog can't answer, for an Azure Database for PostgreSQL **Flexible Server**
+source: the **read-throughput ceiling** (`read_throughput_bytes_per_sec`, only
+derived when the Azure SDK itself reports a provisioned throughput for the
+server's storage tier — there is no verified IOPS-formula fallback, so an
+unsupported tier just omits it) and **WAL disk free** (`wal_disk_free_bytes`,
+provisioned storage size minus the `storage_used` Azure Monitor metric — disk
+usage isn't exposed via SQL at all). It **merges** into any existing
+`source-capacity.json`, same discipline as the catalog half: a measured value
+overrides a declared one, and a `wal_disk_free_bytes` with no
+`wal_generation_bytes_per_sec` already on file to pair with (declared, or a
+prior `source-capacity` run) is omitted rather than left dangling.
+
+Needs `PGCYAN_SOURCE_AZURE_RESOURCE_ID` (the source server's Azure resource id —
+there's no way to derive it from the Postgres hostname) and an Azure credential
+(`DefaultAzureCredential` / Workload Identity) with `Reader` + `Monitoring
+Reader` on that resource. Like the other collectors it is **optional**: a
+missing resource id, a credential failure, or any Azure API error preserves the
+existing artifact, writes `source-capacity-azure-errors.json`, and still exits 0.
+
 ### Collect target capacity (optional)
 
 ```bash
@@ -398,6 +425,7 @@ stage's `--help` and module docstring.
 | `PGCYAN_CAPACITY_DECLARED`   | `capacity-declared.json` | `capacity-inputs`: operator-declared capacity bundle to read |
 | `PGCYAN_NET_STREAMS` / `PGCYAN_NET_STREAM_BYTES` / `PGCYAN_NET_RTT_SAMPLES` | `4` / `16Mi` / `5` | `network-probe`: parallel streams, bytes/stream, TCP RTT samples |
 | `PGCYAN_WAL_SAMPLE_SECONDS`   | `2`         | `source-capacity`: interval for sampling the WAL generation rate |
+| `PGCYAN_SOURCE_AZURE_RESOURCE_ID` | *(unset)* | `source-capacity-azure`: the source Flexible Server's Azure resource id |
 | `PGCYAN_COPYLOG_PATH` / `PGCYAN_METRICS_PATH` / `PGCYAN_HISTORY_MAX_RUNS` | `.` / *(unset)* / `20` | `copylog-history`: copylog input, optional metrics for byte volume, retention window |
 | `PGCYAN_SHARDS`              | `4`         | `plan`: number of copy shards    |
 | `PGCYAN_SPLIT_TABLES_LARGER_THAN` | `50GB` | `plan`: pgcopydb within-job split threshold |

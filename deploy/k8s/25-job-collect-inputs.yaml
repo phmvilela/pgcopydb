@@ -21,6 +21,11 @@
 #   * `pg_cyan.cli source-capacity`       -> merges the source's catalog fields
 #     (connections + WAL generation rate) into source-capacity.json, preserving
 #     declared/cloud fields; also optional (a failure exits 0, keeps the artifact).
+#   * `pg_cyan.cli source-capacity-azure` -> merges the source's Azure-cloud
+#     fields (read-throughput ceiling + WAL disk free, #154) into
+#     source-capacity.json; needs PGCYAN_SOURCE_AZURE_RESOURCE_ID and an Azure
+#     Reader + Monitoring Reader grant on the source server (out of band, see
+#     01-rbac.yaml); optional, missing config or API failure exits 0.
 #   * `pg_cyan.cli target-capacity`       -> merges the TARGET's connection
 #     headroom into target-capacity.json (connects via PGCOPYDB_TARGET_PGURI);
 #     optional, merge-not-clobber.
@@ -86,6 +91,13 @@ spec:
               # source-capacity.json, preserving declared/cloud fields. Optional:
               # a failure exits 0 and keeps any existing source-capacity.json.
               python -m pg_cyan.cli source-capacity --output-dir=/work
+              # Merge the source's Azure-cloud fields (read-throughput ceiling +
+              # WAL disk free, #154) into source-capacity.json. Needs
+              # PGCYAN_SOURCE_AZURE_RESOURCE_ID (env, not set here by default) and
+              # an Azure Reader + Monitoring Reader grant on the source server.
+              # Optional: missing config or an API failure exits 0 and keeps any
+              # existing source-capacity.json.
+              python -m pg_cyan.cli source-capacity-azure --output-dir=/work
               # Same for the TARGET's connection headroom (connects to the target
               # via PGCOPYDB_TARGET_PGURI). Optional, merge-not-clobber.
               python -m pg_cyan.cli target-capacity --output-dir=/work

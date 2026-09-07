@@ -286,7 +286,10 @@ data-shard (#25), CDC (#26), and post-data (#28) steps.
 
 ## Known gaps / cleanups worth doing
 
-- `pg_cyan/cloud/azure/` and `pg_cyan/postgres/` are empty skeletons — the
-  Azure-side pre-migration checks (HA, geo-backup, networking, storage, SKU)
-  and shared PG introspection helpers will land here.
+- `pg_cyan/postgres/` is still an empty skeleton for shared PG introspection
+  helpers. `pg_cyan/cloud/azure/` is no longer empty — it holds
+  `postgres_flexible_server.py` (#154: Flexible Server storage/SKU + the
+  `storage_used` Monitor metric, behind `source-capacity-azure`) — but the
+  other Azure-side pre-migration checks (HA, geo-backup, networking) are
+  still unbuilt.
 - Migration and post-migration stages are unimplemented.
