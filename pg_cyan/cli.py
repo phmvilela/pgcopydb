@@ -281,20 +281,28 @@ def plan(inputs_dir: str, output_dir: str, shards: int, split_tables_larger_than
 @click.option("--rtt-samples", type=int,
               default=lambda: int(os.getenv("PGCYAN_NET_RTT_SAMPLES", "5")),
               show_default="$PGCYAN_NET_RTT_SAMPLES", help="TCP connects; the min is the RTT.")
+@click.option("--warmup-fraction", type=float,
+              default=lambda: float(os.getenv("PGCYAN_NET_WARMUP_FRACTION", "0.2")),
+              show_default="$PGCYAN_NET_WARMUP_FRACTION",
+              help="Fraction of each transfer discarded as warm-up before rating it.")
 def network_probe(host: str, port: int, user: str, password: str, database: str,
                   sslmode: str, timeout: int, output_dir: str, streams: int,
-                  stream_bytes: int, rtt_samples: int) -> None:
+                  stream_bytes: int, rtt_samples: int, warmup_fraction: float) -> None:
     """Measure the source<->cluster path and emit the network.json capacity artifact.
 
     Measures RTT (TCP connect) and effective throughput (timed COPY, single +
-    parallel streams), then writes ``network.json`` for the capacity-aware
-    planner. An **optional** collector: a probe failure leaves any declared
-    ``network.json`` in place and still exits 0, so it never breaks the walk.
+    parallel streams, steady-state sampled past an initial warm-up window), then
+    writes ``network.json`` for the capacity-aware planner. When parallel streams
+    don't scale near-linearly, records a diagnostic ``aggregate_scaling`` block
+    (not consumed by the planner) suggesting whether the source or the network is
+    the likely limiter. An **optional** collector: a probe failure leaves any
+    declared ``network.json`` in place and still exits 0, so it never breaks the walk.
     """
     prober = PgCyanNetworkProbe(
         host=host, port=port, user=user, password=password, database=database,
         sslmode=sslmode, timeout=timeout, output_dir=output_dir,
         streams=streams, stream_bytes=stream_bytes, rtt_samples=rtt_samples,
+        warmup_fraction=warmup_fraction,
     )
     try:
         summary = prober.probe()

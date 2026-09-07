@@ -185,12 +185,21 @@ python -m pg_cyan.cli network-probe --output-dir ./artifacts
 `network-probe` is the first automated capacity **collector**: it measures the
 source path from where it runs and writes `network.json` for the planner —
 **RTT** (min of a few TCP connects to the source port; ICMP is often blocked),
-**per-stream throughput** (one timed `COPY … TO STDOUT` of generated data), and
-**aggregate bandwidth** (`--streams` parallel COPYs). A measured value overrides a
-declared one. It is **optional**: any probe failure leaves an existing (declared)
-`network.json` untouched, writes `network-errors.json`, and still exits 0 — so it
-never breaks the migration walk. Tunable via `--streams` / `--stream-bytes` /
-`--rtt-samples`.
+**per-stream throughput** (one timed `COPY … TO STDOUT` of a precomputed,
+near-zero-CPU constant row — not a per-row `repeat()` call, so the source isn't
+generating the timing bottleneck itself), and **aggregate bandwidth**
+(`--streams` parallel COPYs). Both throughput numbers are **steady-state
+sampled**: `--warmup-fraction` (default `0.2`) of each transfer's window is
+discarded before rating it, so TCP ramp-up doesn't bias a short measurement
+low. When the aggregate doesn't scale near-linearly with `--streams`, the
+artifact also carries a diagnostic `aggregate_scaling` block
+(`expected_bytes_per_sec`, `efficiency`, `likely_limited_by: "source"|"network"`)
+— a heuristic explanation for *why* a low number was measured, not a
+correction to it; the planner doesn't read this field. A measured value
+overrides a declared one. It is **optional**: any probe failure leaves an
+existing (declared) `network.json` untouched, writes `network-errors.json`,
+and still exits 0 — so it never breaks the migration walk. Tunable via
+`--streams` / `--stream-bytes` / `--rtt-samples` / `--warmup-fraction`.
 
 ### Collect source capacity (optional)
 
@@ -424,6 +433,7 @@ stage's `--help` and module docstring.
 | `PG_INPUTS_DIR`              | `.`         | `plan` / `capacity-inputs`: dir holding source artifacts |
 | `PGCYAN_CAPACITY_DECLARED`   | `capacity-declared.json` | `capacity-inputs`: operator-declared capacity bundle to read |
 | `PGCYAN_NET_STREAMS` / `PGCYAN_NET_STREAM_BYTES` / `PGCYAN_NET_RTT_SAMPLES` | `4` / `16Mi` / `5` | `network-probe`: parallel streams, bytes/stream, TCP RTT samples |
+| `PGCYAN_NET_WARMUP_FRACTION` | `0.2` | `network-probe`: fraction of each transfer discarded as warm-up before rating it |
 | `PGCYAN_WAL_SAMPLE_SECONDS`   | `2`         | `source-capacity`: interval for sampling the WAL generation rate |
 | `PGCYAN_SOURCE_AZURE_RESOURCE_ID` | *(unset)* | `source-capacity-azure`: the source Flexible Server's Azure resource id |
 | `PGCYAN_COPYLOG_PATH` / `PGCYAN_METRICS_PATH` / `PGCYAN_HISTORY_MAX_RUNS` | `.` / *(unset)* / `20` | `copylog-history`: copylog input, optional metrics for byte volume, retention window |

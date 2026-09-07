@@ -24,6 +24,23 @@ What it measures:
   aggregate is < N x per-stream, so ``bandwidth/per_stream`` (the planner's
   ``network_fill`` term) reflects the real fill factor.
 
+The generated payload is a **Python-precomputed literal**, not a per-row
+``repeat()`` call -- Postgres parses one constant and re-projects it, so the
+probe doesn't burn source CPU generating rows (#153: on a constrained source,
+that CPU cost -- not the network -- was what kept parallel streams from
+scaling, which collapsed the aggregate reading to ~1x a single stream). Both
+throughput measurements use **steady-state sampling**: each COPY's byte
+arrivals are timestamped, and an initial ``warmup_fraction`` of the transfer
+window (TCP slow-start / connection ramp) is discarded before computing the
+rate, so a short transfer isn't biased low by its own startup. When the
+aggregate probe still comes back far short of ``per_stream x streams``, that
+scaling shortfall is recorded as an ``aggregate_scaling`` block in
+``network.json`` (see ``_scaling_attribution``) -- a diagnostic explaining
+*why* a low number was measured (more likely source contention than a real
+network ceiling), not a correction to the measured value itself. It doesn't
+feed the planner's math (``pg_cyan/collect/capacity.py`` is unchanged by this) --
+it's informational, for a human or a future ticket to act on.
+
 It is an **optional** collector and degrades without ever breaking the walk: any
 probe failure leaves an existing (declared) ``network.json`` untouched -- so the
 declared value remains the fallback -- writes ``network-errors.json`` for
@@ -51,20 +68,83 @@ from pg_cyan.postgres.conn import source_conn_defaults
 
 logger = logging.getLogger(__name__)
 
-#: Width of each generated COPY row, in bytes. Cheap for the source to emit
-#: (a single ``repeat``), so the timing reflects the path, not source CPU.
+#: Width of each generated COPY row, in bytes.
 _ROW_BYTES = 4096
+#: The row payload as a single SQL string literal, computed once here rather
+#: than via a per-row ``repeat()`` call in the query -- Postgres parses this as
+#: one Const and re-projects it ``rows`` times, so generating it costs no
+#: source-side CPU beyond the row materialization the probe wants to time (#153).
+_ROW_LITERAL = "'" + ("x" * _ROW_BYTES) + "'"
+#: Threshold, as a fraction of "if it scaled at streams x", below which a low
+#: aggregate reading is attributed to source/connection contention rather than
+#: a real network ceiling. A documented heuristic, not a measured constant --
+#: see ``_scaling_attribution``.
+_SCALING_EFFICIENCY_SOURCE_THRESHOLD = 0.5
 
 
 class _CountingSink:
-    """A write-only file-like that counts bytes and discards them."""
+    """A write-only file-like that counts bytes and timestamps each chunk."""
 
-    def __init__(self) -> None:
+    def __init__(self, start_time: float) -> None:
+        #: Anchor for ``samples``' timestamps. Callers running several streams
+        #: concurrently pass the SAME start_time to every sink so all their
+        #: samples land on one shared timeline and can be merged.
+        self._start = start_time
         self.n = 0
+        #: (elapsed_seconds_since_start, chunk_bytes) per chunk received.
+        self.samples: List[Tuple[float, int]] = []
 
     def write(self, data) -> int:
-        self.n += len(data)
-        return len(data)
+        chunk = len(data)
+        self.n += chunk
+        self.samples.append((perf_counter() - self._start, chunk))
+        return chunk
+
+
+def _steady_state_rate(samples: List[Tuple[float, int]], total_elapsed: float,
+                        warmup_fraction: float) -> float:
+    """
+    Bytes/sec over a transfer, discarding an initial warm-up window.
+
+    ``samples`` are ``(elapsed_since_start, chunk_bytes)`` pairs covering the
+    whole ``total_elapsed`` window. The first ``warmup_fraction`` of that
+    window (TCP slow-start / connection ramp) is dropped so a short or lumpy
+    transfer isn't biased downward by its own startup; the rate is then bytes
+    received after the cutoff over the remaining time. Falls back to the plain
+    average over the whole window when nothing survives the cutoff (e.g. the
+    whole transfer was faster than the warm-up window) or there are no samples.
+    """
+    if not samples or total_elapsed <= 0:
+        return 0.0
+    total_bytes = sum(b for _, b in samples)
+    cutoff = total_elapsed * warmup_fraction
+    steady_bytes = sum(b for t, b in samples if t >= cutoff)
+    steady_elapsed = total_elapsed - cutoff
+    if steady_elapsed <= 0 or steady_bytes <= 0:
+        return total_bytes / total_elapsed
+    return steady_bytes / steady_elapsed
+
+
+def _scaling_attribution(per_stream: float, bandwidth: float, streams: int) -> Optional[Dict]:
+    """
+    Diagnostic block explaining a poor aggregate/``per_stream x streams`` ratio.
+
+    Returns None when there is nothing to compare (``streams <= 1`` or
+    ``per_stream`` is non-positive). ``likely_limited_by`` is a heuristic, not a
+    hard classification -- see ``_SCALING_EFFICIENCY_SOURCE_THRESHOLD``.
+    """
+    if streams <= 1 or per_stream <= 0:
+        return None
+    expected = per_stream * streams
+    efficiency = bandwidth / expected if expected > 0 else 0.0
+    likely_limited_by = ("source" if efficiency < _SCALING_EFFICIENCY_SOURCE_THRESHOLD
+                          else "network")
+    return {
+        "streams": streams,
+        "expected_bytes_per_sec": round(expected, 2),
+        "efficiency": round(efficiency, 4),
+        "likely_limited_by": likely_limited_by,
+    }
 
 
 class PgCyanNetworkProbe:
@@ -86,6 +166,7 @@ class PgCyanNetworkProbe:
         streams: int = 4,
         stream_bytes: int = 16 * 1024 * 1024,
         rtt_samples: int = 5,
+        warmup_fraction: float = 0.2,
     ):
         """
         Args:
@@ -95,6 +176,9 @@ class PgCyanNetworkProbe:
             streams: parallel COPY streams for the aggregate-bandwidth probe.
             stream_bytes: approximate bytes generated per stream.
             rtt_samples: number of TCP connects; the min is taken as the RTT.
+            warmup_fraction: fraction of each transfer's window discarded as
+                warm-up before computing its steady-state rate (see
+                ``_steady_state_rate``).
         """
         self.host = host
         self.port = port
@@ -107,6 +191,7 @@ class PgCyanNetworkProbe:
         self.streams = max(1, int(streams))
         self.stream_bytes = max(_ROW_BYTES, int(stream_bytes))
         self.rtt_samples = max(1, int(rtt_samples))
+        self.warmup_fraction = max(0.0, min(float(warmup_fraction), 0.9))
         self.errors: List[str] = []
 
     def _log_event(
@@ -150,36 +235,45 @@ class PgCyanNetworkProbe:
         return psycopg2.connect(**kwargs)
 
     def _copy_sql(self) -> str:
-        """A COPY that streams ~``stream_bytes`` of cheaply-generated data."""
+        """A COPY that streams ~``stream_bytes`` of a precomputed constant row."""
         rows = max(1, self.stream_bytes // _ROW_BYTES)
-        # `rows`/`_ROW_BYTES` are our own ints -- no user input in this SQL.
-        return (f"COPY (SELECT repeat('x', {_ROW_BYTES}) "
-                f"FROM generate_series(1, {rows})) TO STDOUT")
+        # `rows` is our own int -- no user input in this SQL.
+        return f"COPY (SELECT {_ROW_LITERAL} FROM generate_series(1, {rows})) TO STDOUT"
 
-    def _copy_stream(self) -> Tuple[int, float]:
-        """Run one COPY stream; return (bytes_received, seconds)."""
+    def _copy_stream(self, start_time: Optional[float] = None) -> Tuple[int, float, List[Tuple[float, int]]]:
+        """
+        Run one COPY stream; return (bytes_received, seconds, chunk_samples).
+
+        ``start_time`` anchors the chunk timestamps to a shared clock -- pass
+        the same value to every concurrently-run stream so their samples can be
+        merged onto one timeline (used by the aggregate probe below); defaults
+        to this call's own start.
+        """
         conn = self._open_conn()
         try:
-            sink = _CountingSink()
             cur = conn.cursor()
             t0 = perf_counter()
+            sink = _CountingSink(start_time if start_time is not None else t0)
             cur.copy_expert(self._copy_sql(), sink)
             elapsed = perf_counter() - t0
             cur.close()
-            return sink.n, max(elapsed, 1e-9)
+            return sink.n, max(elapsed, 1e-9), sink.samples
         finally:
             conn.close()
 
-    def measure_throughput(self) -> Optional[Tuple[float, float]]:
+    def measure_throughput(self) -> Optional[Tuple[float, float, Optional[Dict]]]:
         """
-        Measure (per_stream_bytes_per_sec, bandwidth_bytes_per_sec).
+        Measure (per_stream_bytes_per_sec, bandwidth_bytes_per_sec, aggregate_scaling).
 
-        One stream gives the per-stream rate; ``streams`` parallel streams over
-        their wall-clock window give the aggregate bandwidth. Returns None if the
-        source connection or COPY could not run at all.
+        One stream gives the steady-state per-stream rate; ``streams`` parallel
+        streams sharing one wall-clock window give the steady-state aggregate
+        bandwidth. ``aggregate_scaling`` (see ``_scaling_attribution``) is None
+        when there's nothing to compare (``streams == 1`` or the aggregate probe
+        itself failed). Returns None if the source connection or COPY could not
+        run at all.
         """
         try:
-            single_bytes, single_secs = self._copy_stream()
+            _, single_secs, single_samples = self._copy_stream()
         except (PgError, OSError) as e:
             self._log_event("measure_throughput", "failure",
                             "Single-stream COPY probe failed",
@@ -189,18 +283,21 @@ class PgCyanNetworkProbe:
             self.errors.append(f"Throughput probe failed: {e}")
             return None
 
-        per_stream = single_bytes / single_secs
+        per_stream = _steady_state_rate(single_samples, single_secs, self.warmup_fraction)
 
         bandwidth = per_stream
+        scaling: Optional[Dict] = None
         if self.streams > 1:
             try:
                 wall0 = perf_counter()
                 with ThreadPoolExecutor(max_workers=self.streams) as pool:
-                    results = list(pool.map(lambda _: self._copy_stream(),
+                    results = list(pool.map(lambda _: self._copy_stream(wall0),
                                             range(self.streams)))
                 wall = max(perf_counter() - wall0, 1e-9)
-                total_bytes = sum(b for b, _ in results)
-                bandwidth = max(total_bytes / wall, per_stream)
+                merged_samples = [sample for _, _, samples in results for sample in samples]
+                bandwidth = max(_steady_state_rate(merged_samples, wall, self.warmup_fraction),
+                                per_stream)
+                scaling = _scaling_attribution(per_stream, bandwidth, self.streams)
             except (PgError, OSError) as e:
                 # Aggregate probe failed but we still have a per-stream number;
                 # fall back to it rather than losing the whole measurement.
@@ -208,7 +305,7 @@ class PgCyanNetworkProbe:
                                 "Parallel bandwidth probe failed; using per-stream rate",
                                 {"error": str(e)})
                 bandwidth = per_stream
-        return per_stream, bandwidth
+        return per_stream, bandwidth, scaling
 
     # ------------------------------------------------------------------ output
 
@@ -226,7 +323,7 @@ class PgCyanNetworkProbe:
             self.errors.append(f"Failed to write {filename}: {e}")
             return None
 
-    def _build_network(self, rtt_ms, per_stream, bandwidth) -> Dict:
+    def _build_network(self, rtt_ms, per_stream, bandwidth, scaling: Optional[Dict]) -> Dict:
         payload = {
             "component": "network-probe",
             "status": "success",
@@ -237,10 +334,15 @@ class PgCyanNetworkProbe:
                 "streams": self.streams,
                 "stream_bytes": self.stream_bytes,
                 "rtt_samples": self.rtt_samples,
+                "warmup_fraction": self.warmup_fraction,
             },
         }
         if rtt_ms is not None:
             payload["rtt_ms"] = round(rtt_ms, 3)
+        if scaling is not None:
+            # Diagnostic only -- pg_cyan/collect/capacity.py does not read this;
+            # it explains *why* a low bandwidth number was measured.
+            payload["aggregate_scaling"] = scaling
         return capacity_contract.stamp(payload)
 
     def probe(self) -> Dict:
@@ -276,8 +378,8 @@ class PgCyanNetworkProbe:
             summary["error_file"] = error_path
             return summary
 
-        per_stream, bandwidth = throughput
-        payload = self._build_network(rtt_ms, per_stream, bandwidth)
+        per_stream, bandwidth, scaling = throughput
+        payload = self._build_network(rtt_ms, per_stream, bandwidth, scaling)
 
         # Guard: our own artifact must satisfy the shared contract.
         contract_errors = capacity_contract.validate(self.OUTPUT_FILENAME, payload)
@@ -302,7 +404,8 @@ class PgCyanNetworkProbe:
                         "Measured the source network path",
                         {"rtt_ms": payload.get("rtt_ms"),
                          "per_stream_bytes_per_sec": payload["per_stream_bytes_per_sec"],
-                         "bandwidth_bytes_per_sec": payload["bandwidth_bytes_per_sec"]})
+                         "bandwidth_bytes_per_sec": payload["bandwidth_bytes_per_sec"],
+                         "aggregate_scaling": payload.get("aggregate_scaling")})
         summary.update(status="success", output_file=output_path)
         return summary
 
@@ -329,6 +432,7 @@ def probe_network_from_env() -> int:
             streams=int(os.getenv("PGCYAN_NET_STREAMS", "4")),
             stream_bytes=int(os.getenv("PGCYAN_NET_STREAM_BYTES", str(16 * 1024 * 1024))),
             rtt_samples=int(os.getenv("PGCYAN_NET_RTT_SAMPLES", "5")),
+            warmup_fraction=float(os.getenv("PGCYAN_NET_WARMUP_FRACTION", "0.2")),
         )
         summary = probe.probe()
         print(json.dumps(summary, indent=2, default=str))
