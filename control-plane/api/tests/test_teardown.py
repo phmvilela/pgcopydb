@@ -1,5 +1,6 @@
 """Teardown-logic tests, exercised against fake k8s + controller clients."""
 from app.controller_client import ControllerUnreachable
+from app.provisioner import node_reader_binding_name
 from app.teardown import (
     CONTROLLER_POD_SELECTOR,
     CONTROLLER_STATEFULSET,
@@ -11,12 +12,14 @@ from app.teardown import (
 class FakeK8s:
     """Records teardown ops; returns a scripted sequence of pod counts."""
 
-    def __init__(self, pod_counts, events=None):
+    def __init__(self, pod_counts, events=None, boom_on_binding_delete=False):
         self.pod_counts = list(pod_counts)
         self.scaled = []
         self.deleted = []
+        self.deleted_bindings = []
         self.polls = 0
         self._events = events
+        self._boom_on_binding_delete = boom_on_binding_delete
 
     def scale_statefulset(self, namespace, name, replicas):
         self.scaled.append((namespace, name, replicas))
@@ -32,6 +35,13 @@ class FakeK8s:
         self.deleted.append(namespace)
         if self._events is not None:
             self._events.append("delete")
+
+    def delete_cluster_role_binding(self, name):
+        if self._boom_on_binding_delete:
+            raise RuntimeError("not found")  # e.g. a pre-#158 migration never had one
+        self.deleted_bindings.append(name)
+        if self._events is not None:
+            self._events.append("delete-binding")
 
 
 class FakeController:
@@ -125,3 +135,19 @@ def test_teardown_flags_released_false_on_controller_error_response():
     res = _teardown(k8s, controller).teardown("ns")
     assert res["released"] is False
     assert k8s.deleted == ["ns"]
+
+
+def test_teardown_deletes_the_node_reader_binding():
+    k8s = FakeK8s(pod_counts=[0])
+    _teardown(k8s).teardown("pgcyan-mig-abc")
+    assert k8s.deleted_bindings == [node_reader_binding_name("pgcyan-mig-abc")]
+
+
+def test_teardown_binding_cleanup_is_best_effort_and_never_blocks():
+    # No binding to delete (pre-#158 migration, or provisioning failed before
+    # the stamp) -- teardown must still succeed and report normally.
+    k8s = FakeK8s(pod_counts=[0], boom_on_binding_delete=True)
+    res = _teardown(k8s).teardown("ns")
+    assert res == {"namespace": "ns", "graceful": True, "released": True}
+    assert k8s.deleted == ["ns"]           # the namespace delete still happened
+    assert k8s.deleted_bindings == []      # the binding delete failed silently

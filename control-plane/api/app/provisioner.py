@@ -15,19 +15,37 @@ re-declared here, so there is no drift. Two apply-time transforms:
 * **placeholder fill** — the ``${PGCYAN_*}`` env placeholders in the controller
   manifest are filled (image, wait-for-start=true, etc.).
 
-On top of the shared manifests it also stamps ONE extra RoleBinding: the
-out-of-cluster, read-only *observer* (the devcontainer's fixed ``pgcyan-viewer``
-SA) is bound into each dynamic namespace so an operator watching with that
-identity sees the per-migration namespaces the same way it sees the fixed
-integration-test one. It is built in code — NOT taken through ``retarget`` — so
-its subject keeps pointing at the observer's own namespace instead of being
-rewritten to the new one, and it reuses the per-namespace ``pgcyan-viewer`` Role
-so the read-only rules stay defined once (deploy/k8s/01-rbac.yaml).
+On top of the shared manifests it also stamps TWO extra bindings, both built in
+code — NOT taken through the generic ``deploy/k8s/01-rbac.yaml`` retarget loop:
+
+* The out-of-cluster, read-only *observer* RoleBinding (the devcontainer's
+  fixed ``pgcyan-viewer`` SA) is bound into each dynamic namespace so an
+  operator watching with that identity sees the per-migration namespaces the
+  same way it sees the fixed integration-test one. Its subject keeps pointing
+  at the observer's own namespace instead of being rewritten to the new one,
+  and it reuses the per-namespace ``pgcyan-viewer`` Role so the read-only
+  rules stay defined once (deploy/k8s/01-rbac.yaml).
+* A per-namespace ``ClusterRoleBinding`` (#158) grants this namespace's
+  ``pgcyan-orchestrator`` SA node-list, so the ``cluster-capacity`` collector
+  (#146) works for control-plane-provisioned migrations too. This is why
+  ``ClusterRole``/``ClusterRoleBinding`` docs are explicitly SKIPPED when
+  applying ``deploy/k8s/01-rbac.yaml``'s generic RBAC loop below: they are
+  cluster-scoped, singly-named, shared objects (``pgcyan-node-reader``) meant
+  for the fixed integration-test namespace's own direct ``kubectl apply``, not
+  something safe to blindly re-``create`` (not upsert) per migration --
+  besides colliding on that shared name, the control plane's own identity
+  (``deploy/control-plane/01-rbac.yaml``) deliberately does not hold
+  ``clusterroles``/``clusterrolebindings`` broadly, only enough to ``bind`` the
+  ONE ``pgcyan-node-reader`` ClusterRole that same file bootstraps once,
+  cluster-wide, as fixed infra (not re-derived from ``deploy/k8s`` here). See
+  ``node_reader_binding_name`` / ``_node_reader_binding`` below; the matching
+  cleanup lives in ``control-plane/api/app/teardown.py`` (cluster-scoped
+  objects aren't caught by the namespace-delete cascade).
 
 Kubernetes I/O goes through an injected ``applier`` so the provisioning logic
 (ordering, retarget, fill, secret contents) is unit-testable without a cluster.
 
-See also: control-plane/api/app/k8s.py.
+See also: control-plane/api/app/k8s.py, control-plane/api/app/teardown.py.
 """
 import json
 import uuid
@@ -59,10 +77,25 @@ VIEWER_ROLE_NAME = "pgcyan-viewer"
 #: RoleBinding 01-rbac.yaml already creates for the local viewer SA.
 EXTERNAL_VIEWER_BINDING_NAME = "pgcyan-viewer-external"
 
+#: The cluster-wide ClusterRole (nodes get/list/watch) bootstrapped ONCE by
+#: deploy/control-plane/01-rbac.yaml -- see module docstring for why this isn't
+#: re-derived from deploy/k8s/01-rbac.yaml at provision time (#158).
+NODE_READER_CLUSTER_ROLE = "pgcyan-node-reader"
+
 
 def new_migration_id() -> str:
     """A short, unique migration id."""
     return uuid.uuid4().hex[:10]
+
+
+def node_reader_binding_name(namespace: str) -> str:
+    """Deterministic per-namespace node-reader ClusterRoleBinding name.
+
+    Named off the namespace (not the migration id) so ``teardown()`` -- which
+    already has the namespace, not a migration id -- can recompute the exact
+    same name to delete with no extra plumbing.
+    """
+    return f"{NODE_READER_CLUSTER_ROLE}-{namespace}"
 
 
 def namespace_for(migration_id: str) -> str:
@@ -162,6 +195,35 @@ class Provisioner:
             }],
         }
 
+    def _node_reader_binding(self, ns: str) -> dict:
+        """ClusterRoleBinding granting this namespace's orchestrator node-list (#158).
+
+        Binds via the shared ``pgcyan-node-reader`` ClusterRole bootstrapped
+        once by ``deploy/control-plane/01-rbac.yaml`` (never re-created here).
+        Uniquely named per namespace (``node_reader_binding_name``) so
+        concurrent/sequential migrations never collide on one shared name --
+        the problem the committed ``deploy/k8s`` binding has under this
+        provisioner (see module docstring).
+        """
+        return {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {
+                "name": node_reader_binding_name(ns),
+                "labels": {"app.kubernetes.io/part-of": "pgcyan"},
+            },
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": NODE_READER_CLUSTER_ROLE,
+            },
+            "subjects": [{
+                "kind": "ServiceAccount",
+                "name": "pgcyan-orchestrator",
+                "namespace": ns,
+            }],
+        }
+
     def _docs(self, name: str, subs: Optional[Dict[str, str]] = None) -> List[dict]:
         text = (self.manifests_dir / name).read_text()
         if subs:
@@ -185,9 +247,15 @@ class Provisioner:
 
         self.applier.create_namespace(ns, labels)
 
-        # Identities + storage first.
+        # Identities + storage first. ClusterRole/ClusterRoleBinding docs are
+        # skipped here on purpose (#158, see module docstring): they're
+        # cluster-scoped, singly-named, shared objects meant for the fixed
+        # integration-test namespace's own direct apply, not something safe to
+        # blindly re-create per migration.
         for name in (RBAC_MANIFEST, PVC_MANIFEST):
             for doc in self._docs(name):
+                if doc.get("kind") in ("ClusterRole", "ClusterRoleBinding"):
+                    continue
                 retarget_namespace(doc, ns)
                 self.applier.apply_doc(doc)
 
@@ -198,6 +266,12 @@ class Provisioner:
         # per-namespace pgcyan-viewer Role applied just above.
         if self.viewer_sa and self.viewer_ns:
             self.applier.apply_doc(self._external_viewer_binding(ns))
+
+        # Grant this namespace's orchestrator node-list, via the shared
+        # ClusterRole deploy/control-plane/01-rbac.yaml bootstraps once (#158).
+        # Uniquely named per namespace; torn down explicitly in teardown.py
+        # since cluster-scoped objects aren't caught by the namespace cascade.
+        self.applier.apply_doc(self._node_reader_binding(ns))
 
         # DB credentials the controller reads via envFrom (never in git).
         self.applier.create_secret(ns, "pgcyan-db-uris", {

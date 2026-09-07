@@ -4,8 +4,10 @@
 #
 # Broad by design (no per-user auth on the control plane yet). It is NOT
 # cluster-admin: it can manage only the specific resource kinds a migration
-# namespace needs -- no nodes, no cluster-scoped RBAC beyond what it needs to
-# bind namespaced Roles, no arbitrary CRDs.
+# namespace needs, no arbitrary CRDs. It can create ClusterRoleBindings (#158,
+# for cluster-capacity's per-namespace node-reader grant) but can only ever
+# `bind` the single pre-existing pgcyan-node-reader ClusterRole below -- it
+# cannot fabricate or bind any other cluster-scoped privilege.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -54,6 +56,21 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete", "bind", "escalate"]
+  # Create/delete the per-migration node-reader ClusterRoleBinding (#158) so
+  # cluster-capacity's node listing works for control-plane-provisioned
+  # migrations, mirroring deploy/k8s/01-rbac.yaml's pgcyan-node-reader binding
+  # for the fixed integration-test namespace. `bind` on the ClusterRole below
+  # is required by Kubernetes' privilege-escalation check for creating a
+  # ClusterRoleBinding that references it -- scoped by resourceNames to that
+  # ONE role, so this SA still cannot bind (or fabricate) arbitrary cluster
+  # privileges; it stays "not cluster-admin" as stated above.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: ["pgcyan-node-reader"]
   # Observe the migrations it provisions (pod status/logs, events, run-state).
   - apiGroups: [""]
     resources: ["pods", "pods/log", "events"]
@@ -74,3 +91,24 @@ subjects:
   - kind: ServiceAccount
     name: pgcyan-control-plane
     namespace: pgcyan-system
+---
+# --- pgcyan-node-reader: read-only, cluster-scoped node listing (#158) --------
+# Bootstrapped ONCE here, cluster-wide, rather than re-derived per migration
+# from deploy/k8s/01-rbac.yaml (which defines the SAME role for the fixed
+# integration-test namespace's own direct apply -- identical rules, applied
+# via two independent paths, same as pgcyan-control-plane's own identity being
+# fixed infra rather than provisioned per migration). The provisioner
+# (control-plane/api/app/provisioner.py) stamps one ClusterRoleBinding per
+# dynamic namespace against this role; teardown removes it (cluster-scoped
+# objects aren't caught by the namespace-delete cascade).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgcyan-node-reader
+  labels:
+    app.kubernetes.io/part-of: pgcyan
+    app.kubernetes.io/component: control-plane
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]

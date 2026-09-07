@@ -18,18 +18,28 @@ Tester-driven teardown of a migration.
 3. **Wait** for the controller pod to terminate cleanly.
 4. **Delete the namespace** (cascade) -- removes the Secret, PVC, Service, RBAC,
    and the now-idle StatefulSet.
+5. **Delete the per-namespace node-reader ClusterRoleBinding** (#158) -- like
+   the replication slot, this is state the namespace-delete cascade cannot
+   reach: it's cluster-scoped, stamped by the provisioner
+   (``provisioner.py``'s ``_node_reader_binding``) so ``cluster-capacity``
+   could list nodes for this migration. Best-effort, same reasoning as the
+   source release: a migration provisioned before #158 (or one that failed
+   before that stamp) simply never had one, so a not-found here must not block
+   the delete.
 
 The caller then marks the registry entry ``done``, freeing the singleton.
 
 Kubernetes + controller I/O are injected (same pattern as the provisioner) so the
 ordering and wait logic are unit-testable without a cluster.
 
-See also: control-plane/api/app/k8s.py, control-plane/api/app/controller_client.py.
+See also: control-plane/api/app/k8s.py, control-plane/api/app/controller_client.py,
+control-plane/api/app/provisioner.py (node_reader_binding_name).
 """
 import time
 from typing import Dict
 
 from app.controller_client import ControllerUnreachable
+from app.provisioner import node_reader_binding_name
 
 #: The controller StatefulSet + the label its pods carry (deploy/k8s).
 CONTROLLER_STATEFULSET = "pgcyan-controller"
@@ -72,7 +82,17 @@ class Teardown:
             raise
         except Exception as exc:  # noqa: BLE001 -- any k8s failure is a teardown failure
             raise TeardownError(f"teardown of {namespace} failed: {exc}") from exc
+        # 5. Best-effort: remove the cluster-scoped node-reader binding the
+        # namespace cascade can't reach. Never blocks -- a migration without one
+        # (pre-#158, or a provisioning that failed before that stamp) is fine.
+        self._cleanup_node_reader_binding(namespace)
         return {"namespace": namespace, "graceful": graceful, "released": released}
+
+    def _cleanup_node_reader_binding(self, namespace: str) -> None:
+        try:
+            self.applier.delete_cluster_role_binding(node_reader_binding_name(namespace))
+        except Exception:  # noqa: BLE001 -- best-effort, must never block teardown
+            pass
 
     def _release_source(self, namespace: str) -> bool:
         """Ask the controller to drop the source slot + publications (best-effort).

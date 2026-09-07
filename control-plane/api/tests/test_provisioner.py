@@ -142,6 +142,40 @@ def test_provision_external_viewer_is_disable_able(manifests_dir, fake_applier):
     assert "pgcyan-viewer-external" not in names
 
 
+def test_provision_binds_per_namespace_node_reader(manifests_dir, fake_applier):
+    p = Provisioner(manifests_dir, "img:1", fake_applier)
+    ns = "pgcyan-mig-deadbeef01"
+    p.provision(_req(), migration_id="deadbeef01")
+
+    crb = next(d for d in fake_applier.docs
+              if d.get("kind") == "ClusterRoleBinding"
+              and d["metadata"]["name"] == f"pgcyan-node-reader-{ns}")
+    assert crb["roleRef"] == {
+        "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole",
+        "name": "pgcyan-node-reader"}
+    # Bound to THIS namespace's orchestrator SA (unlike the external-viewer
+    # binding, this one IS namespace-specific -- it grants the collector
+    # running inside the new namespace, not an outside observer).
+    assert crb["subjects"] == [{
+        "kind": "ServiceAccount", "name": "pgcyan-orchestrator", "namespace": ns}]
+
+
+def test_provision_does_not_reapply_the_committed_cluster_scoped_rbac(manifests_dir, fake_applier):
+    # deploy/k8s/01-rbac.yaml's own pgcyan-node-reader ClusterRole/ClusterRoleBinding
+    # (bare name, no namespace suffix) must never be swept into the per-migration
+    # apply -- they're shared, singly-named, and the control-plane identity
+    # deliberately can't create/manage a bare ClusterRole at all (#158).
+    p = Provisioner(manifests_dir, "img:1", fake_applier)
+    p.provision(_req(), migration_id="deadbeef01")
+
+    bare_cluster_scoped = [
+        d for d in fake_applier.docs
+        if d.get("kind") in ("ClusterRole", "ClusterRoleBinding")
+        and d["metadata"]["name"] == "pgcyan-node-reader"
+    ]
+    assert bare_cluster_scoped == []
+
+
 def test_provision_follow_cdc_flag_sets_controller_env(manifests_dir, fake_applier):
     p = Provisioner(manifests_dir, "img:1", fake_applier, follow_cdc=True)
     p.provision(_req(), migration_id="c0ffee")

@@ -22,6 +22,7 @@ class K8sApplier:
         self._api_client = api_client
         self._core = client.CoreV1Api(api_client)
         self._apps = client.AppsV1Api(api_client)
+        self._rbac = client.RbacAuthorizationV1Api(api_client)
 
     def create_namespace(self, name: str, labels: Dict[str, str]) -> None:
         from kubernetes import client
@@ -70,3 +71,8 @@ class K8sApplier:
     def delete_namespace(self, namespace: str) -> None:
         """Delete a namespace (cascades to everything inside it)."""
         self._core.delete_namespace(namespace)
+
+    def delete_cluster_role_binding(self, name: str) -> None:
+        """Delete a ClusterRoleBinding (cluster-scoped -- not caught by any
+        namespace cascade, so callers must do this explicitly; see #158)."""
+        self._rbac.delete_cluster_role_binding(name)

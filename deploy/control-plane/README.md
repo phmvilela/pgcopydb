@@ -11,7 +11,7 @@ migration** (later tickets #87–#90).
 | File | What |
 |---|---|
 | `00-namespace.yaml` | the `pgcyan-system` namespace |
-| `01-rbac.yaml` | `pgcyan-control-plane` ServiceAccount + ClusterRole + ClusterRoleBinding (create/delete namespaces and the resources inside per-migration namespaces) |
+| `01-rbac.yaml` | `pgcyan-control-plane` ServiceAccount + ClusterRole + ClusterRoleBinding (create/delete namespaces and the resources inside per-migration namespaces); also bootstraps the shared `pgcyan-node-reader` ClusterRole (#158) the provisioner binds into each dynamic namespace so `cluster-capacity` can list nodes there |
 | `10-pvc-registry.yaml` | RWO managed-disk PVC for the SQLite registry, mounted at `/data` |
 | `20-deployment-api.yaml` | the FastAPI Deployment (single replica, `Recreate`, non-root) — `GET /health` |
 | `30-service-api.yaml` | ClusterIP Service (`:80` → container `:8000`) |
@@ -53,6 +53,11 @@ for r in serviceaccounts secrets configmaps persistentvolumeclaims services \
          rolebindings.rbac.authorization.k8s.io; do
   echo "$r: $(kubectl auth can-i create "$r" -n pgcyan-migration --as="$SA")"
 done
+
+# SA can bind (but only) the pre-existing pgcyan-node-reader ClusterRole (#158)
+kubectl auth can-i create clusterrolebindings --as="$SA"                          # yes
+kubectl auth can-i bind clusterroles/pgcyan-node-reader --as="$SA"                # yes
+kubectl auth can-i bind clusterroles/cluster-admin --as="$SA"                     # no
 
 # Registry PVC bound + persistent across a pod restart
 kubectl get pvc -n pgcyan-system pgcyan-control-plane-registry           # Bound
@@ -135,6 +140,9 @@ kubectl logs -n pgcyan-mig-$ID -l pgcyan.dev/component=controller --previous \
 kubectl get ns pgcyan-mig-$ID          # -> NotFound
 # 4. Registry shows it done; a fresh POST /migrations is accepted again:
 curl -fsS localhost:8080/migrations    # ... "state":"done" ...
+# 5. Its per-namespace node-reader ClusterRoleBinding is gone too (#158) --
+#    cluster-scoped, so namespace deletion alone would NOT have removed it:
+kubectl get clusterrolebinding pgcyan-node-reader-pgcyan-mig-$ID   # -> NotFound
 ```
 
 > **#81/#83 co-requisite:** the *no-SIGKILL* guarantee (criterion above) is

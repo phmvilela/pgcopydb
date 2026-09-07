@@ -231,7 +231,14 @@ sandboxes on demand — distinct from a single migration run. Two new trees:
   the API Deployment (single replica, `Recreate` — RWO volume) + Service. Same
   image-placeholder convention as `deploy/k8s`: `${PGCYAN_CONTROL_PLANE_IMAGE}`
   filled by `envsubst` at apply time. Applied **manually** for now; the deploy
-  workflow is #91.
+  workflow is #91. Also bootstraps the shared `pgcyan-node-reader` ClusterRole
+  (#158) — the provisioner stamps one uniquely-named `ClusterRoleBinding` per
+  dynamic namespace against it (never re-derived from `deploy/k8s/01-rbac.yaml`,
+  whose own copy of that Role/Binding stays scoped to the fixed integration-test
+  namespace's own direct apply — see `provisioner.py`'s module docstring), so
+  `cluster-capacity` (#146) works for control-plane-provisioned migrations too;
+  `teardown.py` removes the binding, since a namespace-delete cascade can't
+  reach cluster-scoped objects.
 
 ## Style
 
