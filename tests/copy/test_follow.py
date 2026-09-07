@@ -152,6 +152,54 @@ def test_build_follow_command_on_workdir_no_resume():
     assert "--resume" not in cmd
 
 
+def test_build_follow_command_with_resume():
+    cmd = PgCyanFollow(slot_name="pgcyan_slot", plugin="pgoutput",
+                       work_dir="/pgcopydb", resume=True).build_follow_command()
+    assert "--resume" in cmd
+
+
+def test_start_skips_drop_stale_origin_when_resuming(tmp_path, monkeypatch):
+    proc = _FakeProc(exit_after=None)
+    monkeypatch.setattr(follow_module.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(follow_module.psycopg2, "connect",
+                        lambda dsn: _SlotConn(_SlotCursor(active_after=1)))
+    _fake_run_ok(monkeypatch)   # clear_endpos + enable_apply both succeed
+
+    f = _make(tmp_path, resume=True, target_pguri="postgres://tgt/db")
+    called = {"dropped": False}
+    f.drop_stale_origin = lambda: called.__setitem__("dropped", True) or True
+    summary = f.start()
+
+    assert summary["status"] == "success"
+    assert called["dropped"] is False   # NOT dropped -- it's the resume's progress marker
+
+
+def test_start_calls_clear_endpos_when_resuming(tmp_path, monkeypatch):
+    proc = _FakeProc(exit_after=None)
+    monkeypatch.setattr(follow_module.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(follow_module.psycopg2, "connect",
+                        lambda dsn: _SlotConn(_SlotCursor(active_after=1)))
+    _fake_run_ok(monkeypatch)
+
+    f = _make(tmp_path, resume=True)
+    calls = []
+    f.clear_endpos = lambda: calls.append(1) or True
+    summary = f.start()
+
+    assert summary["status"] == "success"
+    assert calls == [1]
+
+
+def test_start_fails_fast_when_clear_endpos_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(follow_module.subprocess, "Popen",
+                        lambda *a, **k: pytest.fail("should not launch if endpos can't clear"))
+    f = _make(tmp_path, resume=True)
+    f.clear_endpos = lambda: False
+    summary = f.start()
+    assert summary["status"] == "failure"
+    assert (tmp_path / PgCyanFollow.LOG_ERROR_FILENAME).exists()
+
+
 def test_start_attaches_enables_apply_writes_log_and_ready(tmp_path, monkeypatch):
     proc = _FakeProc(exit_after=None)   # stays alive
     monkeypatch.setattr(follow_module.subprocess, "Popen", lambda *a, **k: proc)
@@ -192,6 +240,27 @@ def test_enable_apply_command_targets_workdir(tmp_path, monkeypatch):
     assert _make(tmp_path, work_dir="/pgcopydb").enable_apply() is True
     assert captured["cmd"][:5] == ["pgcopydb", "stream", "sentinel", "set", "apply"]
     assert "--dir" in captured["cmd"] and "/pgcopydb" in captured["cmd"]
+
+
+def test_clear_endpos_command_targets_workdir(tmp_path, monkeypatch):
+    captured = {}
+
+    def _run(cmd, **k):
+        captured["cmd"] = cmd
+        return _Completed(0)
+
+    monkeypatch.setattr(follow_module.subprocess, "run", _run)
+    assert _make(tmp_path, work_dir="/pgcopydb").clear_endpos() is True
+    assert captured["cmd"][:6] == ["pgcopydb", "stream", "sentinel", "set", "endpos", "0/0"]
+    assert "--dir" in captured["cmd"] and "/pgcopydb" in captured["cmd"]
+
+
+def test_clear_endpos_gives_up_after_retries(tmp_path, monkeypatch):
+    _fake_run_ok(monkeypatch, returncode=1)
+    monkeypatch.setattr(follow_module.time, "sleep", lambda *_: None)
+    f = _make(tmp_path)
+    assert f.clear_endpos() is False
+    assert f.errors
 
 
 def test_start_no_slot_fails(tmp_path, monkeypatch):

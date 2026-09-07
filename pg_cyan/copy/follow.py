@@ -118,6 +118,7 @@ class PgCyanFollow:
         poll_interval: int = DEFAULT_POLL_INTERVAL,
         stop_timeout: int = DEFAULT_STOP_TIMEOUT,
         verbose: bool = False,
+        resume: bool = False,
     ) -> None:
         """
         Args:
@@ -142,6 +143,9 @@ class PgCyanFollow:
                 fallback (see ``close``).
             verbose: Run ``pgcopydb follow --verbose`` (logs each applied change) --
                 an optional CDC debug knob; off by default.
+            resume: Continue a previously-stopped stream (#112) instead of a
+                first start after the copy -- see ``build_follow_command`` and
+                ``start()`` for what this changes.
         """
         self.source_pguri = source_pguri
         self.target_pguri = target_pguri
@@ -154,6 +158,7 @@ class PgCyanFollow:
         self.attach_timeout = attach_timeout
         self.poll_interval = poll_interval
         self.stop_timeout = stop_timeout
+        self.resume = resume
         self.verbose = verbose
 
         self.proc: Optional[subprocess.Popen] = None
@@ -177,9 +182,10 @@ class PgCyanFollow:
     # ------------------------------------------------------- command build
 
     def build_follow_command(self) -> List[str]:
-        """``pgcopydb follow`` on the controller's --dir: reuse the slot, create the sentinel.
+        """``pgcopydb follow`` on the controller's --dir: reuse the slot.
 
-        NOT ``--resume``. Two source facts drive this (verified in pgcopydb):
+        NOT ``--resume`` by default. Two source facts drive this (verified in
+        pgcopydb):
           * slot REUSE fires on the slot record already being in the --dir
             ``source.db`` catalog (which the controller's ``snapshot --follow``
             wrote) -- it is NOT gated on ``--resume`` (``snapshot.c`` reuse branch).
@@ -189,8 +195,13 @@ class PgCyanFollow:
             not create it, so ``follow --resume`` then reads 0 rows and aborts
             (rc=12). Running without ``--resume`` reuses the slot AND creates the
             sentinel (startpos = the slot's LSN = the copy's snapshot point), which
-            is exactly a first CDC start after the copy. (A future controller-restart
-            resume WOULD add ``--resume``, once refuse-to-resume is relaxed.)
+            is exactly a first CDC start after the copy.
+
+        WITH ``self.resume`` (#112): the sentinel already exists from that first
+        start (and ``clear_endpos()`` was called ahead of this to undo the
+        graceful stop's endpos, else ``follow`` would see it already reached and
+        exit immediately) -- ``--resume`` continues from it instead of trying
+        to recreate it.
         """
         cmd = [
             self.PGCOPYDB_BIN, "follow",
@@ -200,9 +211,51 @@ class PgCyanFollow:
             "--plugin", self.plugin,
             "--not-consistent",   # reuse the slot's snapshot; don't export a new one
         ]
+        if self.resume:
+            cmd.append("--resume")
         if self.verbose:
             cmd.append("--verbose")   # log each applied change (CDC volume is low)
         return cmd
+
+    def clear_endpos(self) -> bool:
+        """
+        Clear the sentinel endpos ahead of a resume (#112).
+
+        A graceful ``close()`` leaves the sentinel endpos set to the LSN it
+        stopped at; on the next ``follow``, that persisted endpos would already
+        be <= replay_lsn, and pgcopydb exits immediately ("previously reached")
+        instead of streaming the tail. ``pgcopydb stream sentinel set endpos
+        0/0`` clears it, direct-mode against this SAME ``--dir`` ``source.db``
+        (like ``enable_apply``/``request_stop``), before ``start()`` launches
+        ``follow --resume``.
+
+        Retries a few times (same brief-SQLite-contention shape as
+        ``enable_apply``), then gives up -- a resume cannot proceed without this,
+        so a persistent failure is a resume-start failure.
+        """
+        cmd = [self.PGCOPYDB_BIN, "stream", "sentinel", "set", "endpos",
+               "0/0", "--dir", self.work_dir]
+        for attempt in range(3):
+            try:
+                result = subprocess.run(  # noqa: S603 -- fixed argv, no shell
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                self._log_event("clear_endpos", "warning",
+                                f"stream sentinel set endpos 0/0 failed to run (attempt {attempt + 1}/3)",
+                                {"error": str(e)})
+                time.sleep(2)
+                continue
+            if result.returncode == 0:
+                self._log_event("clear_endpos", "success",
+                                "Cleared the sentinel endpos ahead of resume", {})
+                return True
+            self._log_event("clear_endpos", "warning",
+                            f"stream sentinel set endpos 0/0 rc={result.returncode} (attempt {attempt + 1}/3)",
+                            {"output_tail": (result.stdout or "")[-500:]})
+            time.sleep(2)
+        self.errors.append("Could not clear the sentinel endpos; resume would see it already reached")
+        return False
 
     # ------------------------------------------------ stale target origin
 
@@ -452,9 +505,23 @@ class PgCyanFollow:
                 self.LOG_ERROR_FILENAME, self._build_error("Missing source URI"))
             return summary
 
-        # follow recreates the target replication origin non-idempotently; drop a
-        # leftover from a prior/cancelled run so it can create a fresh one.
-        self.drop_stale_origin()
+        if self.resume:
+            # Undo the graceful stop's persisted endpos so `follow --resume`
+            # streams the tail instead of seeing it "already reached" and
+            # exiting immediately. A resume cannot proceed without this.
+            if not self.clear_endpos():
+                self._log_event("start", "failure",
+                                "Could not clear the sentinel endpos; cannot resume", {})
+                summary["log_error_file"] = self._write_json(
+                    self.LOG_ERROR_FILENAME, self._build_error("Could not clear the sentinel endpos"))
+                return summary
+        else:
+            # follow recreates the target replication origin non-idempotently;
+            # drop a leftover from a prior/cancelled run so it can create a fresh
+            # one. NOT done when resuming -- that origin IS the progress marker
+            # this resume continues from, dropping it would lose the apply
+            # position (#112).
+            self.drop_stale_origin()
 
         try:
             os.makedirs(self.work_dir, exist_ok=True)

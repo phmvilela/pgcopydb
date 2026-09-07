@@ -834,12 +834,16 @@ def foreign_keys(source_pguri: str, target_pguri: str, output_dir: str) -> None:
               default=lambda: os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes"),
               show_default="$PGCYAN_FOLLOW_CDC (unset = off)",
               help="After a full walk, become the CDC consumer (`pgcopydb follow`).")
+@click.option("--resume-cdc/--no-resume-cdc",
+              default=lambda: os.getenv("PGCYAN_RESUME_CDC", "").strip().lower() in ("1", "true", "yes"),
+              show_default="$PGCYAN_RESUME_CDC (unset = off)",
+              help="Resume a gracefully-stopped CDC stream (`follow --resume`, no snapshot/walk) instead of a fresh run.")
 @click.option("--wait-for-start/--no-wait-for-start",
               default=lambda: os.getenv("PGCYAN_WAIT_FOR_START", "").strip().lower() in ("1", "true", "yes"),
               show_default="$PGCYAN_WAIT_FOR_START (unset = off)",
               help="Park pre-snapshot and serve a control API; take the snapshot and walk only on POST /start")
 def run_migration(namespace: str, in_cluster: bool, stop_after: str,
-                  follow_cdc: bool, wait_for_start: bool) -> None:
+                  follow_cdc: bool, resume_cdc: bool, wait_for_start: bool) -> None:
     """Hold the snapshot in-pod and walk the whole migration DAG.
 
     The folded controller: it establishes and HOLDS the consistent snapshot in
@@ -853,12 +857,18 @@ def run_migration(namespace: str, in_cluster: bool, stop_after: str,
     With ``--wait-for-start`` it does NOT snapshot on launch: it serves
     a small control API (`GET /status`, `POST /start`) and parks pre-snapshot,
     establishing the snapshot + walking only when `POST /start` arrives.
+
+    With ``--resume-cdc`` it skips the snapshot/DAG walk entirely and resumes a
+    previously gracefully-stopped CDC stream instead (#112) -- requires the
+    prior run's state ConfigMap to show it already released its snapshot and
+    didn't fail; a separate, explicit path that does not weaken the default
+    refuse-to-resume guard for a fresh (pre/mid-copy) restart.
     """
     from pg_cyan.copy.snapshot import _holder_from_env
     holder = _holder_from_env()
     controller = PgCyanController(holder=holder, namespace=namespace,
                                   in_cluster=in_cluster, stop_after=stop_after or None,
-                                  follow_cdc=follow_cdc,
+                                  follow_cdc=follow_cdc, resume_cdc=resume_cdc,
                                   api_port=int(os.getenv("PGCYAN_API_PORT",
                                                          str(PgCyanController.DEFAULT_API_PORT))))
     try:

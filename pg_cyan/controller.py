@@ -106,6 +106,7 @@ class PgCyanController:
         ready_file: str = DEFAULT_READY_FILE,
         stop_after: Optional[str] = None,
         follow_cdc: bool = False,
+        resume_cdc: bool = False,
         api_port: int = DEFAULT_API_PORT,
         core_api=None,
         orchestrator_factory: Optional[Callable[..., PgCyanOrchestrator]] = None,
@@ -126,6 +127,12 @@ class PgCyanController:
                 release the snapshot then stream ``pgcopydb follow`` on this pod's
                 own ``--dir`` (Option A). ``False`` -> park after the
                 walk (no CDC). Skipped when ``stop_after`` halts before post-data.
+            resume_cdc: Resume a previously-stopped CDC stream instead of a fresh
+                run (#112) -- CDC-only, no snapshot/DAG walk. See
+                ``_run_resume_cdc``. An explicit operator opt-in (a fresh pod
+                does NOT infer this from the state ConfigMap alone), separate
+                from -- and NOT weakening -- the refuse-to-resume guard the
+                default path still applies.
             core_api: Injectable CoreV1Api (own pod + state ConfigMap); built if omitted.
             orchestrator_factory: Injectable builder ``(**kwargs) -> orchestrator``
                 for tests; defaults to constructing a real ``PgCyanOrchestrator``.
@@ -139,6 +146,7 @@ class PgCyanController:
         self.ready_file = ready_file
         self.stop_after = stop_after
         self.follow_cdc = follow_cdc
+        self.resume_cdc = resume_cdc
         self.api_port = api_port
         self.follow_factory = follow_factory or self._default_follow
         self.cdc: Optional[PgCyanFollow] = None       # the streaming CDC child, once started
@@ -308,6 +316,12 @@ class PgCyanController:
                         "Closing the held snapshot ahead of CDC", {})
         self.holder.close()
         self._released = True
+        # Persist: from this point on, a fresh pod losing the in-pod snapshot is
+        # irrelevant to THIS run -- it's resumable via CDC alone (#112). Status
+        # itself is unchanged (still "running"); this just adds the durable bit
+        # a resuming pod's claim_run()-refusal check needs to distinguish a
+        # pre/mid-copy restart (still refuse) from a post-copy CDC restart.
+        self._update_run_status("running", released=True)
 
     # ----------------------------------------------------------- run-state
 
@@ -344,12 +358,20 @@ class PgCyanController:
             )
             return True
 
-    def _update_run_status(self, status: str, snapshot: Optional[str] = None) -> None:
-        """Best-effort patch of the state ConfigMap's status (never raises)."""
+    def _update_run_status(self, status: str, snapshot: Optional[str] = None,
+                            released: Optional[bool] = None) -> None:
+        """Best-effort patch of the state ConfigMap's status (never raises).
+
+        A patch only ever ADDS/overwrites the keys given here -- the API server
+        merges into the ConfigMap's existing ``data`` map, so omitting
+        ``snapshot``/``released`` leaves whatever was previously recorded intact.
+        """
         data = {self.STATE_KEY: status,
                 "updated_at": datetime.utcnow().isoformat() + "Z"}
         if snapshot:
             data["snapshot"] = snapshot
+        if released is not None:
+            data["released"] = "true" if released else "false"
         try:
             self.core_api.patch_namespaced_config_map(
                 name=self.STATE_CONFIGMAP, namespace=self.namespace,
@@ -360,14 +382,18 @@ class PgCyanController:
                             f"Could not update run-state to {status!r}",
                             {"error": e.reason or str(e)})
 
-    def _read_run_status(self) -> Optional[str]:
-        """Return the existing run-state status, or ``None`` if unreadable."""
+    def _read_run_state(self) -> Dict:
+        """Return the run-state ConfigMap's full ``data`` dict, or {} if unreadable."""
         try:
             cm = self.core_api.read_namespaced_config_map(
                 name=self.STATE_CONFIGMAP, namespace=self.namespace)
-            return (cm.data or {}).get(self.STATE_KEY)
+            return cm.data or {}
         except ApiException:
-            return None
+            return {}
+
+    def _read_run_status(self) -> Optional[str]:
+        """Return the existing run-state status, or ``None`` if unreadable."""
+        return self._read_run_state().get(self.STATE_KEY)
 
     # ------------------------------------------------------------ readiness
 
@@ -575,6 +601,65 @@ class PgCyanController:
             except Exception:  # noqa: BLE001 - best-effort
                 pass
 
+    # ---------------------------------------------------------- resume-cdc
+
+    def _run_resume_cdc(self, summary: Dict) -> Dict:
+        """
+        Resume a previously-stopped CDC stream (#112) -- CDC-only: no snapshot
+        is established and the DAG is never walked, since a post-copy CDC
+        restart has nothing left to re-copy. Never raises.
+
+        Requires the prior run's state ConfigMap to show ``released == "true"``
+        (the snapshot-dependent part is over -- see ``_release_snapshot``) and a
+        non-terminal-failure status; refuses otherwise. This is a DIFFERENT
+        check from -- and does not touch -- ``claim_run()``'s refuse-to-resume
+        guard, which still applies unconditionally on the default (non-resume)
+        path: a pre/mid-copy restart is still refused exactly as before.
+        """
+        state = self._read_run_state()
+        prior_status = state.get(self.STATE_KEY)
+        if not state or state.get("released") != "true" or prior_status in ("failed", "halted"):
+            self.errors.append(
+                f"Cannot resume CDC: prior run state={prior_status!r} "
+                f"released={state.get('released')!r} in {self.STATE_CONFIGMAP} is "
+                "not a resumable post-copy CDC run (need released=\"true\" and a "
+                "non-failed status)."
+            )
+            self._log_event("resume_cdc", "failure",
+                            "Prior run is not in a resumable CDC state; refusing",
+                            {"state_configmap": self.STATE_CONFIGMAP, "prior_state": state})
+            summary["status"] = "halted"
+            self.state = "halted"
+            self._set_ready(False)
+            return summary
+
+        snapshot_id = state.get("snapshot")
+        summary["snapshot"] = snapshot_id
+        self._released = True   # released by a prior process; nothing held here
+
+        self.cdc = self.follow_factory(slot_name=self.holder.slot_name,
+                                       plugin=self.holder.plugin, resume=True)
+        cdc = self.cdc.start()
+        if cdc.get("status") == "success":
+            summary["status"] = "success"
+            summary["ready"] = True
+            summary["cdc"] = "streaming"
+            self.state = "succeeded"
+            self._update_run_status("succeeded", snapshot=snapshot_id, released=True)
+            self._set_ready(True)
+            self._log_event("resume_cdc", "success",
+                            "CDC resumed; controller is the consumer",
+                            {"slot": self.holder.slot_name})
+        else:
+            summary["status"] = "failure"
+            summary["cdc"] = "failed"
+            summary["errors"].extend(cdc.get("errors", []))
+            self.state = "failed"
+            self._update_run_status("failed", snapshot=snapshot_id, released=True)
+            self._set_ready(False)
+            self._log_event("resume_cdc", "failure", "CDC failed to resume", {})
+        return summary
+
     # --------------------------------------------------------------- run
 
     def run(self) -> Dict:
@@ -601,6 +686,12 @@ class PgCyanController:
         # SIGTERM/SIGINT -> tear the child down and stop. Raising KeyboardInterrupt
         # routes both the walk and the park() below through clean shutdown.
         self._install_signal_handlers()
+
+        # RESUME-CDC (#112): an explicit, separate entry path -- routes around
+        # claim_run() entirely rather than weakening it, so the default
+        # refuse-to-resume guard below is completely unaffected.
+        if self.resume_cdc:
+            return self._run_resume_cdc(summary)
 
         # REFUSE-TO-RESUME: a pre-existing run-state marker means a prior pod
         # already began this run; its in-pod snapshot is gone and we must not
@@ -710,6 +801,7 @@ def run_migration_from_env() -> int:
         ready_file=os.getenv("PGCYAN_READY_FILE", PgCyanController.DEFAULT_READY_FILE),
         stop_after=os.getenv("PGCYAN_STOP_AFTER") or None,
         follow_cdc=os.getenv("PGCYAN_FOLLOW_CDC", "").strip().lower() in ("1", "true", "yes"),
+        resume_cdc=os.getenv("PGCYAN_RESUME_CDC", "").strip().lower() in ("1", "true", "yes"),
         api_port=int(os.getenv("PGCYAN_API_PORT", str(PgCyanController.DEFAULT_API_PORT))),
     )
     if os.getenv("PGCYAN_WAIT_FOR_START", "").strip().lower() in ("1", "true", "yes"):

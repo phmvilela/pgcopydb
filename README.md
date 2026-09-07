@@ -377,6 +377,24 @@ See `deploy/k8s/` (the manifests are the nodes) and
 `notes/k8s-sharded-migration-topology.md` (the engine one-pager) for the full
 picture, and the `run-integration-test` skill to exercise it on a cluster.
 
+#### Resuming a paused CDC stream (#112)
+
+A CDC stream stopped gracefully (the controller's `close()` sets the sentinel
+endpos and waits for `follow` to drain to it and exit `0`) leaves a resumable
+point: the slot retained, the `--dir` catalog and target replication origin
+intact on the controller's persistent volume. `PGCYAN_RESUME_CDC=true` picks
+that back up — CDC-only, no snapshot or DAG walk:
+
+```bash
+# On a controller pod whose PREVIOUS run already released its snapshot and
+# streamed CDC (state ConfigMap shows released="true", not failed/halted):
+PGCYAN_RESUME_CDC=true python -m pg_cyan.cli run-migration
+```
+
+This is a separate, explicit entry path from a fresh run — it does not weaken
+the default refuse-to-resume guard, which still refuses a pre/mid-copy restart
+exactly as before (the in-pod snapshot really is unrecoverable there).
+
 ### The migration DAG
 
 The pre-migration collectors feed the planner, and the controller walks the
@@ -464,6 +482,7 @@ stage's `--help` and module docstring.
 | `PGCYAN_PUBLICATION` / `PGCYAN_SLOT` | `pgcyan_pub` / `pgcyan_slot` | publication + replication-slot names |
 | `PGCYAN_PLUGIN` / `PGCYAN_ORIGIN` | `pgoutput` / `pgcyan` | CDC: logical decoding plugin + replication origin node name |
 | `PGCYAN_FOLLOW_CDC` | *(unset)* | `run-migration`: after the walk, become the CDC consumer (`pgcopydb follow` in-controller — #26); `true` to enable |
+| `PGCYAN_RESUME_CDC` | *(unset)* | `run-migration`: resume a gracefully-stopped CDC stream (`follow --resume`, no snapshot/walk — #112) instead of a fresh run; `true` to enable |
 | `PGCYAN_RUN_ID`              | *(clock)*   | `plan`: opaque run identifier    |
 | `PGCOPYDB_SOURCE_PGURI` / `PGCOPYDB_TARGET_PGURI` | *(unset)* | pgcopydb-native source/target libpq URIs (else `PG_SOURCE_*`) |
 | `SNAPSHOT_ID`               | *(unset)*   | `schema` / `copy`: consistent snapshot to pin to (**injected by the controller** — #70) |

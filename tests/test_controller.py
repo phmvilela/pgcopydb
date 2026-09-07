@@ -119,7 +119,7 @@ class _FakeFollow:
 
 
 def _make_controller(holder=None, core=None, orch_result=None, capture=None,
-                     ready_file=None, follow_cdc=False, api_port=0):
+                     ready_file=None, follow_cdc=False, resume_cdc=False, api_port=0):
     holder = holder or _FakeHolder()
 
     def factory(**kwargs):
@@ -137,7 +137,8 @@ def _make_controller(holder=None, core=None, orch_result=None, capture=None,
     return PgCyanController(
         holder=holder, namespace="pgcyan-migration", pod_name="pgcyan-controller-0",
         core_api=core or _FakeCore(), orchestrator_factory=factory,
-        follow_factory=follow_factory, follow_cdc=follow_cdc, api_port=api_port,
+        follow_factory=follow_factory, follow_cdc=follow_cdc, resume_cdc=resume_cdc,
+        api_port=api_port,
         ready_file=ready_file or "/tmp/pgcyan-test-ready-unused",
     )
 
@@ -309,6 +310,91 @@ def test_release_snapshot_closes_holder_and_marks_healthy():
     holder.closed = False
     ctl._release_snapshot()
     assert holder.closed is False
+
+
+def test_release_snapshot_persists_the_released_flag():
+    # #112: the durable bit a future pod's resume-CDC check needs -- persisted
+    # the moment the snapshot stops being load-bearing, independent of whatever
+    # status the run is later marked with.
+    core = _FakeCore()
+    ctl = _make_controller(core=core)
+    ctl._release_snapshot()
+    assert core.state["released"] == "true"
+
+
+# ---------------------------------------------------------- resume-cdc (#112)
+
+def _resumable_core(status="succeeded", released="true", snapshot="SNAP-1"):
+    core = _FakeCore(state_exists=True, state_status=status)
+    if released is not None:
+        core.state["released"] = released
+    if snapshot is not None:
+        core.state["snapshot"] = snapshot
+    return core
+
+
+def test_resume_cdc_streams_without_snapshot_or_walk():
+    holder = _FakeHolder()
+    capture = {}
+    core = _resumable_core()
+    ctl = _make_controller(holder=holder, core=core, capture=capture, resume_cdc=True)
+    summary = ctl.run()
+
+    assert summary["status"] == "success"
+    assert summary["ready"] is True
+    assert summary["cdc"] == "streaming"
+    assert summary["snapshot"] == "SNAP-1"
+    assert holder.established is False           # no snapshot established
+    assert "orch" not in capture                 # the DAG was never walked
+    assert capture["cdc"].kwargs["resume"] is True
+    assert capture["cdc"].kwargs["slot_name"] == "pgcyan_slot"
+    assert core.state["status"] == "succeeded"
+
+
+def test_resume_cdc_refuses_without_prior_state():
+    ctl = _make_controller(core=_FakeCore(state_exists=False), resume_cdc=True)
+    summary = ctl.run()
+    assert summary["status"] == "halted"
+    assert ctl.cdc is None
+    assert any("Cannot resume" in e for e in summary["errors"])
+
+
+def test_resume_cdc_refuses_when_snapshot_was_never_released():
+    core = _resumable_core(released=None)   # never got past the snapshot-dependent part
+    ctl = _make_controller(core=core, resume_cdc=True)
+    summary = ctl.run()
+    assert summary["status"] == "halted"
+    assert ctl.cdc is None
+
+
+def test_resume_cdc_refuses_on_prior_failed_status():
+    core = _resumable_core(status="failed")
+    ctl = _make_controller(core=core, resume_cdc=True)
+    summary = ctl.run()
+    assert summary["status"] == "halted"
+    assert ctl.cdc is None
+
+
+def test_resume_cdc_failure_marks_not_ready():
+    holder = _FakeHolder()
+    holder.slot_name = "bad-slot"   # _FakeFollow.start() fails for this slot
+    core = _resumable_core()
+    ctl = _make_controller(holder=holder, core=core, resume_cdc=True)
+    summary = ctl.run()
+    assert summary["status"] == "failure"
+    assert summary["ready"] is False
+    assert core.state["status"] == "failed"
+
+
+def test_resume_cdc_does_not_call_claim_run():
+    # claim_run()'s refuse-to-resume guard is untouched for the default path --
+    # the resume path routes around it entirely rather than weakening it.
+    core = _resumable_core()
+    calls = []
+    core.create_namespaced_config_map = lambda *a, **k: calls.append(1)
+    ctl = _make_controller(core=core, resume_cdc=True)
+    ctl.run()
+    assert calls == []
 
 
 def test_resolve_owner_reference_shape():
