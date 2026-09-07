@@ -615,7 +615,8 @@ static char *outputDBcreateDDLs[] = {
 	"  id integer primary key, "
 	"  action text, xid integer, lsn integer, timestamp text, "
 	"  message text, "
-	"  nspname text, relname text, old_type text)",
+	/* cascade: TRUNCATE only (pgoutput wire flags bit 0x01); see issue #79 */
+	"  nspname text, relname text, old_type text, cascade integer)",
 
 	"create unique index o_a_lsn on output(action, lsn)",
 	"create index o_a_xid on output(action, xid)",
@@ -648,6 +649,15 @@ static char *replayDBcreateDDLs[] = {
 	"  id integer primary key, "
 	"  action text, xid integer, lsn integer, endlsn integer, timestamp text, "
 	"  nspname text, relname text, "
+	/*
+	 * cascade: TRUNCATE only (issue #79). Row-level, like nspname/relname
+	 * above, NOT on the deduped stmt(hash, sql) table -- the stored SQL text
+	 * ("TRUNCATE ONLY ...") is unchanged by this flag (see ld_apply.c, which
+	 * applies CASCADE only at final-SQL-build time, after its regclass
+	 * lookup), so two occurrences of the same statement can still carry
+	 * different cascade values.
+	 */
+	"  cascade integer, "
 	"  stmt_hash text references stmt(hash), stmt_args jsonb)",
 
 	"create index r_xid on replay(xid)",

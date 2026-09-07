@@ -1673,8 +1673,8 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
 	/* --- INSERT into output --- */
 	char *output_sql =
 		"insert or replace into output"
-		"  (action, xid, lsn, timestamp, message, nspname, relname, old_type)"
-		"  values($1, $2, $3, $4, NULL, $5, $6, $7)";
+		"  (action, xid, lsn, timestamp, message, nspname, relname, old_type, cascade)"
+		"  values($1, $2, $3, $4, NULL, $5, $6, $7, $8)";
 
 	SQLiteQuery oq = { 0 };
 	if (!catalog_sql_prepare(db, output_sql, &oq))
@@ -1699,7 +1699,9 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
 		{
 			pgmsg->oldType != 0 ? BIND_PARAMETER_TYPE_TEXT : BIND_PARAMETER_TYPE_NULL,
 			"old_type", 0, pgmsg->oldType != 0 ? old_type_str : NULL
-		}
+		},
+		/* cascade: TRUNCATE only (issue #79); 0 for every other action */
+		{ BIND_PARAMETER_TYPE_INT, "cascade", pgmsg->cascade ? 1 : 0, NULL }
 	};
 
 	if (!catalog_sql_bind(&oq, oparams, lengthof(oparams)))
@@ -2009,8 +2011,8 @@ ld_store_insert_replay_stmt(DatabaseCatalog *catalog,
 
 	char *sql =
 		"insert into replay"
-		"(action, xid, lsn, endlsn, timestamp, nspname, relname, stmt_hash, stmt_args)"
-		"values($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+		"(action, xid, lsn, endlsn, timestamp, nspname, relname, cascade, stmt_hash, stmt_args)"
+		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
 
 	SQLiteQuery query = { 0 };
 
@@ -2081,6 +2083,8 @@ ld_store_insert_replay_stmt(DatabaseCatalog *catalog,
 		{ timeParamType, "timestamp", 0, timestr },
 		{ nspnameParamType, "nspname", 0, replayStmt->nspname },
 		{ relnameParamType, "relname", 0, replayStmt->relname },
+		/* cascade: TRUNCATE rows only (issue #79); 0 for every other action */
+		{ BIND_PARAMETER_TYPE_INT, "cascade", replayStmt->cascade ? 1 : 0, NULL },
 		{ hashParamType, "stmt_hash", 0, hash },
 		{ dataParamType, "stmt_args", 0, replayStmt->data },
 	};
@@ -2765,6 +2769,10 @@ ld_store_replay_fetch(SQLiteQuery *query)
 				sizeof(s->relname));
 	}
 
+	/* r.cascade — TRUNCATE rows only; see issue #79 */
+	s->cascade = sqlite3_column_type(query->ppStmt, 11) != SQLITE_NULL &&
+				sqlite3_column_int(query->ppStmt, 11) != 0;
+
 	log_debug("ld_store_replay_fetch: %lld %c xid=%u lsn=%X/%X endlsn=%X/%X",
 			  (long long) s->id, s->action, s->xid,
 			  LSN_FORMAT_ARGS(s->lsn), LSN_FORMAT_ARGS(s->endlsn));
@@ -2821,7 +2829,7 @@ ld_store_iter_replay_init(ReplayDBReplayIterator *iter)
 	 */
 	char *sql =
 		"   select r.id, r.action, r.xid, r.lsn, r.endlsn, r.timestamp, "
-		"          s.sql, r.stmt_args, r.stmt_hash, r.nspname, r.relname "
+		"          s.sql, r.stmt_args, r.stmt_hash, r.nspname, r.relname, r.cascade "
 		"     from replay r "
 		"left join stmt s on r.stmt_hash = s.hash "
 		"    where r.lsn >= $1 or r.lsn is null "
@@ -3084,7 +3092,7 @@ ld_store_iter_replay_txn_init(ReplayDBReplayTxnIterator *iter)
 
 	char *sql =
 		"   select r.id, r.action, r.xid, r.lsn, r.endlsn, r.timestamp, "
-		"          s.sql, r.stmt_args, r.stmt_hash, r.nspname, r.relname "
+		"          s.sql, r.stmt_args, r.stmt_hash, r.nspname, r.relname, r.cascade "
 		"     from replay r "
 		"left join stmt s on r.stmt_hash = s.hash "
 		"    where r.xid = $1 and r.id >= $2 "

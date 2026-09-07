@@ -2540,12 +2540,26 @@ stream_write_delete(ReplayDBStmt *replayStmt, LogicalMessageDelete *delete)
  * the partitioned-target case via a single regclass lookup. If this is ever
  * changed to emit multi-relation TRUNCATE statements, update the apply path
  * accordingly.
+ *
+ * The source TRUNCATE's CASCADE flag (issue #79) is carried on
+ * replayStmt->cascade, a row-level column separate from the stored statement
+ * text -- NOT appended here -- so it survives independently of this
+ * singular-relation limitation; see the comment at the assignment below.
  */
 static bool
 stream_write_truncate(ReplayDBStmt *replayStmt, LogicalMessageTruncate *truncate)
 {
 	strlcpy(replayStmt->nspname, truncate->table.nspname, sizeof(replayStmt->nspname));
 	strlcpy(replayStmt->relname, truncate->table.relname, sizeof(replayStmt->relname));
+
+	/*
+	 * Carried separately from the stored statement text below (issue #79):
+	 * the apply path (ld_apply.c) needs the bare "TRUNCATE ONLY ns.rel" text
+	 * for its regclass lookup (partitioned-target detection), so CASCADE is
+	 * NOT baked into replayStmt->stmt here -- it's applied at final-SQL-build
+	 * time in ld_apply.c, after that lookup, using this row-level flag.
+	 */
+	replayStmt->cascade = truncate->cascade;
 
 	PQExpBuffer buf = createPQExpBuffer();
 

@@ -90,6 +90,8 @@ typedef struct PgoutputMessage
 
 	int ncols_new;
 	PgoutputColumn *new_cols;       /* malloc'd array; NULL for DELETE */
+
+	bool cascade;                   /* 'T' only: wire flags bit 0x1 (CASCADE) */
 } PgoutputMessage;
 
 

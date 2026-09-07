@@ -748,7 +748,21 @@ preparePgoutputMessage(LogicalStreamContext *context)
 		case 'T':
 		{
 			uint32_t nrelids = pgout_u32(buf, &pos, bufLen);
-			pgout_u8(buf, &pos, bufLen);    /* flags (cascade, restart_seqs) */
+
+			/*
+			 * flags: bit 0x01 = CASCADE, bit 0x02 = RESTART IDENTITY (Postgres
+			 * logical replication protocol, TRUNCATE message). Previously read
+			 * and discarded here, so a source TRUNCATE of an FK-referenced
+			 * table always replayed as a bare "TRUNCATE ONLY" and got rejected
+			 * by the target -- crashing the whole apply subprocess (issue #79).
+			 * Threaded through msg->cascade -> LogicalMessageTruncate.cascade
+			 * (ld_transform.c) -> ReplayDBStmt.cascade (persisted in
+			 * replay.db) -> applied at final-SQL-build time in ld_apply.c,
+			 * AFTER its regclass lookup (which needs the bare qualified name,
+			 * not a string with " CASCADE" appended).
+			 */
+			uint8_t flags = pgout_u8(buf, &pos, bufLen);
+			msg->cascade = (flags & 0x01) != 0;
 
 			for (uint32_t i = 0; i < nrelids; i++)
 			{
@@ -1090,7 +1104,7 @@ parsePgoutputMessage(StreamContext *privateContext,
 	 * For now, read them from the output row directly.
 	 */
 	const char *nspsql =
-		"select nspname, relname, old_type from output where id = $1";
+		"select nspname, relname, old_type, cascade from output where id = $1";
 
 	SQLiteQuery nsq = { 0 };
 	nsq.errorOnZeroRows = true;
@@ -1098,6 +1112,7 @@ parsePgoutputMessage(StreamContext *privateContext,
 	char nspname[PG_NAMEDATALEN] = { 0 };
 	char relname[PG_NAMEDATALEN] = { 0 };
 	char old_type = 0;
+	bool cascade = false;   /* STREAM_ACTION_TRUNCATE only; see issue #79 */
 
 	if (catalog_sql_prepare(db, nspsql, &nsq))
 	{
@@ -1124,6 +1139,7 @@ parsePgoutputMessage(StreamContext *privateContext,
 				{
 					old_type = ot[0];
 				}
+				cascade = sqlite3_column_int(nsq.ppStmt, 3) != 0;
 			}
 		}
 		(void) catalog_sql_finalize(&nsq);
@@ -1209,6 +1225,7 @@ parsePgoutputMessage(StreamContext *privateContext,
 		{
 			stmt->stmt.truncate.table.nspname = quote_and_dup(nspname);
 			stmt->stmt.truncate.table.relname = quote_and_dup(relname);
+			stmt->stmt.truncate.cascade = cascade;
 			break;
 		}
 

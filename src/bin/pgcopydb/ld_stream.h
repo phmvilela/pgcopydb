@@ -169,6 +169,7 @@ typedef struct LogicalMessageDelete
 typedef struct LogicalMessageTruncate
 {
 	LogicalMessageRelation table;
+	bool cascade;   /* pgoutput TRUNCATE flags bit 0x01; see ld_pgoutput.c case 'T' */
 } LogicalMessageTruncate;
 
 typedef struct LogicalMessageSwitchWAL

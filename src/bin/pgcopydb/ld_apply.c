@@ -1057,6 +1057,21 @@ stream_apply_dml(StreamApplyContext *context, ReplayDBStmt *s)
 			}
 		}
 
+		/*
+		 * Apply the source TRUNCATE's CASCADE flag now, AFTER the relkind
+		 * lookup above (which needs the bare qualified name for its regclass
+		 * cast) -- see issue #79. Without CASCADE, a source TRUNCATE of a
+		 * table referenced by a foreign key is rejected by the target and
+		 * crashes the whole apply subprocess.
+		 */
+		char withCascade[BUFSIZE] = { 0 };
+
+		if (s->cascade)
+		{
+			sformat(withCascade, sizeof(withCascade), "%s CASCADE", execSQL);
+			execSQL = withCascade;
+		}
+
 		if (!pgsql_execute(applyPgConn, execSQL))
 		{
 			/* errors have already been logged */
@@ -2192,6 +2207,19 @@ stream_apply_sql(StreamApplyContext *context,
 				char *ptr = (char *) sql + len - 1;
 				*ptr = '\0';
 			}
+
+			/*
+			 * NOTE (issue #79): this handler applies pre-rendered SQL TEXT
+			 * (from stream_replay_line / a .sql file -- test_decoding /
+			 * wal2json plugins), not a decoded pgoutput message, so there is
+			 * no wire-protocol CASCADE flag available here to apply -- the
+			 * CASCADE fix for a source TRUNCATE of an FK-referenced table
+			 * only covers the pgoutput/replay.db path (stream_apply_dml
+			 * above, ReplayDBStmt.cascade), which is what pgcyan's `follow`
+			 * actually uses. Fixing this path would need its own mechanism
+			 * (the .sql-file-writing plugin would need to emit CASCADE
+			 * itself) and is out of scope here.
+			 */
 
 			/*
 			 * Postgres rejects TRUNCATE ONLY on partitioned tables. Mirror

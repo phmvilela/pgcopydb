@@ -51,6 +51,8 @@ typedef struct ReplayDBStmt
 	char nspname[PG_NAMEDATALEN];
 	char relname[PG_NAMEDATALEN];
 
+	bool cascade;                /* TRUNCATE rows only; see issue #79 */
+
 	uint32_t hash;
 	char *stmt;                 /* malloc'ed area */
 	char *data;                 /* malloc'ed area */
