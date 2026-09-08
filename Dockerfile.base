@@ -15,13 +15,19 @@
 
 # --- pgcopydb: compiled from the phmvilela/pgcopydb fork (multi-stage) -------
 # Built from source rather than apt-installing PGDG because the migration needs
-# a fork patch to the SQLite CDC apply path: flush the libpq pipeline when the
-# replay queue drains, so a trailing CDC change lands on the target (stock 0.18
-# does not). Pin PGCOPYDB_GIT_REF to the fork commit for a reproducible image.
+# fork patches to the SQLite CDC path, on top of stock 0.18:
+#   * flush the libpq pipeline when the replay queue drains, so a trailing CDC
+#     change lands on the target (stock 0.18 does not).
+#   * don't prematurely commit copy table-data's reused snapshot connection
+#     ("BUG: call to pgsql_commit() without holding an open multi statement
+#     connection" on `--resume` -- issue #98).
+#   * replay CASCADE on a pgoutput TRUNCATE of an FK-referenced table, instead
+#     of crashing the whole apply subprocess (issue #79).
+# Pin PGCOPYDB_GIT_REF to the fork commit for a reproducible image.
 #   PGVERSION -- the postgresql-server-dev / libpq major the binary links.
 ARG PGVERSION=16
 ARG PGCOPYDB_GIT_URL=https://github.com/phmvilela/pgcopydb.git
-ARG PGCOPYDB_GIT_REF=428a7f5137660da078ff7da5ee4ae00d2f75ba72
+ARG PGCOPYDB_GIT_REF=af252b0b9708f464ed8e45fdc9bfa8c3aeaad60e
 
 FROM debian:12-slim AS pgcopydb-build
 ARG PGVERSION
