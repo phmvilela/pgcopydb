@@ -28,10 +28,13 @@ COPY --chown=app:app control-plane/api/app ./app
 # The migration manifests the provisioner applies verbatim (issue #87).
 COPY --chown=app:app deploy/k8s ./deploy/k8s
 # The shared, dependency-free capacity-input contract (issue #141). Vendored as
-# the two leaf files rather than installing the heavy migration package, so
-# `from pg_cyan import capacity_contract` resolves at runtime and the API
-# validates request bodies by the exact rules the planner reads (no drift).
-COPY --chown=app:app pg_cyan/__init__.py pg_cyan/capacity_contract.py ./pg_cyan/
+# the leaf files rather than installing the heavy migration package, so
+# `from pg_cyan.collect import capacity_contract` resolves at runtime and the
+# API validates request bodies by the exact rules the planner reads (no
+# drift). Path matches pg_cyan/collect/ (the collect/plan/copy DAG-phase
+# subpackages) -- keep this in sync if capacity_contract.py ever moves again.
+COPY --chown=app:app pg_cyan/__init__.py ./pg_cyan/
+COPY --chown=app:app pg_cyan/collect/__init__.py pg_cyan/collect/capacity_contract.py ./pg_cyan/collect/
 
 USER 1000:1000
 

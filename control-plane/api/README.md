@@ -55,7 +55,7 @@ kubectl port-forward -n pgcyan-system svc/pgcyan-control-plane-api 8080:80
 `capacity` is optional: the operator-declared inputs the capacity-aware planner
 uses (`source_capacity`, `target_capacity`, `network`, `cluster_capacity`,
 `constraints`). Each is validated against the **shared contract**
-(`pg_cyan/capacity_contract.py`) — the same rules the planner reads by, so a
+(`pg_cyan/collect/capacity_contract.py`) — the same rules the planner reads by, so a
 rejected body is one the planner would also reject (invalid → `422` with
 field-level detail, before the singleton slot is claimed). Accepted objects are
 stamped into a `pgcyan-capacity-declared` ConfigMap in the migration namespace
