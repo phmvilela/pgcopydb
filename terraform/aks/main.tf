@@ -164,8 +164,16 @@ resource "azurerm_kubernetes_cluster" "aks" {
   }
 
   # Container Insights -> Log Analytics.
+  #
+  # msi_auth_for_monitoring_enabled makes the addon authenticate to the
+  # workspace with the cluster's managed identity. It defaults to false, which
+  # is the legacy workspace-key auth Azure Monitor retires on 2026-09-30 — so it
+  # is set explicitly rather than left to the provider default. AKS creates and
+  # associates the backing Data Collection Rule (MSCI-<region>-<cluster>) itself;
+  # that DCR is deliberately not managed here.
   oms_agent {
-    log_analytics_workspace_id = azurerm_log_analytics_workspace.aks.id
+    log_analytics_workspace_id      = azurerm_log_analytics_workspace.aks.id
+    msi_auth_for_monitoring_enabled = true
   }
 
   tags = local.tags

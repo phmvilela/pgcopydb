@@ -14,7 +14,7 @@ and is applied independently.
 | **2 user-assigned managed identities** (`-orchestrator`, `-worker`) + **federated credentials** | One per ServiceAccount (`pgcyan-orchestrator`, `pgcyan-worker` in `pgcyan-migration`). The federated credential's `subject` matches `system:serviceaccount:<ns>:<sa>` exactly. |
 | **Azure Files CSI driver** (`file_driver_enabled`) | Provides the `azurefile-csi` **ReadWriteMany** StorageClass that `20-pvc-workdir.yaml` claims for the shared `/work` dir. |
 | **Azure Container Registry** + **AcrPull** to the kubelet identity | Hosts the `REPLACE_ME/pgcyan` image so every Job/Deployment can pull it without imagePullSecrets. |
-| **Log Analytics** + **Container Insights** (`oms_agent`) | Cluster/pod observability for the migration run. |
+| **Log Analytics** + **Container Insights** (`oms_agent`, managed-identity auth) | Cluster/pod observability for the migration run. |
 | **Azure CNI Overlay** VNet/subnet | Pod IPs come from an overlay CIDR, so heavy concurrent shard fan-out never exhausts the VNet. |
 | **GitHub Actions OIDC identity** (UAMI + federated credential) | Passwordless Azure login for `.github/workflows/build.yml`'s `publish` (ACR push) and `integration-tests.yml`'s cluster jobs — no static credentials in GitHub. |
 
