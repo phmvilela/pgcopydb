@@ -1,7 +1,13 @@
 # Example Terraform variables for the pg_cyan AKS deployment.
-# Copy to terraform.tfvars and adjust for your environment.
+#
+# These values mirror the DEPLOYED cluster, and so do the defaults in
+# variables.tf — copying this file is a no-op rather than a source of drift:
 #
 #   cp terraform.tfvars.example terraform.tfvars
+#
+# Before changing anything here, read README "Defaults track production".
+# acr_name and cluster_name in particular are replacement-forcing: editing
+# acr_name destroys the registry and every image in it.
 
 resource_group_name = "pg-cyan-aks-rg"
 azure_region        = "westus2"
@@ -10,18 +16,21 @@ cluster_name        = "pg-cyan-aks"
 # Kubernetes version — check availability in your region (versions get
 # retired from standard support and fall back to the paid LTS tier):
 #   az aks get-versions --location westus2 -o table
-kubernetes_version = "1.33"
-sku_tier           = "Standard"
+kubernetes_version = "1.36.2"
+sku_tier           = "Free"
 
 # Namespace MUST match deploy/k8s/00-namespace.yaml
 k8s_namespace = "pgcyan-migration"
 
-# Node pool (autoscaled). Bound max_count to cap concurrent shard fan-out cost.
-node_vm_size         = "Standard_D4s_v5"
-node_min_count       = 2
-node_max_count       = 6
-max_pods_per_node    = 60
-node_os_disk_size_gb = 128
+# Node pool. Fixed-size by default; node_min_count/node_max_count take effect
+# only when node_autoscaling_enabled = true, which bounds shard fan-out cost.
+node_vm_size             = "Standard_D2ads_v7"
+node_autoscaling_enabled = false
+node_count               = 1
+node_min_count           = 2
+node_max_count           = 6
+max_pods_per_node        = 60
+node_os_disk_size_gb     = 128
 
 # Networking (Azure CNI Overlay). service_cidr must NOT overlap the VNet.
 vnet_address_space           = ["10.10.0.0/16"]
@@ -31,7 +40,8 @@ service_cidr                 = "10.0.0.0/16"
 dns_service_ip               = "10.0.0.10"
 
 # ACR name must be globally unique and alphanumeric only (no hyphens).
-acr_name = "pgcyanacr"
+# This is the deployed registry. Changing it REPLACES the ACR, losing all images.
+acr_name = "pgcyanimages"
 acr_sku  = "Standard"
 
 # GitHub repo publish-image.yml's `publish`/`deploy` jobs run in — the OIDC

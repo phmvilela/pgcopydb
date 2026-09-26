@@ -129,6 +129,44 @@ The generated `backend.hcl` is gitignored; only the per-module `key` is
 committed. See [`../README.md`](../README.md#remote-state) for the full rationale
 and the key-less (AAD) option.
 
+## Defaults track production
+
+The defaults in [`variables.tf`](variables.tf) are the values the **deployed**
+cluster actually runs, not aspirational ones, and `terraform.tfvars.example`
+mirrors them. A `terraform plan` with no `terraform.tfvars` at all should
+therefore be empty.
+
+This matters because `terraform.tfvars` is gitignored. The file used to create
+this cluster was lost with the machine it lived on, and the example file that
+replaced it disagreed with reality on six values — so a plan proposed destroying
+the container registry (and every image in it), downgrading Kubernetes, and
+switching the cluster to the paid SKU tier. Keeping the defaults honest means
+the repo alone reproduces production, and tfvars is only for genuine
+per-environment overrides.
+
+Consequences worth knowing:
+
+- **`acr_name` and `cluster_name` force replacement.** Changing `acr_name`
+  destroys the registry and all images; the manifests' image references and
+  `publish-image.yml` break with it.
+- **`kubernetes_version` cannot go backwards.** AKS rejects downgrades, so a
+  stale default makes `apply` fail — bump it after an AKS upgrade lands.
+- **`node_vm_size` changes need `temporary_name_for_rotation`** set on the node
+  pool, or the provider refuses to resize in place.
+- **`sku_tier = "Standard"` is billed** per cluster-hour. The default is `Free`.
+
+If the cluster drifts again (a portal change, an auto-upgrade), regenerate a
+tfvars from live state rather than guessing:
+
+```bash
+terraform apply -refresh-only        # adopt reality into state; touches state only
+./reconstruct-tfvars.sh > terraform.tfvars
+terraform plan                       # should be empty
+```
+
+Then fold any values it reports into the `variables.tf` defaults and delete the
+generated file, so the next person does not need it.
+
 ## Notes
 
 - `service_cidr` must not overlap `vnet_address_space` or `pod_cidr`.

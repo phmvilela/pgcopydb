@@ -131,12 +131,23 @@ resource "azurerm_kubernetes_cluster" "aks" {
     vm_size              = var.node_vm_size
     vnet_subnet_id       = azurerm_subnet.aks_nodes.id
     orchestrator_version = var.kubernetes_version
-    enable_auto_scaling  = true
-    min_count            = var.node_min_count
-    max_count            = var.node_max_count
     max_pods             = var.max_pods_per_node
     os_disk_size_gb      = var.node_os_disk_size_gb
     tags                 = local.tags
+
+    # Autoscaling is opt-in (default off, matching the deployed pool). The
+    # provider rejects min_count/max_count while the autoscaler is off, and
+    # ignores node_count while it is on, so each side is nulled out in turn.
+    enable_auto_scaling = var.node_autoscaling_enabled
+    node_count          = var.node_autoscaling_enabled ? null : var.node_count
+    min_count           = var.node_autoscaling_enabled ? var.node_min_count : null
+    max_count           = var.node_autoscaling_enabled ? var.node_max_count : null
+
+    # AKS sets max_surge=10% on node pools whether or not the config says so.
+    # Declaring it stops every plan from proposing to strip the block.
+    upgrade_settings {
+      max_surge = "10%"
+    }
   }
 
   # Control-plane identity. Kubelet identity is derived from this and is what

@@ -24,13 +24,13 @@ variable "cluster_name" {
 variable "kubernetes_version" {
   description = "Kubernetes version for the control plane and default node pool"
   type        = string
-  default     = "1.33"
+  default     = "1.36.2" # the deployed cluster's version — see README "Defaults track production"
 }
 
 variable "sku_tier" {
   description = "AKS SKU tier. 'Standard' gives an SLA on the API server; 'Free' for dev/test."
   type        = string
-  default     = "Standard"
+  default     = "Free" # the deployed cluster runs Free; 'Standard' is billed per cluster-hour
 
   validation {
     condition     = contains(["Free", "Standard", "Premium"], var.sku_tier)
@@ -48,17 +48,37 @@ variable "k8s_namespace" {
 variable "node_vm_size" {
   description = "VM size for the default node pool"
   type        = string
-  default     = "Standard_D4s_v5" # 4 vCPU / 16 GB — headroom for concurrent COPY shards
+  default     = "Standard_D2ads_v7" # the deployed pool's size
+}
+
+# Autoscaling is opt-in. The deployed pool is fixed-size, so node_count is
+# authoritative by default and node_min_count/node_max_count apply only when
+# node_autoscaling_enabled is true (the provider rejects min/max otherwise).
+variable "node_autoscaling_enabled" {
+  description = "Enable the cluster autoscaler on the default node pool. When false, node_count is fixed."
+  type        = bool
+  default     = false
+}
+
+variable "node_count" {
+  description = "Fixed node count for the default node pool. Ignored when node_autoscaling_enabled is true."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.node_count >= 1
+    error_message = "node_count must be at least 1."
+  }
 }
 
 variable "node_min_count" {
-  description = "Minimum node count for cluster autoscaler"
+  description = "Minimum node count for cluster autoscaler (only when node_autoscaling_enabled)"
   type        = number
   default     = 2
 }
 
 variable "node_max_count" {
-  description = "Maximum node count for cluster autoscaler (bounds concurrent shard fan-out)"
+  description = "Maximum node count for cluster autoscaler, bounding concurrent shard fan-out (only when node_autoscaling_enabled)"
   type        = number
   default     = 6
 
@@ -115,7 +135,7 @@ variable "dns_service_ip" {
 variable "acr_name" {
   description = "Azure Container Registry name (globally unique, alphanumeric only)"
   type        = string
-  default     = "pgcyanacr"
+  default     = "pgcyanimages" # the deployed registry — renaming this DESTROYS it and every image in it
 
   validation {
     condition     = can(regex("^[a-zA-Z0-9]{5,50}$", var.acr_name))
@@ -162,6 +182,9 @@ variable "environment_tags" {
   description = "Additional tags merged onto all resources"
   type        = map(string)
   default = {
-    team = "database-migration"
+    # environment overrides the environment=migration tag set in locals, and
+    # matches what every deployed resource currently carries.
+    environment = "staging"
+    team        = "database-migration"
   }
 }
