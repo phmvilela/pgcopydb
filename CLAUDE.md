@@ -16,8 +16,7 @@ Current state: the **pre-migration** stages (`preflight`, `source-parameters`,
 orchestrator** (`orchestrate`), and the
 **folded controller** (`run-migration`, #70) that holds the consistent snapshot
 in-pod and drives the whole `deploy/k8s/` sharded pgcopydb DAG, plus the
-Terraform **worker VM** / **AKS cluster** modules exist. Post-migration is not
-built yet.
+Terraform **AKS cluster** module exists. Post-migration is not built yet.
 
 ## Where work comes from
 
@@ -254,11 +253,8 @@ sandboxes on demand — distinct from a single migration run. Two new trees:
 
 ## Terraform
 
-Two independent root modules, each with its own **remote** state (separate blobs
-in one shared Azure Blob backend; see below):
+One root module, with **remote** state in an Azure Blob backend (see below):
 
-- `terraform/` — the migration **worker VM** (resource group, VNet, subnet,
-  NSG, public IP, VM, cloud-init). Restrict `allowed_ssh_cidr`.
 - `terraform/aks/` — the **AKS cluster** that runs the `deploy/k8s` sharded
   pgcopydb migration (issue #34). Enables **OIDC issuer + Workload Identity**,
   creates the two user-assigned managed identities + federated credentials for
@@ -269,12 +265,12 @@ in one shared Azure Blob backend; see below):
   (see `terraform/aks/README.md`). Managed-identity → Postgres login must be
   granted DB-side out of band.
 
-Both modules are meant to be idempotent — `terraform apply` should be safe to
-re-run. State lives in a shared Azure Blob backend, one blob per module
-(`worker-vm.tfstate` / `aks.tfstate`), bootstrapped once by
-`terraform/bootstrap-backend.sh` (idempotent; storage account name derived from
-the subscription id). Run it, then `terraform init -backend-config=backend.hcl`
-in each module. This is what keeps an ephemeral dev container from orphaning
+The module is meant to be idempotent — `terraform apply` should be safe to
+re-run, and its committed defaults are the deployed cluster's real values, so a
+plan with no `terraform.tfvars` reports no changes. State lives in an Azure Blob
+backend (`aks.tfstate`), bootstrapped once by `terraform/bootstrap-backend.sh`
+(idempotent; storage account name derived from the subscription id). Run it, then
+`terraform init -backend-config=backend.hcl` in the module. This is what keeps an ephemeral dev container from orphaning
 Azure resources by losing local state. Keep state/secrets out of the repo
 (`*.tfstate`, `*.tfvars`, `backend.hcl` are gitignored; commit only the
 `*.example` files).

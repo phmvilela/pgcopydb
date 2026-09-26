@@ -28,8 +28,7 @@ provider "azurerm" {
 data "azurerm_client_config" "current" {}
 
 locals {
-  # Common tags applied to every resource. Mirrors the tagging shape used by the
-  # worker-VM module (../main.tf) so both modules read consistently.
+  # Common tags applied to every resource.
   tags = merge(
     {
       environment = "migration"

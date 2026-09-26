@@ -17,7 +17,7 @@ Output is a mix of **Python** (checks, orchestration) and **Terraform**
 stand up and tear down.
 
 > Status: early (v0.1.0). The pre-migration **preflight** checks and the Azure
-> **worker VM** Terraform template are the first pieces in place.
+> **AKS cluster** Terraform module are the first pieces in place.
 
 ---
 
@@ -39,7 +39,7 @@ pg_cyan/
   controller.py        PgCyanController: folded controller — holds snapshot + walks DAG (#70)
   cloud/azure/         Azure SDK integrations (skeleton)
   postgres/            PostgreSQL connection/introspection utils (skeleton)
-terraform/             Azure worker-VM provisioning (VNet, NSG, VM, cloud-init)
+terraform/aks/         Azure AKS provisioning (cluster, Workload Identity, ACR, VNet)
 tests/                 pytest suite (DB-free unit tests)
 Dockerfile             Non-root image: pgcopydb + kubectl + the CLI (default cmd)
 requirements.txt       Pinned Python dependencies
@@ -506,15 +506,16 @@ docker run --rm \
   pg_cyan preflight
 ```
 
-## Provisioning the Azure worker VM
+## Provisioning the Azure AKS cluster
 
-See [`terraform/README.md`](terraform/README.md). In short:
+See [`terraform/aks/README.md`](terraform/aks/README.md). In short:
 
 ```bash
 cd terraform
-cp terraform.tfvars.example terraform.tfvars   # edit values
-terraform init
-terraform plan -out=tfplan
+./bootstrap-backend.sh                         # one-time: remote state storage
+cd aks
+terraform init -backend-config=backend.hcl
+terraform plan -out=tfplan                     # defaults match production: expect no changes
 terraform apply tfplan
 ```
 

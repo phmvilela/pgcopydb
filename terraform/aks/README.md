@@ -1,10 +1,9 @@
 # pg_cyan AKS Terraform (`terraform/aks`)
 
 Provisions the **Azure Kubernetes Service** cluster that runs the sharded
-pgcopydb migration defined in [`deploy/k8s`](../../deploy/k8s/). This module is
-**separate from** the worker-VM module in [`../`](../) — it has its own state
-(a separate blob in the shared remote backend; see [Remote state](#remote-state))
-and is applied independently.
+pgcopydb migration defined in [`deploy/k8s`](../../deploy/k8s/). It is the only
+Terraform module in the repo, and keeps its state in a remote Azure Blob backend
+(see [Remote state](#remote-state)).
 
 ## What it creates
 
@@ -121,10 +120,9 @@ manifests exactly) and leaves no state — prefer Cloud Shell.
 
 ## Remote state
 
-This module's state is a blob (`key = "aks.tfstate"`) in the shared Azure Blob
-backend created by [`../bootstrap-backend.sh`](../bootstrap-backend.sh) — the
-same container the worker-VM module uses (`key = "worker-vm.tfstate"`). Run the
-script once (`az login` first), then `terraform init -backend-config=backend.hcl`.
+This module's state is a blob (`key = "aks.tfstate"`) in the Azure Blob container
+created by [`../bootstrap-backend.sh`](../bootstrap-backend.sh). Run the script
+once (`az login` first), then `terraform init -backend-config=backend.hcl`.
 The generated `backend.hcl` is gitignored; only the per-module `key` is
 committed. See [`../README.md`](../README.md#remote-state) for the full rationale
 and the key-less (AAD) option.
