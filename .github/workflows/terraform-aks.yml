@@ -48,10 +48,10 @@ jobs:
         working-directory: terraform/aks
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
 
       - name: terraform fmt -check
         run: terraform fmt -check -recursive

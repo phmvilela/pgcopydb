@@ -88,7 +88,7 @@ jobs:
       # A local composite action (uses: ./agent-workflow-steps) requires the repo
       # to be checked out first.
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run agent-defined steps
         uses: ./agent-workflow-steps

@@ -20,7 +20,7 @@ runs:
       run: echo "PGCYAN_IMAGE=${ACR_NAME}.azurecr.io/pgcyan:$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
     - name: Azure login (OIDC, passwordless)
-      uses: azure/login@v2
+      uses: azure/login@v3
       with:
         client-id: ${{ env.AZURE_CLIENT_ID }}
         tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -54,7 +54,7 @@ runs:
         echo "Image pgcyan:${sha} is published."
 
     - name: Get AKS credentials
-      uses: azure/aks-set-context@v4
+      uses: azure/aks-set-context@v5
       with:
         resource-group: ${{ env.AKS_RESOURCE_GROUP }}
         cluster-name: ${{ env.AKS_CLUSTER_NAME }}

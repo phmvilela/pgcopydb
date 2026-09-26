@@ -67,7 +67,7 @@ jobs:
       AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Guard -- require Azure + AKS config
         env:
@@ -96,7 +96,7 @@ jobs:
           echo "base_tag=$(cat control-plane/api/Dockerfile.base control-plane/api/requirements.txt | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Azure login (OIDC, passwordless)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -166,7 +166,7 @@ jobs:
           echo "Migration image ${MIGRATION_REPO}:${tag} is published."
 
       - name: Get AKS credentials
-        uses: azure/aks-set-context@v4
+        uses: azure/aks-set-context@v5
         with:
           resource-group: ${{ env.AKS_RESOURCE_GROUP }}
           cluster-name: ${{ env.AKS_CLUSTER_NAME }}
