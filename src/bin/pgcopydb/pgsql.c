@@ -5314,8 +5314,8 @@ pgsql_drop_replication_slot(PGSQL *pgsql, const char *slotName)
 /*
  * pgsql_create_publication creates a publication FOR TABLE <table list>
  * by querying pg_tables directly on the live source connection.  Excludes
- * system schemas and the pgcopydb internal schema.  Uses only CREATE
- * privilege on the database — no superuser needed.
+ * system schemas, the pgcopydb internal schema, and unlogged and temporary
+ * tables.  Uses only CREATE privilege on the database — no superuser needed.
  *
  * When filters is non-NULL, exclude-table and exclude-schema entries are
  * applied so that the publication matches the user-specified filter, giving
@@ -5386,7 +5386,20 @@ pgsql_create_publication(PGSQL *pgsql, const char *pubName,
 						 "SELECT schemaname, tablename"
 						 " FROM pg_tables"
 						 " WHERE schemaname NOT IN"
-						 " ('pg_catalog', 'information_schema', 'pgcopydb')");
+						 " ('pg_catalog', 'information_schema', 'pgcopydb')"
+
+						 /*
+						  * Only permanent tables can be published: Postgres
+						  * refuses to add an unlogged or a temporary table to
+						  * a publication, and their changes are not in the
+						  * WAL anyway.
+						  */
+						 " AND NOT EXISTS"
+						 " (SELECT 1 FROM pg_class c"
+						 "    JOIN pg_namespace n ON n.oid = c.relnamespace"
+						 "   WHERE n.nspname = schemaname"
+						 "     AND c.relname = tablename"
+						 "     AND c.relpersistence <> 'p')");
 
 	if (filters != NULL)
 	{
