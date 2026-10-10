@@ -161,6 +161,11 @@ compare data`` subcommands:
   The output of the command is formatted in JSON, when supported. Ignored
   otherwise.
 
+--snapshot
+
+  Instead of comparing the live data pgcopydb will use an already exported
+  snapshot on the source database for comparison.
+
 --verbose
 
   Increase current verbosity. The default level of verbosity is INFO. In

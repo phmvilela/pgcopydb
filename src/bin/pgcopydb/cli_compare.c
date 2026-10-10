@@ -30,6 +30,13 @@ static void cli_compare_data(int argc, char **argv);
 
 static bool cli_compare_data_table_hook(void *ctx, SourceTable *table);
 
+/*
+ * Counts tables whose contents differ between source and target. compare data
+ * reported differences only in the log and still exited zero, so callers that
+ * checked the exit status read a mismatch as a match.
+ */
+static uint64_t compareDataDiffCount = 0;
+
 static CommandLine compare_schema_command =
 	make_command(
 		"schema",
@@ -38,7 +45,9 @@ static CommandLine compare_schema_command =
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
-		"  --all-databases      Compare all databases from the source instance\n",
+		"  --all-databases      Compare all databases from the source instance\n"
+		"  --snapshot           Use snapshot obtained with pg_export_snapshot\n"
+		"                       on the source database\n",
 		cli_compare_getopts,
 		cli_compare_schema);
 
@@ -51,7 +60,9 @@ static CommandLine compare_data_command =
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
 		"  --all-databases      Compare all databases from the source instance\n"
-		"  --json               Format the output using JSON\n",
+		"  --json               Format the output using JSON\n"
+		"  --snapshot           Use snapshot obtained with pg_export_snapshot\n"
+		"                       on the source database\n",
 		cli_compare_getopts,
 		cli_compare_data);
 
@@ -84,6 +95,7 @@ cli_compare_getopts(int argc, char **argv)
 		{ "table-jobs", required_argument, NULL, 'j' },
 		{ "all-databases", no_argument, NULL, 'a' },
 		{ "json", no_argument, NULL, 'J' },
+		{ "snapshot", required_argument, NULL, 'N' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "notice", no_argument, NULL, 'v' },
@@ -211,6 +223,13 @@ cli_compare_getopts(int argc, char **argv)
 				break;
 			}
 
+			case 'N':
+			{
+				strlcpy(options.snapshot, optarg, sizeof(options.snapshot));
+				log_trace("--snapshot %s", options.snapshot);
+				break;
+			}
+
 			case 'd':
 			{
 				verboseCount = 3;
@@ -253,6 +272,13 @@ cli_compare_getopts(int argc, char **argv)
 		++errors;
 	}
 
+	if (options.allDatabases && !IS_EMPTY_STRING_BUFFER(options.snapshot))
+	{
+		log_fatal("Option --snapshot is not compatible with --all-databases: "
+				  "a snapshot belongs to a single database");
+		++errors;
+	}
+
 	/* prepare safe versions of the connection strings (without password) */
 	if (!cli_prepare_pguris(&(options.connStrings)))
 	{
@@ -291,9 +317,11 @@ cli_compare_schema(int argc, char **argv)
 	bool service = true;
 	char *serviceName = "snapshot";
 
-	/* pretend that --resume --not-consistent have been used */
+	/* pretend that --resume has been used */
 	compareOptions.resume = true;
-	compareOptions.notConsistent = true;
+
+	/* pretend that --not-consistent has been used (unless a snapshot is used) */
+	compareOptions.notConsistent = IS_EMPTY_STRING_BUFFER(compareOptions.snapshot);
 
 	if (!copydb_init_workdir(&copySpecs,
 							 dir,
@@ -317,6 +345,13 @@ cli_compare_schema(int argc, char **argv)
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
+	if (!IS_EMPTY_STRING_BUFFER(compareOptions.snapshot) &&
+		!copydb_set_snapshot(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
 	if (compareOptions.allDatabases)
 	{
 		if (!compare_all_databases_schema(&copySpecs))
@@ -333,6 +368,12 @@ cli_compare_schema(int argc, char **argv)
 			log_fatal("Comparing the schemas failed, see above for details");
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
+	}
+
+	if (!IS_EMPTY_STRING_BUFFER(compareOptions.snapshot))
+	{
+		/* close our snapshot: commit transaction and finish connection */
+		(void) copydb_close_snapshot(&copySpecs);
 	}
 }
 
@@ -356,9 +397,11 @@ cli_compare_data(int argc, char **argv)
 	bool service = true;
 	char *serviceName = "snapshot";
 
-	/* pretend that --resume --not-consistent have been used */
+	/* pretend that --resume has been used */
 	compareOptions.resume = true;
-	compareOptions.notConsistent = true;
+
+	/* pretend that --not-consistent has been used (unless a snapshot is used) */
+	compareOptions.notConsistent = IS_EMPTY_STRING_BUFFER(compareOptions.snapshot);
 
 	if (!copydb_init_workdir(&copySpecs,
 							 dir,
@@ -390,6 +433,13 @@ cli_compare_data(int argc, char **argv)
 		return;
 	}
 
+	if (!IS_EMPTY_STRING_BUFFER(compareOptions.snapshot) &&
+		!copydb_set_snapshot(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
 	if (!compare_data(&copySpecs))
 	{
 		log_fatal("Failed to compute checksums, see above for details");
@@ -403,6 +453,12 @@ cli_compare_data(int argc, char **argv)
 		log_error("Failed to open internal catalogs in COPY worker process, "
 				  "see above for details");
 		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!IS_EMPTY_STRING_BUFFER(compareOptions.snapshot))
+	{
+		/* close our snapshot: commit transaction and finish connection */
+		(void) copydb_close_snapshot(&copySpecs);
 	}
 
 	if (outputJSON)
@@ -451,6 +507,19 @@ cli_compare_data(int argc, char **argv)
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
+
+	/*
+	 * After the report, so a caller keeps the per-table detail that says which
+	 * tables differ. Same verdict shape as compare schema, which already exits
+	 * non-zero on diffCount > 0.
+	 */
+	if (compareDataDiffCount > 0)
+	{
+		log_fatal("Data on source and target database differ: "
+				  "%lld table(s) do not match",
+				  (long long) compareDataDiffCount);
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
 }
 
 
@@ -460,6 +529,16 @@ cli_compare_data(int argc, char **argv)
 static bool
 cli_compare_data_table_hook(void *ctx, SourceTable *table)
 {
+	/*
+	 * Count before formatting, so both the JSON and the tabular output paths
+	 * feed the same verdict.
+	 */
+	if (table->sourceChecksum.rowcount != table->targetChecksum.rowcount ||
+		!streq(table->sourceChecksum.checksum, table->targetChecksum.checksum))
+	{
+		++compareDataDiffCount;
+	}
+
 	if (outputJSON)
 	{
 		JSON_Array *jsArray = (JSON_Array *) ctx;
