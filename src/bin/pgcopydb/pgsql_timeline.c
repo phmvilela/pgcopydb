@@ -30,6 +30,7 @@ typedef struct TimelineHistoryResult
 static void parseIdentifySystemResult(IdentifySystemResult *ctx, PGresult *result);
 static void parseTimelineHistoryResult(TimelineHistoryResult *context, PGresult *result,
 									   char *cdcPathDir);
+static bool timelineHistoryIsRefused(const char *message);
 static bool writeTimelineHistoryFile(char *filename, char *content);
 static bool register_timeline_hook(void *ctx, char *line);
 
@@ -94,7 +95,24 @@ pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system, char *cdcPathDir)
 
 		result = PQexec(connection, sql);
 
-		if (!is_response_ok(result))
+		if (!is_response_ok(result) &&
+			timelineHistoryIsRefused(PQerrorMessage(connection)))
+		{
+			/*
+			 * Some servers refuse TIMELINE_HISTORY on the logical replication
+			 * connection we use here. The history only describes timelines
+			 * that ended before our starting position, and the current
+			 * timeline is known from IDENTIFY_SYSTEM: go on without it.
+			 */
+			log_warn("Skipping the timeline history, the server refuses "
+					 "TIMELINE_HISTORY on this connection: %s",
+					 PQerrorMessage(connection));
+			PQclear(result);
+			clear_results(pgsql);
+
+			system->timelineHistoryFilename[0] = '\0';
+		}
+		else if (!is_response_ok(result))
 		{
 			log_error("Failed to request TIMELINE_HISTORY: %s",
 					  PQerrorMessage(connection));
@@ -105,21 +123,23 @@ pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system, char *cdcPathDir)
 
 			return false;
 		}
-
-		(void) parseTimelineHistoryResult((void *) &hContext, result, cdcPathDir);
-
-		PQclear(result);
-		clear_results(pgsql);
-
-		if (!hContext.parsedOk)
+		else
 		{
-			log_error("Failed to get result from TIMELINE_HISTORY");
-			PQfinish(connection);
-			return false;
-		}
+			(void) parseTimelineHistoryResult((void *) &hContext, result, cdcPathDir);
 
-		/* store the filename for the timeline history file */
-		strlcpy(system->timelineHistoryFilename, hContext.filename, MAXPGPATH);
+			PQclear(result);
+			clear_results(pgsql);
+
+			if (!hContext.parsedOk)
+			{
+				log_error("Failed to get result from TIMELINE_HISTORY");
+				PQfinish(connection);
+				return false;
+			}
+
+			/* store the filename for the timeline history file */
+			strlcpy(system->timelineHistoryFilename, hContext.filename, MAXPGPATH);
+		}
 	}
 
 	if (connIsOurs)
@@ -128,6 +148,20 @@ pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system, char *cdcPathDir)
 	}
 
 	return true;
+}
+
+
+/*
+ * timelineHistoryIsRefused returns true when the given error message is the
+ * server refusing to run TIMELINE_HISTORY on a logical replication connection,
+ * as opposed to failing to run it.
+ */
+static bool
+timelineHistoryIsRefused(const char *message)
+{
+	return message != NULL &&
+		   strstr(message,
+				  "cannot be executed on a logical replication connection") != NULL;
 }
 
 
@@ -325,8 +359,14 @@ parse_timeline_history_file(char *filename,
 		.prevend = InvalidXLogRecPtr
 	};
 
-	/* step 2: iterate over the file */
-	if (currentTimeline > 1)
+	/*
+	 * step 2: iterate over the file. There is none on the first timeline, nor
+	 * when the server refused TIMELINE_HISTORY (see pgsql_identify_system).
+	 */
+	bool hasHistoryFile =
+		currentTimeline > 1 && !IS_EMPTY_STRING_BUFFER(filename);
+
+	if (hasHistoryFile)
 	{
 		if (!file_iter_lines(filename, &context, register_timeline_hook))
 		{
@@ -336,7 +376,13 @@ parse_timeline_history_file(char *filename,
 	}
 
 	/* step 3: add the current timeline to catalog */
-	if (currentTimeline != context.prevtli + 1)
+	if (currentTimeline > 1 && !hasHistoryFile)
+	{
+		log_notice("No timeline history file for timeline %d, "
+				   "registering only the current timeline",
+				   currentTimeline);
+	}
+	else if (currentTimeline != context.prevtli + 1)
 	{
 		log_warn("parse_timeline_history_file: Expected timeline %d, got %d",
 				 context.prevtli + 1, currentTimeline);
