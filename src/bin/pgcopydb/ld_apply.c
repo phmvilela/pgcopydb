@@ -258,13 +258,19 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 			break;
 		}
 
-		/* ── check for upstream-done signal ──────────────────────────── */
+		/*
+		 * Check for the upstream-done signal, without waiting for it: the
+		 * pipe carries that one message and nothing else, so a blocking wait
+		 * here costs its timeout on every pass, including the passes that
+		 * have a transaction ready in replayDB. Waiting for work belongs in
+		 * the idle path below, which waits on this same pipe.
+		 */
 		if (!specs->upstream_done && pipe_rd >= 0)
 		{
 			fd_set rfds;
 			FD_ZERO(&rfds);
 			FD_SET(pipe_rd, &rfds);
-			struct timeval tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
+			struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
 
 			int nready = select(pipe_rd + 1, &rfds, NULL, NULL, &tv);
 			if (nready < 0 && errno != EINTR)
@@ -558,12 +564,28 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 			}
 
 			/*
-			 * Not caught up yet.  In pipe mode the select() ceiling gives
-			 * ≤100 ms latency; with no pipe left to wait on, sleep briefly so
-			 * a count of idle passes is also a wall-clock bound.  Passes that
-			 * produced work have already continued above.
+			 * Not caught up yet, and this pass found nothing: wait up to
+			 * 100 ms before looking again. With the upstream pipe still open,
+			 * wait on it, so the signal wakes us at once; otherwise sleep.
+			 * Either way an idle pass is bounded in wall-clock time. Passes
+			 * that produced work have already continued above, so no wait
+			 * here delays a transaction that is ready.
 			 */
-			if (pipe_rd < 0)
+			if (pipe_rd >= 0 && !specs->upstream_done)
+			{
+				fd_set rfds;
+				FD_ZERO(&rfds);
+				FD_SET(pipe_rd, &rfds);
+				struct timeval tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
+
+				int nready = select(pipe_rd + 1, &rfds, NULL, NULL, &tv);
+				if (nready < 0 && errno != EINTR)
+				{
+					log_error("apply select() on pipe while idle: %m");
+					return false;
+				}
+			}
+			else
 			{
 				pg_usleep(100 * 1000);  /* 100 ms */
 			}
